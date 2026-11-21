@@ -16,6 +16,7 @@ pub enum AdmissionError {
     UserQuotaExceeded,
     IpQuotaExceeded,
     ConfigStale,
+    AdmissionConflict,
     StaleLock,
     InvalidIdentifier(&'static str),
     CorruptState,
@@ -35,6 +36,7 @@ impl fmt::Display for AdmissionError {
             Self::UserQuotaExceeded => formatter.write_str("user session quota exceeded"),
             Self::IpQuotaExceeded => formatter.write_str("IP session quota exceeded"),
             Self::ConfigStale => formatter.write_str("caster config snapshot is stale"),
+            Self::AdmissionConflict => formatter.write_str("admission record changed concurrently"),
             Self::StaleLock => formatter.write_str("admission lock is stale"),
             Self::InvalidIdentifier(name) => write!(formatter, "invalid {name}"),
             Self::CorruptState => formatter.write_str("corrupt admission state"),
@@ -166,10 +168,10 @@ impl SessionRecord {
 
 #[derive(Debug)]
 pub struct ClientAdmissionRequest {
-    session: SessionRecord,
-    max_sessions: usize,
-    ip_max_sessions: Option<usize>,
-    config: ConfigSnapshot,
+    pub(crate) session: SessionRecord,
+    pub(crate) max_sessions: usize,
+    pub(crate) ip_max_sessions: Option<usize>,
+    pub(crate) config: ConfigSnapshot,
 }
 
 impl ClientAdmissionRequest {
@@ -190,10 +192,10 @@ impl ClientAdmissionRequest {
 
 #[derive(Debug)]
 pub struct SourceAdmissionRequest {
-    session: SessionRecord,
-    max_sessions: usize,
-    source_claim: SourceClaimRequest,
-    config: ConfigSnapshot,
+    pub(crate) session: SessionRecord,
+    pub(crate) max_sessions: usize,
+    pub(crate) source_claim: SourceClaimRequest,
+    pub(crate) config: ConfigSnapshot,
 }
 
 impl SourceAdmissionRequest {
@@ -519,7 +521,7 @@ pub async fn admit_source(
     }
 }
 
-fn validate_session(session: &SessionRecord) -> Result<(), AdmissionError> {
+pub(crate) fn validate_session(session: &SessionRecord) -> Result<(), AdmissionError> {
     validate_key_segment(&session.session_id, "session ID")?;
     validate_key_segment(&session.user_id, "user ID")?;
     validate_key_segment(&session.mountpoint, "mountpoint")?;
@@ -531,18 +533,18 @@ fn validate_session(session: &SessionRecord) -> Result<(), AdmissionError> {
     Ok(())
 }
 
-fn user_session_key(cluster_id: &str, session: &SessionRecord) -> String {
+pub(crate) fn user_session_key(cluster_id: &str, session: &SessionRecord) -> String {
     format!(
         "/rcaster/{cluster_id}/online/users/{}/sessions/{}",
         session.user_id, session.session_id
     )
 }
 
-fn ip_session_key(cluster_id: &str, client_ip: &str, session_id: &str) -> String {
+pub(crate) fn ip_session_key(cluster_id: &str, client_ip: &str, session_id: &str) -> String {
     format!("/rcaster/{cluster_id}/online/ips/{client_ip}/client-sessions/{session_id}")
 }
 
-fn config_compare(cluster_id: &str, config: &ConfigSnapshot) -> Compare {
+pub(crate) fn config_compare(cluster_id: &str, config: &ConfigSnapshot) -> Compare {
     Compare::mod_revision(
         format!("/rcaster/{cluster_id}/config/caster"),
         CompareOp::Equal,
@@ -550,7 +552,7 @@ fn config_compare(cluster_id: &str, config: &ConfigSnapshot) -> Compare {
     )
 }
 
-fn validate_key_segment(value: &str, name: &'static str) -> Result<(), AdmissionError> {
+pub(crate) fn validate_key_segment(value: &str, name: &'static str) -> Result<(), AdmissionError> {
     if value.is_empty()
         || !value
             .bytes()

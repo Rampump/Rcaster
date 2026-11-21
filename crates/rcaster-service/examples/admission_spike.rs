@@ -15,6 +15,7 @@ use rcaster_service::{
         AdmissionError, ClientAdmissionRequest, SessionRecord, admit_client, try_acquire_user_lock,
     },
     config::{CasterConfig, ConfigSnapshot, publish_config},
+    revision_admission::admit_client_revision,
 };
 use tokio::{
     sync::{Semaphore, mpsc},
@@ -31,12 +32,28 @@ struct SpikeConfig {
     max_lock_retries: usize,
     preload_sessions: usize,
     ip_max_sessions: Option<usize>,
+    admission_mode: AdmissionMode,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum WorkloadMode {
     Unique,
     Hot,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AdmissionMode {
+    Lock,
+    Revision,
+}
+
+impl AdmissionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lock => "lock",
+            Self::Revision => "revision",
+        }
+    }
 }
 
 impl WorkloadMode {
@@ -100,6 +117,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
         let max_retries = config.max_lock_retries;
         let ip_max_sessions = config.ip_max_sessions;
+        let admission_mode = config.admission_mode;
 
         tokio::spawn(async move {
             let request_started = Instant::now();
@@ -112,6 +130,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 config_snapshot,
                 max_retries,
                 ip_max_sessions,
+                admission_mode,
             )
             .await;
             let _ = sender.send(Sample {
@@ -144,7 +163,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         concat!(
             "{{\"mode\":\"{}\",\"target_rate\":{},\"requested\":{},\"seconds\":{},",
-            "\"concurrency\":{},\"successes\":{},\"failures\":{},\"achieved_per_s\":{:.2},",
+            "\"admission\":\"{}\",\"concurrency\":{},\"successes\":{},\"failures\":{},\"achieved_per_s\":{:.2},",
             "\"lock_retries\":{},\"p50_ms\":{:.3},\"p95_ms\":{:.3},\"p99_ms\":{:.3},",
             "\"elapsed_s\":{:.3},\"preload_sessions\":{},\"ip_max\":{:?},\"errors\":{:?}}}"
         ),
@@ -152,6 +171,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.rate,
         requested,
         config.seconds,
+        config.admission_mode.as_str(),
         config.concurrency,
         successes,
         failures,
@@ -228,7 +248,31 @@ async fn admit_with_retry(
     config: ConfigSnapshot,
     max_retries: usize,
     ip_max_sessions: Option<usize>,
+    admission_mode: AdmissionMode,
 ) -> (Result<(), String>, u32) {
+    if matches!(admission_mode, AdmissionMode::Revision) {
+        let request = ClientAdmissionRequest::new(
+            SessionRecord::client(
+                session_id,
+                user_id,
+                "C63",
+                worker.caster_id,
+                worker.runtime_epoch,
+                "198.51.100.10",
+                "2026-11-22T02:00:00Z",
+            ),
+            max_sessions,
+            ip_max_sessions,
+            config,
+        );
+        let result =
+            admit_client_revision(&mut worker.client, worker.session_lease, &cluster, request)
+                .await
+                .map(|_| ())
+                .map_err(classify_error);
+        return (result, 0);
+    }
+
     for attempt in 0..=max_retries {
         match try_acquire_user_lock(&mut worker.client, worker.lock_lease, &cluster, &user_id).await
         {
@@ -279,6 +323,7 @@ fn classify_error(error: AdmissionError) -> String {
         AdmissionError::UserQuotaExceeded => "USER_QUOTA_EXCEEDED".to_owned(),
         AdmissionError::IpQuotaExceeded => "IP_QUOTA_EXCEEDED".to_owned(),
         AdmissionError::ConfigStale => "CONFIG_STALE".to_owned(),
+        AdmissionError::AdmissionConflict => "ADMISSION_CONFLICT".to_owned(),
         AdmissionError::StaleLock => "STALE_LOCK".to_owned(),
         AdmissionError::Source(error) => format!("SOURCE_{error}"),
         other => other.to_string(),
@@ -305,6 +350,7 @@ fn parse_args() -> Result<SpikeConfig, Box<dyn Error>> {
     let mut max_lock_retries = 250;
     let mut preload_sessions = 0;
     let mut ip_max_sessions = None;
+    let mut admission_mode = AdmissionMode::Lock;
     let args: Vec<String> = env::args().skip(1).collect();
     let mut index = 0;
 
@@ -327,6 +373,13 @@ fn parse_args() -> Result<SpikeConfig, Box<dyn Error>> {
             "--max-lock-retries" => max_lock_retries = value.parse()?,
             "--preload-sessions" => preload_sessions = value.parse()?,
             "--ip-max" => ip_max_sessions = Some(value.parse()?),
+            "--admission" => {
+                admission_mode = match value.as_str() {
+                    "lock" => AdmissionMode::Lock,
+                    "revision" => AdmissionMode::Revision,
+                    _ => return Err(format!("unknown admission mode {value}").into()),
+                }
+            }
             _ => return Err(format!("unknown argument {key}").into()),
         }
         index += 2;
@@ -355,5 +408,6 @@ fn parse_args() -> Result<SpikeConfig, Box<dyn Error>> {
         max_lock_retries,
         preload_sessions,
         ip_max_sessions,
+        admission_mode,
     })
 }

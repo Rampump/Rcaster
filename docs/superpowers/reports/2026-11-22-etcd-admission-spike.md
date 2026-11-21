@@ -1,7 +1,7 @@
 # Etcd Admission Spike Report
 
 - 日期：2026-11-22
-- 分支：`gate-1-etcd-admission-spike`
+- 分支：A：`gate-1-etcd-admission-spike`；B：`gate-1-revision-admission`
 - 实现：Rust release build，`tokio`、`etcd-client 0.21.1`
 - 驱动：[`admission_spike.rs`](../../../crates/rcaster-service/examples/admission_spike.rs)
 
@@ -15,9 +15,32 @@
 - 1 万 session 前缀仍可在约 100/s 热点准入下完成，p99 约 70 ms；count-only 读避免了返回 1 万个 value。
 - leader 成员停止后，使用仍存活 endpoints 的 entry 可继续；使用包含失效 endpoint 的完整列表时，新客户端存在连接失败。leader 重启后准入恢复。
 
-因此 Phase 0 选择采用方案 **B：per-user admission record + revision CAS** 作为下一设计门，并需要在 B 的证据中补充 per-IP admission record 或等价分片方案，解决大 NAT IP 串行瓶颈。当前锁方案继续保留，作为低竞争基线，不应据此宣称支持热点 1000/s。
+因此最初选择方案 **B：per-user admission record + revision CAS** 进行原型验证。B 的结论是：它显著改善独立用户路径，但同一 user/IP key 仍将热点准入串行限制在约 130/s。最终选择 **C** 作为热点作用域必须完成的下一个设计门；B 保留为普通非热点路径的候选实现。
 
-本报告不选择 C；独立 admission service 只有在 B 仍无法满足目标或运维复杂度被证明可接受时再进入概要设计。
+B 已证明无法满足热点 500/1000/s，因此进入 C 的条件已经满足。
+
+## 方案 B 复测
+
+B 使用：
+
+- `/runtime/admission/users/{user_id}` 与 `/runtime/admission/ips/{canonical_ip}` 持久 record。
+- record 本身不保存计数，只通过 etcd `mod_revision` 提供串行化版本。
+- 每次成功准入重写 record，并在同一 Txn 写 session；Source claim 仍与 owner session 同 Txn。
+- CAS 冲突从新的 record revision 和线性 count 重试，带 1–8 ms 随机抖动。
+- record 不绑定 lease，因此 lease 过期不会留下错误计数；session count 仍来自 count-only 线性读。
+
+| workload | offered/s | success | failure | achieved/s | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 独立用户 | 1000 | 5000 | 0 | 999.64 | 3.043 | 4.421 | 7.827 |
+| 热点用户 | 100 | 500 | 0 | 99.04 | 18.109 | 125.790 | 231.114 |
+| 热点用户 | 500 | 2496 | 4 | 141.14 | 308.759 | 1350.990 | 2019.441 |
+| 热点用户 | 1000 | 4990 | 10 | 129.71 | 337.136 | 1472.570 | 2380.760 |
+| 共享 NAT IP | 500 | 2500 | 0 | 138.41 | 323.785 | 1396.002 | 2153.134 |
+| 热点用户 + 1 万 session | 100 | 300 | 0 | 99.54 | 8.027 | 64.665 | 81.164 |
+
+B 消除了多数 `USER_LOCK_BUSY` / `IP_LOCK_BUSY` 失败，但在热点下仍由单 record CAS 串行化；每个成功请求仍包含 record 读、session count 读和 Txn。若要求热点 1000/s，需要 C 级批量/分片或独立 admission 协调，而不能继续只调 retry。
+
+方案 B 功能测试覆盖 Client/Source 最终额度竞争、100 Caster 竞争、NAT IP 隔离、配置 revision 拒绝和 Source claim 回滚，均通过。
 
 ## 环境
 

@@ -20,10 +20,11 @@ prototypes:
 - The admission spike record is in
   [`docs/superpowers/reports/2026-11-22-etcd-admission-spike.md`](docs/superpowers/reports/2026-11-22-etcd-admission-spike.md).
 
-The current lock-based design sustained 1000 admissions/s for unique users in the
-local three-member spike, but saturated at roughly 100/s for one hot user and
-roughly 66/s for one shared NAT IP. It is not production-approved for those
-hot-contention cases; the next gate is the per-user admission-record design.
+The lock-based design saturated at roughly 100/s for one hot user and roughly
+66/s for one shared NAT IP. The revision-record prototype sustained 1000
+admissions/s for unique users with p99 around 8 ms, but still saturated near
+130/s for hot user/IP scopes. Revision records remain the normal-path candidate;
+the next gate is the independent admission-service design for contended scopes.
 
 This is not yet a runnable NTRIP Caster.
 
