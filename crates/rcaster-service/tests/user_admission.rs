@@ -306,6 +306,65 @@ async fn concurrent_casters_do_not_exceed_user_limit() {
 }
 
 #[tokio::test]
+async fn one_hundred_casters_compete_for_the_final_slot() {
+    let cluster = unique("hundred-casters");
+    let user_id = "u_hundred";
+    let mut config_client = connect().await;
+    let config = publish_config(&mut config_client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let mut tasks = Vec::new();
+
+    for index in 0..100 {
+        let cluster = cluster.clone();
+        let config = config.clone();
+        let mut client = connect().await;
+        tasks.push(tokio::spawn(async move {
+            let lock_lease = grant_lease(&mut client, 30).await;
+            let session_lease = grant_lease(&mut client, 30).await;
+            let lock = acquire_user_lock(&mut client, lock_lease, &cluster, user_id).await?;
+            admit_client(
+                &mut client,
+                session_lease,
+                &cluster,
+                lock,
+                ClientAdmissionRequest::new(
+                    SessionRecord::client(
+                        format!("s_{index}"),
+                        user_id,
+                        "C63",
+                        format!("caster-{index}"),
+                        format!("boot_{index}"),
+                        "203.0.113.60",
+                        "2026-11-22T03:00:00Z",
+                    ),
+                    1,
+                    None,
+                    config,
+                ),
+            )
+            .await
+        }));
+    }
+
+    let mut successes = 0;
+    for task in tasks {
+        if task.await.expect("admission task").is_ok() {
+            successes += 1;
+        }
+    }
+
+    assert_eq!(successes, 1);
+    let mut client = connect().await;
+    assert_eq!(
+        read_user_session_count(&mut client, &cluster, user_id)
+            .await
+            .expect("count sessions"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn sources_do_not_consume_ip_client_quota() {
     let cluster = unique("ip-isolation");
     let user_id = "u_ip";
@@ -411,6 +470,71 @@ async fn sources_do_not_consume_ip_client_quota() {
     .await;
 
     assert!(matches!(second, Err(AdmissionError::IpQuotaExceeded)));
+}
+
+#[tokio::test]
+async fn session_count_queries_are_exact_for_user_and_ip_prefixes() {
+    let cluster = unique("count-query");
+    let user_id = "u_count";
+    let first_ip = "203.0.113.50";
+    let second_ip = "203.0.113.51";
+    let mut client = connect().await;
+    let config = publish_config(&mut client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+
+    for (session_id, client_ip) in [
+        ("s_count_1", first_ip),
+        ("s_count_2", first_ip),
+        ("s_count_3", second_ip),
+    ] {
+        let lock_lease = grant_lease(&mut client, 30).await;
+        let session_lease = grant_lease(&mut client, 30).await;
+        let lock = try_acquire_user_lock(&mut client, lock_lease, &cluster, user_id)
+            .await
+            .expect("user lock");
+        admit_client(
+            &mut client,
+            session_lease,
+            &cluster,
+            lock,
+            ClientAdmissionRequest::new(
+                SessionRecord::client(
+                    session_id,
+                    user_id,
+                    "C63",
+                    "caster-east-01",
+                    "boot_east",
+                    client_ip,
+                    "2026-11-22T02:00:00Z",
+                ),
+                10,
+                Some(10),
+                config.clone(),
+            ),
+        )
+        .await
+        .expect("client admission");
+    }
+
+    assert_eq!(
+        read_user_session_count(&mut client, &cluster, user_id)
+            .await
+            .expect("count user sessions"),
+        3
+    );
+    assert_eq!(
+        read_ip_session_count(&mut client, &cluster, first_ip)
+            .await
+            .expect("count first IP"),
+        2
+    );
+    assert_eq!(
+        read_ip_session_count(&mut client, &cluster, second_ip)
+            .await
+            .expect("count second IP"),
+        1
+    );
 }
 
 async fn connect() -> Client {

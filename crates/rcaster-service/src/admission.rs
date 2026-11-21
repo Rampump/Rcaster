@@ -311,7 +311,10 @@ pub async fn read_user_session_count(
     validate_key_segment(user_id, "user ID")?;
     let prefix = format!("/rcaster/{cluster_id}/online/users/{user_id}/sessions/");
     Ok(client
-        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .get(
+            prefix,
+            Some(GetOptions::new().with_prefix().with_count_only()),
+        )
         .await?
         .count() as usize)
 }
@@ -325,7 +328,10 @@ pub async fn read_ip_session_count(
     validate_key_segment(client_ip, "client IP")?;
     let prefix = format!("/rcaster/{cluster_id}/online/ips/{client_ip}/client-sessions/");
     Ok(client
-        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .get(
+            prefix,
+            Some(GetOptions::new().with_prefix().with_count_only()),
+        )
         .await?
         .count() as usize)
 }

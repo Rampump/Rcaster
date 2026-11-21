@@ -17,6 +17,13 @@ prototypes:
 - Integration tests verify final-slot races, stale lock takeover, atomic source rollback,
   cluster-wide user limits, and IP quota isolation.
 - Integration tests verify stale configuration rejection and recovery for clients and sources.
+- The admission spike record is in
+  [`docs/superpowers/reports/2026-11-22-etcd-admission-spike.md`](docs/superpowers/reports/2026-11-22-etcd-admission-spike.md).
+
+The current lock-based design sustained 1000 admissions/s for unique users in the
+local three-member spike, but saturated at roughly 100/s for one hot user and
+roughly 66/s for one shared NAT IP. It is not production-approved for those
+hot-contention cases; the next gate is the per-user admission-record design.
 
 This is not yet a runnable NTRIP Caster.
 
