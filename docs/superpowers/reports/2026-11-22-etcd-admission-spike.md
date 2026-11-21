@@ -112,6 +112,21 @@ gRPC 已增加内部 mTLS 和 service token：
 
 证书热轮换不主动断开旧连接；需要强制下线时仍由 Caster/session 管理逻辑处理。
 
+### mTLS RTT latency
+
+由于测试机只有单台本地 Windows 主机，本文使用 TCP 双向延迟代理模拟远端 RTT。代理只延迟加密字节，不终止 TLS；客户端仍实际验证 server certificate、client certificate 和 service token。
+
+每个 RTT 场景使用新的代理端口和 hot user，顺序执行 30 次准入：
+
+| simulated RTT | success | failure | p50 ms | p95 ms | p99 ms |
+|---:|---:|---:|---:|---:|---:|
+| 20 ms | 30 | 0 | 62.066 | 63.055 | 76.035 |
+| 50 ms | 30 | 0 | 109.025 | 110.009 | 122.897 |
+| 100 ms | 30 | 0 | 201.875 | 203.359 | 246.090 |
+| 250 ms | 30 | 0 | 434.908 | 439.089 | 556.392 |
+
+HTTP/2 请求头和响应体形成多个串行网络交换，因此一次 admission 的增量高于单个理论 RTT。结果证明功能在高 RTT 下仍成功，但不是生产 SLO：还需在真实跨地域链路、丢包、TLS 重握手、leader 切换和 Caster 并发下复测。
+
 ### Token rotation and rate limit
 
 `AdmissionAccessPolicy` 现在由共享 `Arc<RwLock<_>>` 保存：
@@ -126,7 +141,7 @@ gRPC 已增加内部 mTLS 和 service token：
 
 本原型尚未实现：
 
-- C 的跨主机 RTT；证书热轮换、service token 轮换和按 token 限流已完成。
+- C 的真实跨主机/公网 RTT 与丢包测试；本地延迟仿真、证书热轮换、service token 轮换和按 token 限流已完成。
 - Source 高并发性能基准；功能路径已完成 coordinator 批量化。
 - 多 owner 分片和跨分片 user/IP 额度协调。
 - 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。

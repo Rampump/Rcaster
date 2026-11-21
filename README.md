@@ -32,6 +32,8 @@ Service tokens can be rotated without restart and support optional per-token
 token-bucket rate limits.
 Admission mTLS server certificates and trusted client CAs can be rotated for
 new TLS connections without restarting the listener.
+Local mTLS RTT emulation from 20–250 ms completed successfully; real
+cross-region network validation remains required.
 Client and Source admissions now share the coordinator's user quota and atomic
 Source claim transaction; gRPC exposes both admission types.
 
