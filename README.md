@@ -12,9 +12,11 @@ prototypes:
 - `rcaster-service` contains atomic etcd source claims, activation, and cleanup.
 - User and IP admission locks serialize quota checks and conditionally commit session indexes.
 - Source admission commits the owner session and source claim in one transaction.
+- Client and source admission reject stale Caster Config revisions and resume after reloading.
 - Integration tests verify single-claim ownership and stale-owner fencing after lease expiry.
 - Integration tests verify final-slot races, stale lock takeover, atomic source rollback,
   cluster-wide user limits, and IP quota isolation.
+- Integration tests verify stale configuration rejection and recovery for clients and sources.
 
 This is not yet a runnable NTRIP Caster.
 

@@ -5,12 +5,17 @@ use rcaster_service::admission::{
     AdmissionError, ClientAdmissionRequest, SessionRecord, SourceAdmissionRequest, admit_client,
     admit_source, read_ip_session_count, read_user_session_count, try_acquire_user_lock,
 };
+use rcaster_service::config::{CasterConfig, publish_config};
 use rcaster_service::source_claim::{ClaimError, SourceClaimRequest, claim_source};
 
 #[tokio::test]
 async fn final_user_slot_allows_only_one_of_client_or_source() {
     let cluster = unique("final-slot");
     let user_id = "u_race";
+    let mut config_client = connect().await;
+    let config = publish_config(&mut config_client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
     let client_request = ClientAdmissionRequest::new(
         SessionRecord::client(
             "s_client",
@@ -23,6 +28,7 @@ async fn final_user_slot_allows_only_one_of_client_or_source() {
         ),
         1,
         None,
+        config.clone(),
     );
     let source_request = SourceAdmissionRequest::new(
         SessionRecord::source(
@@ -43,6 +49,7 @@ async fn final_user_slot_allows_only_one_of_client_or_source() {
             user_id,
             "2026-11-22T00:00:00Z",
         ),
+        config,
     );
 
     let mut client_task = connect().await;
@@ -96,6 +103,9 @@ async fn expired_lock_cannot_commit_after_another_caster_takes_over() {
     let cluster = unique("stale-lock");
     let user_id = "u_stale";
     let mut client = connect().await;
+    let config = publish_config(&mut client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
     let lock_lease = grant_lease(&mut client, 2).await;
     let stale_lock = try_acquire_user_lock(&mut client, lock_lease, &cluster, user_id)
         .await
@@ -123,6 +133,7 @@ async fn expired_lock_cannot_commit_after_another_caster_takes_over() {
             ),
             3,
             None,
+            config.clone(),
         ),
     )
     .await
@@ -146,6 +157,7 @@ async fn expired_lock_cannot_commit_after_another_caster_takes_over() {
             ),
             3,
             None,
+            config,
         ),
     )
     .await;
@@ -165,6 +177,9 @@ async fn failed_source_claim_writes_no_owner_session() {
     let owner_user = "u_owner";
     let blocking_user = "u_blocker";
     let mut client = connect().await;
+    let config = publish_config(&mut client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
     let blocker_lease = grant_lease(&mut client, 30).await;
     claim_source(
         &mut client,
@@ -212,6 +227,7 @@ async fn failed_source_claim_writes_no_owner_session() {
                 owner_user,
                 "2026-11-22T00:00:01Z",
             ),
+            config,
         ),
     )
     .await;
@@ -234,10 +250,15 @@ async fn concurrent_casters_do_not_exceed_user_limit() {
 
     let cluster = unique("cluster-limit");
     let user_id = "u_concurrent";
+    let mut config_client = connect().await;
+    let config = publish_config(&mut config_client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
     let mut tasks = Vec::new();
 
     for index in 0..10 {
         let cluster = cluster.clone();
+        let config = config.clone();
         let mut client = connect().await;
         tasks.push(tokio::spawn(async move {
             let lock_lease = grant_lease(&mut client, 30).await;
@@ -260,6 +281,7 @@ async fn concurrent_casters_do_not_exceed_user_limit() {
                     ),
                     LIMIT,
                     None,
+                    config,
                 ),
             )
             .await
@@ -289,6 +311,9 @@ async fn sources_do_not_consume_ip_client_quota() {
     let user_id = "u_ip";
     let ip = "203.0.113.30";
     let mut client = connect().await;
+    let config = publish_config(&mut client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
     let lock_lease = grant_lease(&mut client, 30).await;
     let source_lease = grant_lease(&mut client, 30).await;
     let lock = try_acquire_user_lock(&mut client, lock_lease, &cluster, user_id)
@@ -318,6 +343,7 @@ async fn sources_do_not_consume_ip_client_quota() {
                 user_id,
                 "2026-11-22T00:00:00Z",
             ),
+            config.clone(),
         ),
     )
     .await
@@ -351,6 +377,7 @@ async fn sources_do_not_consume_ip_client_quota() {
             ),
             3,
             Some(1),
+            config.clone(),
         ),
     )
     .await
@@ -378,6 +405,7 @@ async fn sources_do_not_consume_ip_client_quota() {
             ),
             3,
             Some(1),
+            config,
         ),
     )
     .await;

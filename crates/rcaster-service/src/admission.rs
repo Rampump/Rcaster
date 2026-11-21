@@ -4,6 +4,7 @@ use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, PutOpti
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use crate::config::{ConfigError, ConfigSnapshot, load_config_snapshot};
 use crate::source_claim::{
     ClaimError, ClaimedSource, SourceClaimRequest, claim_source_with_guards,
 };
@@ -14,12 +15,14 @@ pub enum AdmissionError {
     IpLockBusy,
     UserQuotaExceeded,
     IpQuotaExceeded,
+    ConfigStale,
     StaleLock,
     InvalidIdentifier(&'static str),
     CorruptState,
     SessionIdentityMismatch,
     MissingClientIp,
     Source(ClaimError),
+    Config(ConfigError),
     Etcd(etcd_client::Error),
     Json(serde_json::Error),
 }
@@ -31,12 +34,14 @@ impl fmt::Display for AdmissionError {
             Self::IpLockBusy => formatter.write_str("IP admission lock is busy"),
             Self::UserQuotaExceeded => formatter.write_str("user session quota exceeded"),
             Self::IpQuotaExceeded => formatter.write_str("IP session quota exceeded"),
+            Self::ConfigStale => formatter.write_str("caster config snapshot is stale"),
             Self::StaleLock => formatter.write_str("admission lock is stale"),
             Self::InvalidIdentifier(name) => write!(formatter, "invalid {name}"),
             Self::CorruptState => formatter.write_str("corrupt admission state"),
             Self::SessionIdentityMismatch => formatter.write_str("session identity mismatch"),
             Self::MissingClientIp => formatter.write_str("client session has no IP"),
             Self::Source(error) => write!(formatter, "source admission failed: {error}"),
+            Self::Config(error) => write!(formatter, "config error: {error}"),
             Self::Etcd(error) => write!(formatter, "etcd error: {error}"),
             Self::Json(error) => write!(formatter, "json error: {error}"),
         }
@@ -48,6 +53,12 @@ impl std::error::Error for AdmissionError {}
 impl From<etcd_client::Error> for AdmissionError {
     fn from(error: etcd_client::Error) -> Self {
         Self::Etcd(error)
+    }
+}
+
+impl From<ConfigError> for AdmissionError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
     }
 }
 
@@ -158,6 +169,7 @@ pub struct ClientAdmissionRequest {
     session: SessionRecord,
     max_sessions: usize,
     ip_max_sessions: Option<usize>,
+    config: ConfigSnapshot,
 }
 
 impl ClientAdmissionRequest {
@@ -165,11 +177,13 @@ impl ClientAdmissionRequest {
         session: SessionRecord,
         max_sessions: usize,
         ip_max_sessions: Option<usize>,
+        config: ConfigSnapshot,
     ) -> Self {
         Self {
             session,
             max_sessions,
             ip_max_sessions,
+            config,
         }
     }
 }
@@ -179,6 +193,7 @@ pub struct SourceAdmissionRequest {
     session: SessionRecord,
     max_sessions: usize,
     source_claim: SourceClaimRequest,
+    config: ConfigSnapshot,
 }
 
 impl SourceAdmissionRequest {
@@ -186,11 +201,13 @@ impl SourceAdmissionRequest {
         session: SessionRecord,
         max_sessions: usize,
         source_claim: SourceClaimRequest,
+        config: ConfigSnapshot,
     ) -> Self {
         Self {
             session,
             max_sessions,
             source_claim,
+            config,
         }
     }
 }
@@ -320,6 +337,7 @@ pub async fn admit_client(
     user_lock: UserLock,
     request: ClientAdmissionRequest,
 ) -> Result<ClientPermit, AdmissionError> {
+    validate_key_segment(cluster_id, "cluster ID")?;
     validate_session(&request.session)?;
     if request.session.user_id != user_lock.user_id {
         let _ = release_user_lock(client, &user_lock).await;
@@ -339,6 +357,7 @@ pub async fn admit_client(
     let session_key = user_session_key(cluster_id, &request.session);
     let session_value = serde_json::to_vec(&request.session)?;
     let mut compares = user_lock.lock.compares().to_vec();
+    compares.push(config_compare(cluster_id, &request.config));
     let mut operations = Vec::new();
 
     if let Some(ip_max_sessions) = request.ip_max_sessions {
@@ -372,11 +391,13 @@ pub async fn admit_client(
 
         let write = write_client_sessions(
             client,
+            cluster_id,
             lease_id,
             session_key,
             session_value,
             compares,
             operations,
+            &request.config,
         )
         .await;
         let _ = release_lock(client, &ip_lock.lock).await;
@@ -385,11 +406,13 @@ pub async fn admit_client(
     } else {
         let write = write_client_sessions(
             client,
+            cluster_id,
             lease_id,
             session_key,
             session_value,
             compares,
             operations,
+            &request.config,
         )
         .await;
         let _ = release_user_lock(client, &user_lock).await;
@@ -401,13 +424,16 @@ pub async fn admit_client(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_client_sessions(
     client: &mut Client,
+    cluster_id: &str,
     lease_id: i64,
     session_key: String,
     session_value: Vec<u8>,
     compares: Vec<Compare>,
     mut operations: Vec<TxnOp>,
+    config: &ConfigSnapshot,
 ) -> Result<(), AdmissionError> {
     operations.insert(
         0,
@@ -421,6 +447,8 @@ async fn write_client_sessions(
 
     if client.txn(transaction).await?.succeeded() {
         Ok(())
+    } else if load_config_snapshot(client, cluster_id).await?.revision != config.revision {
+        Err(AdmissionError::ConfigStale)
     } else {
         Err(AdmissionError::StaleLock)
     }
@@ -433,6 +461,7 @@ pub async fn admit_source(
     user_lock: UserLock,
     request: SourceAdmissionRequest,
 ) -> Result<SourcePermit, AdmissionError> {
+    validate_key_segment(cluster_id, "cluster ID")?;
     validate_session(&request.session)?;
     if request.session.user_id != user_lock.user_id
         || request.session.mountpoint != request.source_claim.mountpoint()
@@ -455,12 +484,14 @@ pub async fn admit_source(
         session_value,
         Some(PutOptions::new().with_lease(lease_id)),
     );
+    let mut compares = user_lock.lock.compares().to_vec();
+    compares.push(config_compare(cluster_id, &request.config));
     let claim = claim_source_with_guards(
         client,
         lease_id,
         cluster_id,
         request.source_claim,
-        user_lock.lock.compares().to_vec(),
+        compares,
         vec![session_operation],
     )
     .await;
@@ -471,7 +502,13 @@ pub async fn admit_source(
             session: request.session,
             claimed_source,
         }),
-        Err(ClaimError::GuardFailed) => Err(AdmissionError::StaleLock),
+        Err(ClaimError::GuardFailed) => {
+            if load_config_snapshot(client, cluster_id).await?.revision != request.config.revision {
+                Err(AdmissionError::ConfigStale)
+            } else {
+                Err(AdmissionError::StaleLock)
+            }
+        }
         Err(error) => Err(AdmissionError::Source(error)),
     }
 }
@@ -497,6 +534,14 @@ fn user_session_key(cluster_id: &str, session: &SessionRecord) -> String {
 
 fn ip_session_key(cluster_id: &str, client_ip: &str, session_id: &str) -> String {
     format!("/rcaster/{cluster_id}/online/ips/{client_ip}/client-sessions/{session_id}")
+}
+
+fn config_compare(cluster_id: &str, config: &ConfigSnapshot) -> Compare {
+    Compare::mod_revision(
+        format!("/rcaster/{cluster_id}/config/caster"),
+        CompareOp::Equal,
+        config.revision,
+    )
 }
 
 fn validate_key_segment(value: &str, name: &'static str) -> Result<(), AdmissionError> {
