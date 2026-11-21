@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package rcaster.admission.v1;
+
+service AdmissionService {
+  rpc AdmitClient(AdmitClientRequest) returns (AdmitClientResponse);
+}
+
+message AdmitClientRequest {
+  int64 caster_lease_id = 1;
+  string session_id = 2;
+  string user_id = 3;
+  string mountpoint = 4;
+  string caster_id = 5;
+  string runtime_epoch = 6;
+  string client_ip = 7;
+  uint64 max_sessions = 8;
+  optional uint64 ip_max_sessions = 9;
+  string started_at = 10;
+  uint64 config_generation = 11;
+  int64 config_revision = 12;
+}
+
+message AdmitClientResponse {
+  oneof result {
+    AdmitClientSuccess success = 1;
+    AdmissionError error = 2;
+  }
+}
+
+message AdmitClientSuccess {}
+
+message AdmissionError {
+  string code = 1;
+  string message = 2;
+}

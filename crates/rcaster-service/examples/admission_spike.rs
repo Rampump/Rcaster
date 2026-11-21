@@ -16,10 +16,12 @@ use rcaster_service::{
     },
     config::{CasterConfig, ConfigSnapshot, publish_config},
     coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
+    coordinator_grpc::{GrpcAdmissionClient, serve_admission_grpc},
     revision_admission::admit_client_revision,
 };
 use tokio::{
-    sync::{Semaphore, mpsc},
+    net::TcpListener,
+    sync::{Semaphore, mpsc, oneshot},
     time::{Instant, sleep, sleep_until},
 };
 
@@ -47,6 +49,7 @@ enum AdmissionMode {
     Lock,
     Revision,
     Coordinator,
+    Grpc,
 }
 
 impl AdmissionMode {
@@ -55,6 +58,7 @@ impl AdmissionMode {
             Self::Lock => "lock",
             Self::Revision => "revision",
             Self::Coordinator => "coordinator",
+            Self::Grpc => "grpc",
         }
     }
 }
@@ -77,10 +81,61 @@ struct PreparedCaster {
     runtime_epoch: String,
 }
 
+struct GrpcRuntime {
+    coordinator: Arc<AdmissionCoordinator>,
+    shutdown: oneshot::Sender<()>,
+    server: tokio::task::JoinHandle<()>,
+    client: GrpcAdmissionClient,
+}
+
+impl GrpcRuntime {
+    async fn shutdown(self) {
+        drop(self.client);
+        let _ = self.shutdown.send(());
+        let _ = self.server.await;
+        if let Ok(coordinator) = Arc::try_unwrap(self.coordinator) {
+            coordinator.shutdown().await;
+        }
+    }
+}
+
 struct Sample {
     latency: Duration,
     retries: u32,
     result: Result<(), String>,
+}
+
+async fn start_grpc_runtime(
+    cluster: &str,
+    endpoints: Vec<String>,
+) -> Result<GrpcRuntime, Box<dyn Error>> {
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(
+            connect(endpoints).await?,
+            cluster,
+            CoordinatorOptions::default(),
+        )
+        .await?,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_coordinator = coordinator.clone();
+    let server = tokio::spawn(async move {
+        serve_admission_grpc(listener, server_coordinator, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .expect("serve admission grpc");
+    });
+    sleep(Duration::from_millis(20)).await;
+    let client = GrpcAdmissionClient::connect(format!("http://{address}")).await?;
+    Ok(GrpcRuntime {
+        coordinator,
+        shutdown: shutdown_tx,
+        server,
+        client,
+    })
 }
 
 #[tokio::main]
@@ -104,6 +159,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await?,
         ))
+    } else {
+        None
+    };
+    let grpc_runtime = if matches!(config.admission_mode, AdmissionMode::Grpc) {
+        Some(start_grpc_runtime(&cluster, config.endpoints.clone()).await?)
     } else {
         None
     };
@@ -134,6 +194,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let ip_max_sessions = config.ip_max_sessions;
         let admission_mode = config.admission_mode;
         let coordinator = coordinator.clone();
+        let grpc_client = grpc_runtime.as_ref().map(|runtime| runtime.client.clone());
 
         tokio::spawn(async move {
             let request_started = Instant::now();
@@ -148,6 +209,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 ip_max_sessions,
                 admission_mode,
                 coordinator,
+                grpc_client,
             )
             .await;
             let _ = sender.send(Sample {
@@ -178,6 +240,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         && let Ok(coordinator) = Arc::try_unwrap(coordinator)
     {
         coordinator.shutdown().await;
+    }
+    if let Some(runtime) = grpc_runtime {
+        runtime.shutdown().await;
     }
 
     let elapsed = started.elapsed().as_secs_f64();
@@ -273,7 +338,32 @@ async fn admit_with_retry(
     ip_max_sessions: Option<usize>,
     admission_mode: AdmissionMode,
     coordinator: Option<Arc<AdmissionCoordinator>>,
+    grpc_client: Option<GrpcAdmissionClient>,
 ) -> (Result<(), String>, u32) {
+    if matches!(admission_mode, AdmissionMode::Grpc) {
+        let request = ClientAdmissionRequest::new(
+            SessionRecord::client(
+                session_id,
+                user_id,
+                "C63",
+                worker.caster_id,
+                worker.runtime_epoch,
+                "198.51.100.10",
+                "2026-11-22T02:00:00Z",
+            ),
+            max_sessions,
+            ip_max_sessions,
+            config,
+        );
+        let mut grpc_client = grpc_client.expect("grpc mode requires a client");
+        let result = grpc_client
+            .admit_client(worker.session_lease, request)
+            .await
+            .map(|_| ())
+            .map_err(classify_error);
+        return (result, 0);
+    }
+
     if matches!(admission_mode, AdmissionMode::Coordinator) {
         let request = ClientAdmissionRequest::new(
             SessionRecord::client(
@@ -426,6 +516,7 @@ fn parse_args() -> Result<SpikeConfig, Box<dyn Error>> {
                     "lock" => AdmissionMode::Lock,
                     "revision" => AdmissionMode::Revision,
                     "coordinator" => AdmissionMode::Coordinator,
+                    "grpc" => AdmissionMode::Grpc,
                     _ => return Err(format!("unknown admission mode {value}").into()),
                 }
             }

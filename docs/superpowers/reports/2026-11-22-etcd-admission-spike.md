@@ -63,9 +63,24 @@ C 原型使用一个 etcd lease 绑定的 admission owner：
 
 正确性测试覆盖 100 Caster 最终额度竞争、Source 不占 IP 配额、旧配置拒绝、owner 排他和 lease 到期后的新 owner 接管。
 
+### C gRPC transport
+
+C 已通过 tonic gRPC 暴露 `AdmitClient`：
+
+- protobuf 请求携带 session identity、Caster lease、连接上限和配置 generation/revision。
+- 服务端复用同一个批量 coordinator；配额和配置错误作为结构化业务响应返回。
+- loopback benchmark 使用真实 gRPC channel、真实 coordinator 和真实 etcd。
+
+| workload | offered/s | success | failure | achieved/s | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 热点用户 gRPC | 1000 | 5000 | 0 | 994.25 | 18.293 | 19.308 | 20.332 |
+| 共享 NAT IP gRPC | 1000 | 3000 | 0 | 991.85 | 18.849 | 20.336 | 30.718 |
+
+传输验证仍使用 loopback insecure channel。mTLS、内部 service token、授权、限流和跨主机 RTT 尚未实现。
+
 本原型尚未实现：
 
-- C 的 gRPC/mTLS 网络 transport；当前 benchmark 在进程内调用 coordinator 接口。
+- C 的 mTLS、service token 和授权；gRPC 本身已在 loopback 验证。
 - Source claim 批量化；Source 暂继续使用 B。
 - 多 owner 分片和跨分片 user/IP 额度协调。
 - 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。

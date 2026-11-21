@@ -665,10 +665,15 @@ name = "rcaster-service"
 version = "0.1.0"
 dependencies = [
  "etcd-client",
+ "prost",
  "rand",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
