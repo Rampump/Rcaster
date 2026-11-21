@@ -98,7 +98,19 @@ gRPC 已增加内部 mTLS 和 service token：
 - token 使用 constant-time 比较；认证发生在 coordinator 之前。
 - 无效 token、错误 scope、错误 cluster 和缺失客户端证书都会被拒绝，且不会创建 session。
 
-安全测试证书由 `rcgen` 在内存生成，不提交可用凭据。跨主机 RTT 和证书热轮换尚未验证。
+安全测试证书由 `rcgen` 在内存生成，不提交可用凭据。跨主机 RTT 尚未验证。
+
+### mTLS certificate rotation
+
+`ReloadableAdmissionMtlsServer` 使用固定 TCP listener 和动态 rustls acceptor：
+
+- 每个新 TLS 握手读取当前 server certificate、private key 和 client CA。
+- `rotate` 原子替换新连接的 TLS 配置，不需要重启 listener。
+- 已建立连接继续使用旧会话配置；新连接立即使用新 CA。
+- 测试从 CA-1 轮换到 CA-2 后，新 CA-1 客户端被拒绝，新 CA-2 客户端可直接准入。
+- 被拒绝的连接不产生 session。
+
+证书热轮换不主动断开旧连接；需要强制下线时仍由 Caster/session 管理逻辑处理。
 
 ### Token rotation and rate limit
 
@@ -114,7 +126,7 @@ gRPC 已增加内部 mTLS 和 service token：
 
 本原型尚未实现：
 
-- C 的证书热轮换和跨主机 RTT；service token 轮换和按 token 限流已完成。
+- C 的跨主机 RTT；证书热轮换、service token 轮换和按 token 限流已完成。
 - Source 高并发性能基准；功能路径已完成 coordinator 批量化。
 - 多 owner 分片和跨分片 user/IP 额度协调。
 - 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。

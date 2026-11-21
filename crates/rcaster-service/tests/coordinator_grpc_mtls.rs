@@ -12,6 +12,7 @@ use rcaster_service::{
         AdmissionAccessPolicy, GrpcAdmissionClient, GrpcClientTls, GrpcServerTls, ServiceToken,
         proto, serve_admission_grpc_mtls,
     },
+    coordinator_mtls_server::ReloadableAdmissionMtlsServer,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -177,6 +178,97 @@ async fn mtls_and_service_scope_guard_admission() {
         .expect("coordinator handle")
         .shutdown()
         .await;
+}
+
+#[tokio::test]
+async fn server_certificate_rotation_affects_new_tls_connections() {
+    let cluster = unique("grpc-cert-rotation");
+    let user_id = "u_cert_rotation";
+    let mut admin = connect().await;
+    let config = publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let first_pki = TestPki::generate();
+    let second_pki = TestPki::generate();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind grpc listener");
+    let address = listener.local_addr().expect("listener address");
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, CoordinatorOptions::default())
+            .await
+            .expect("start coordinator"),
+    );
+    let policy = AdmissionAccessPolicy::new(
+        &cluster,
+        [ServiceToken::new(
+            "certificate-rotation-token",
+            &cluster,
+            ["admission:write"],
+        )],
+    );
+    let server = ReloadableAdmissionMtlsServer::start(
+        listener,
+        coordinator.clone(),
+        first_pki.server_tls(),
+        policy,
+    )
+    .expect("start reloadable server");
+    let mut first_client = GrpcAdmissionClient::connect_mtls(
+        format!("https://{address}"),
+        first_pki.client_tls("certificate-rotation-token", "localhost"),
+    )
+    .await
+    .expect("first client");
+    first_client
+        .admit_client(
+            grant_lease(&mut admin).await,
+            secure_request(user_id, "s_cert_1", config.clone()),
+        )
+        .await
+        .expect("admission before rotation");
+
+    server.rotate(second_pki.server_tls()).expect("rotate TLS");
+
+    let old_certificate = GrpcAdmissionClient::connect_mtls(
+        format!("https://{address}"),
+        first_pki.client_tls("certificate-rotation-token", "localhost"),
+    )
+    .await;
+    if let Ok(mut client) = old_certificate {
+        let result = client
+            .admit_client(
+                grant_lease(&mut admin).await,
+                secure_request(user_id, "s_old_certificate", config.clone()),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    let mut second_client = GrpcAdmissionClient::connect_mtls(
+        format!("https://{address}"),
+        second_pki.client_tls("certificate-rotation-token", "localhost"),
+    )
+    .await
+    .expect("second client");
+    second_client
+        .admit_client(
+            grant_lease(&mut admin).await,
+            secure_request(user_id, "s_cert_2", config),
+        )
+        .await
+        .expect("admission after rotation");
+
+    assert_eq!(
+        read_user_session_count(&mut admin, &cluster, user_id)
+            .await
+            .expect("count sessions"),
+        2
+    );
+    drop(first_client);
+    drop(second_client);
+    server.shutdown().await.expect("shutdown TLS server");
+    drop(coordinator);
 }
 
 fn secure_request(

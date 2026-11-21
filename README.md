@@ -30,6 +30,8 @@ gRPC now requires internal mTLS, a cluster-scoped service token, and
 `admission:write` authorization.
 Service tokens can be rotated without restart and support optional per-token
 token-bucket rate limits.
+Admission mTLS server certificates and trusted client CAs can be rotated for
+new TLS connections without restarting the listener.
 Client and Source admissions now share the coordinator's user quota and atomic
 Source claim transaction; gRPC exposes both admission types.
 

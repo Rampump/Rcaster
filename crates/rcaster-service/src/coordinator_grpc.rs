@@ -203,8 +203,8 @@ impl Interceptor for ClientTokenInterceptor {
 }
 
 #[derive(Clone)]
-struct ServerTokenInterceptor {
-    policy: Arc<AdmissionAccessPolicy>,
+pub(crate) struct ServerTokenInterceptor {
+    pub(crate) policy: Arc<AdmissionAccessPolicy>,
 }
 
 impl Interceptor for ServerTokenInterceptor {
@@ -241,6 +241,7 @@ impl GrpcAdmissionClient {
         endpoint: impl Into<String>,
         tls: GrpcClientTls,
     ) -> Result<Self, AdmissionError> {
+        install_crypto_provider();
         let tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(tls.ca_certificate_pem))
             .identity(Identity::from_pem(tls.certificate_pem, tls.private_key_pem))
@@ -306,7 +307,7 @@ impl GrpcAdmissionClient {
     }
 }
 
-pub struct AdmissionGrpcService {
+pub(crate) struct AdmissionGrpcService {
     coordinator: Arc<AdmissionCoordinator>,
 }
 
@@ -385,6 +386,7 @@ pub async fn serve_admission_grpc_mtls<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    install_crypto_provider();
     let tls_config = ServerTlsConfig::new()
         .identity(Identity::from_pem(tls.certificate_pem, tls.private_key_pem))
         .client_ca_root(Certificate::from_pem(tls.client_ca_pem))
@@ -535,4 +537,8 @@ fn status_to_admission_error(status: Status) -> AdmissionError {
         tonic::Code::ResourceExhausted => AdmissionError::RateLimited,
         _ => AdmissionError::CoordinatorUnavailable,
     }
+}
+
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
