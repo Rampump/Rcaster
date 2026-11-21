@@ -26,7 +26,8 @@ unique users, but still saturated near 130/s for hot scopes. The selected
 coordinator prototype batches admissions under one lease-fenced owner and
 sustained 1000/s for hot users and shared NAT IP with p99 around 20 ms.
 The same workload over a loopback gRPC channel sustained roughly 992–994/s;
-mTLS and internal service authorization are the next security milestone.
+gRPC now requires internal mTLS, a cluster-scoped service token, and
+`admission:write` authorization.
 
 This is not yet a runnable NTRIP Caster.
 

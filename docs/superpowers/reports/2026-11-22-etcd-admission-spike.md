@@ -76,11 +76,18 @@ C 已通过 tonic gRPC 暴露 `AdmitClient`：
 | 热点用户 gRPC | 1000 | 5000 | 0 | 994.25 | 18.293 | 19.308 | 20.332 |
 | 共享 NAT IP gRPC | 1000 | 3000 | 0 | 991.85 | 18.849 | 20.336 | 30.718 |
 
-传输验证仍使用 loopback insecure channel。mTLS、内部 service token、授权、限流和跨主机 RTT 尚未实现。
+gRPC 已增加内部 mTLS 和 service token：
+
+- 服务端要求由内部 CA 签发的客户端证书。
+- 每个请求必须携带 Bearer service token，并具有当前 cluster 的 `admission:write` scope。
+- token 使用 constant-time 比较；认证发生在 coordinator 之前。
+- 无效 token、错误 scope、错误 cluster 和缺失客户端证书都会被拒绝，且不会创建 session。
+
+安全测试证书由 `rcgen` 在内存生成，不提交可用凭据。跨主机 RTT、证书轮换和限流尚未验证。
 
 本原型尚未实现：
 
-- C 的 mTLS、service token 和授权；gRPC 本身已在 loopback 验证。
+- C 的证书轮换、限流和跨主机 RTT；mTLS 与 service token 授权已在 loopback 验证。
 - Source claim 批量化；Source 暂继续使用 B。
 - 多 owner 分片和跨分片 user/IP 额度协调。
 - 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。

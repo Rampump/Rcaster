@@ -1,8 +1,14 @@
 use std::{future::Future, sync::Arc};
 
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status, transport::Channel};
+use tonic::{
+    Request, Response, Status,
+    metadata::MetadataValue,
+    service::{Interceptor, interceptor::InterceptedService},
+    transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig},
+};
 
 use crate::{
     admission::{AdmissionError, ClientAdmissionRequest, ClientPermit, SessionRecord},
@@ -24,7 +30,114 @@ use proto::{
 
 #[derive(Clone)]
 pub struct GrpcAdmissionClient {
-    inner: AdmissionServiceClient<Channel>,
+    inner: AdmissionServiceClient<InterceptedService<Channel, ClientTokenInterceptor>>,
+}
+
+#[derive(Clone)]
+pub struct GrpcClientTls {
+    pub ca_certificate_pem: String,
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    pub server_name: String,
+    pub service_token: String,
+}
+
+#[derive(Clone)]
+pub struct GrpcServerTls {
+    pub certificate_pem: String,
+    pub private_key_pem: String,
+    pub client_ca_pem: String,
+}
+
+#[derive(Clone)]
+pub struct ServiceToken {
+    secret: String,
+    cluster_id: String,
+    scopes: Vec<String>,
+}
+
+impl ServiceToken {
+    pub fn new(
+        secret: impl Into<String>,
+        cluster_id: impl Into<String>,
+        scopes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            secret: secret.into(),
+            cluster_id: cluster_id.into(),
+            scopes: scopes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AdmissionAccessPolicy {
+    cluster_id: String,
+    tokens: Vec<ServiceToken>,
+}
+
+impl AdmissionAccessPolicy {
+    pub fn new(
+        cluster_id: impl Into<String>,
+        tokens: impl IntoIterator<Item = ServiceToken>,
+    ) -> Self {
+        Self {
+            cluster_id: cluster_id.into(),
+            tokens: tokens.into_iter().collect(),
+        }
+    }
+
+    fn authorize(&self, presented: &str) -> Result<(), Status> {
+        for token in &self.tokens {
+            if token.secret.len() == presented.len()
+                && bool::from(token.secret.as_bytes().ct_eq(presented.as_bytes()))
+            {
+                if token.cluster_id != self.cluster_id
+                    || !token.scopes.iter().any(|scope| scope == "admission:write")
+                {
+                    return Err(Status::permission_denied("service token scope denied"));
+                }
+                return Ok(());
+            }
+        }
+        Err(Status::unauthenticated("invalid service token"))
+    }
+}
+
+#[derive(Clone)]
+struct ClientTokenInterceptor {
+    token: Option<String>,
+}
+
+impl Interceptor for ClientTokenInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(token) = &self.token {
+            let value = MetadataValue::try_from(format!("Bearer {token}"))
+                .map_err(|_| Status::internal("invalid authorization metadata"))?;
+            request.metadata_mut().insert("authorization", value);
+        }
+        Ok(request)
+    }
+}
+
+#[derive(Clone)]
+struct ServerTokenInterceptor {
+    policy: Arc<AdmissionAccessPolicy>,
+}
+
+impl Interceptor for ServerTokenInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| Status::unauthenticated("missing service token"))?;
+        let token = authorization
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| Status::unauthenticated("invalid authorization scheme"))?;
+        self.policy.authorize(token)?;
+        Ok(request)
+    }
 }
 
 impl GrpcAdmissionClient {
@@ -35,7 +148,35 @@ impl GrpcAdmissionClient {
             .await
             .map_err(|_| AdmissionError::CoordinatorUnavailable)?;
         Ok(Self {
-            inner: AdmissionServiceClient::new(channel),
+            inner: AdmissionServiceClient::with_interceptor(
+                channel,
+                ClientTokenInterceptor { token: None },
+            ),
+        })
+    }
+
+    pub async fn connect_mtls(
+        endpoint: impl Into<String>,
+        tls: GrpcClientTls,
+    ) -> Result<Self, AdmissionError> {
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(tls.ca_certificate_pem))
+            .identity(Identity::from_pem(tls.certificate_pem, tls.private_key_pem))
+            .domain_name(tls.server_name);
+        let channel = Channel::from_shared(endpoint.into())
+            .map_err(|_| AdmissionError::CoordinatorUnavailable)?
+            .tls_config(tls_config)
+            .map_err(|_| AdmissionError::CoordinatorUnavailable)?
+            .connect()
+            .await
+            .map_err(|_| AdmissionError::Unauthenticated)?;
+        Ok(Self {
+            inner: AdmissionServiceClient::with_interceptor(
+                channel,
+                ClientTokenInterceptor {
+                    token: Some(tls.service_token),
+                },
+            ),
         })
     }
 
@@ -48,7 +189,7 @@ impl GrpcAdmissionClient {
             .inner
             .admit_client(request_to_proto(lease_id, &request))
             .await
-            .map_err(|_| AdmissionError::CoordinatorUnavailable)?
+            .map_err(status_to_admission_error)?
             .into_inner();
 
         match response.result {
@@ -110,6 +251,32 @@ where
         .await
 }
 
+pub async fn serve_admission_grpc_mtls<F>(
+    listener: TcpListener,
+    coordinator: Arc<AdmissionCoordinator>,
+    tls: GrpcServerTls,
+    policy: AdmissionAccessPolicy,
+    shutdown: F,
+) -> Result<(), tonic::transport::Error>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let tls_config = ServerTlsConfig::new()
+        .identity(Identity::from_pem(tls.certificate_pem, tls.private_key_pem))
+        .client_ca_root(Certificate::from_pem(tls.client_ca_pem))
+        .client_auth_optional(false);
+    tonic::transport::Server::builder()
+        .tls_config(tls_config)?
+        .add_service(AdmissionServiceServer::with_interceptor(
+            AdmissionGrpcService::new(coordinator),
+            ServerTokenInterceptor {
+                policy: Arc::new(policy),
+            },
+        ))
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .await
+}
+
 fn request_to_proto(lease_id: i64, request: &ClientAdmissionRequest) -> AdmitClientRequest {
     AdmitClientRequest {
         caster_lease_id: lease_id,
@@ -166,6 +333,8 @@ fn error_from_proto(code: String) -> AdmissionError {
         "IP_QUOTA_EXCEEDED" => AdmissionError::IpQuotaExceeded,
         "CONFIG_STALE" => AdmissionError::ConfigStale,
         "ADMISSION_CONFLICT" => AdmissionError::AdmissionConflict,
+        "UNAUTHENTICATED" => AdmissionError::Unauthenticated,
+        "PERMISSION_DENIED" => AdmissionError::PermissionDenied,
         _ => AdmissionError::CoordinatorUnavailable,
     }
 }
@@ -177,6 +346,16 @@ fn error_code(error: &AdmissionError) -> &'static str {
         AdmissionError::ConfigStale => "CONFIG_STALE",
         AdmissionError::AdmissionConflict => "ADMISSION_CONFLICT",
         AdmissionError::CoordinatorUnavailable => "COORDINATOR_UNAVAILABLE",
+        AdmissionError::Unauthenticated => "UNAUTHENTICATED",
+        AdmissionError::PermissionDenied => "PERMISSION_DENIED",
         _ => "ADMISSION_FAILED",
+    }
+}
+
+fn status_to_admission_error(status: Status) -> AdmissionError {
+    match status.code() {
+        tonic::Code::Unauthenticated => AdmissionError::Unauthenticated,
+        tonic::Code::PermissionDenied => AdmissionError::PermissionDenied,
+        _ => AdmissionError::CoordinatorUnavailable,
     }
 }

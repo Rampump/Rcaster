@@ -18,6 +18,8 @@ pub enum AdmissionError {
     ConfigStale,
     AdmissionConflict,
     CoordinatorUnavailable,
+    Unauthenticated,
+    PermissionDenied,
     StaleLock,
     InvalidIdentifier(&'static str),
     CorruptState,
@@ -41,6 +43,8 @@ impl fmt::Display for AdmissionError {
             Self::CoordinatorUnavailable => {
                 formatter.write_str("admission coordinator is unavailable")
             }
+            Self::Unauthenticated => formatter.write_str("service authentication failed"),
+            Self::PermissionDenied => formatter.write_str("service permission denied"),
             Self::StaleLock => formatter.write_str("admission lock is stale"),
             Self::InvalidIdentifier(name) => write!(formatter, "invalid {name}"),
             Self::CorruptState => formatter.write_str("corrupt admission state"),
