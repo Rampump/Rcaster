@@ -28,6 +28,8 @@ sustained 1000/s for hot users and shared NAT IP with p99 around 20 ms.
 The same workload over a loopback gRPC channel sustained roughly 992–994/s;
 gRPC now requires internal mTLS, a cluster-scoped service token, and
 `admission:write` authorization.
+Service tokens can be rotated without restart and support optional per-token
+token-bucket rate limits.
 Client and Source admissions now share the coordinator's user quota and atomic
 Source claim transaction; gRPC exposes both admission types.
 

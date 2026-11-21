@@ -1,4 +1,8 @@
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex, RwLock},
+    time::Instant,
+};
 
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
@@ -63,6 +67,14 @@ pub struct ServiceToken {
     secret: String,
     cluster_id: String,
     scopes: Vec<String>,
+    rate_limit: Option<Arc<Mutex<TokenBucket>>>,
+}
+
+struct TokenBucket {
+    tokens: f64,
+    capacity: f64,
+    refill_per_second: f64,
+    last_refill: Instant,
 }
 
 impl ServiceToken {
@@ -75,12 +87,48 @@ impl ServiceToken {
             secret: secret.into(),
             cluster_id: cluster_id.into(),
             scopes: scopes.into_iter().map(Into::into).collect(),
+            rate_limit: None,
+        }
+    }
+
+    pub fn with_rate_limit(mut self, requests_per_second: u32, burst: u32) -> Self {
+        if requests_per_second > 0 && burst > 0 {
+            self.rate_limit = Some(Arc::new(Mutex::new(TokenBucket {
+                tokens: f64::from(burst),
+                capacity: f64::from(burst),
+                refill_per_second: f64::from(requests_per_second),
+                last_refill: Instant::now(),
+            })));
+        }
+        self
+    }
+
+    fn allow_request(&self) -> bool {
+        let Some(rate_limit) = &self.rate_limit else {
+            return true;
+        };
+        let Ok(mut bucket) = rate_limit.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * bucket.refill_per_second).min(bucket.capacity);
+        bucket.last_refill = now;
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 }
 
 #[derive(Clone)]
 pub struct AdmissionAccessPolicy {
+    state: Arc<RwLock<PolicyState>>,
+}
+
+struct PolicyState {
     cluster_id: String,
     tokens: Vec<ServiceToken>,
 }
@@ -91,25 +139,50 @@ impl AdmissionAccessPolicy {
         tokens: impl IntoIterator<Item = ServiceToken>,
     ) -> Self {
         Self {
-            cluster_id: cluster_id.into(),
-            tokens: tokens.into_iter().collect(),
+            state: Arc::new(RwLock::new(PolicyState {
+                cluster_id: cluster_id.into(),
+                tokens: tokens.into_iter().collect(),
+            })),
+        }
+    }
+
+    pub fn replace_tokens(&self, tokens: impl IntoIterator<Item = ServiceToken>) {
+        if let Ok(mut state) = self.state.write() {
+            state.tokens = tokens.into_iter().collect();
         }
     }
 
     fn authorize(&self, presented: &str) -> Result<(), Status> {
-        for token in &self.tokens {
-            if token.secret.len() == presented.len()
-                && bool::from(token.secret.as_bytes().ct_eq(presented.as_bytes()))
-            {
-                if token.cluster_id != self.cluster_id
-                    || !token.scopes.iter().any(|scope| scope == "admission:write")
-                {
-                    return Err(Status::permission_denied("service token scope denied"));
-                }
-                return Ok(());
-            }
+        let token = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| Status::internal("service policy lock failed"))?;
+            state
+                .tokens
+                .iter()
+                .find(|token| {
+                    token.secret.len() == presented.len()
+                        && bool::from(token.secret.as_bytes().ct_eq(presented.as_bytes()))
+                })
+                .cloned()
+                .ok_or_else(|| Status::unauthenticated("invalid service token"))?
+        };
+        let cluster_id = self
+            .state
+            .read()
+            .map_err(|_| Status::internal("service policy lock failed"))?
+            .cluster_id
+            .clone();
+        if token.cluster_id != cluster_id
+            || !token.scopes.iter().any(|scope| scope == "admission:write")
+        {
+            return Err(Status::permission_denied("service token scope denied"));
         }
-        Err(Status::unauthenticated("invalid service token"))
+        if !token.allow_request() {
+            return Err(Status::resource_exhausted("service token rate limited"));
+        }
+        Ok(())
     }
 }
 
@@ -434,6 +507,7 @@ fn error_from_proto(code: String) -> AdmissionError {
         "ADMISSION_CONFLICT" => AdmissionError::AdmissionConflict,
         "UNAUTHENTICATED" => AdmissionError::Unauthenticated,
         "PERMISSION_DENIED" => AdmissionError::PermissionDenied,
+        "RATE_LIMITED" => AdmissionError::RateLimited,
         "SOURCE_ALREADY_CLAIMED" => AdmissionError::Source(ClaimError::AlreadyClaimed),
         _ => AdmissionError::CoordinatorUnavailable,
     }
@@ -448,6 +522,7 @@ fn error_code(error: &AdmissionError) -> &'static str {
         AdmissionError::CoordinatorUnavailable => "COORDINATOR_UNAVAILABLE",
         AdmissionError::Unauthenticated => "UNAUTHENTICATED",
         AdmissionError::PermissionDenied => "PERMISSION_DENIED",
+        AdmissionError::RateLimited => "RATE_LIMITED",
         AdmissionError::Source(ClaimError::AlreadyClaimed) => "SOURCE_ALREADY_CLAIMED",
         _ => "ADMISSION_FAILED",
     }
@@ -457,6 +532,7 @@ fn status_to_admission_error(status: Status) -> AdmissionError {
     match status.code() {
         tonic::Code::Unauthenticated => AdmissionError::Unauthenticated,
         tonic::Code::PermissionDenied => AdmissionError::PermissionDenied,
+        tonic::Code::ResourceExhausted => AdmissionError::RateLimited,
         _ => AdmissionError::CoordinatorUnavailable,
     }
 }

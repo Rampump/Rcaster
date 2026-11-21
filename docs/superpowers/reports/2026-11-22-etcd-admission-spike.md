@@ -98,11 +98,23 @@ gRPC 已增加内部 mTLS 和 service token：
 - token 使用 constant-time 比较；认证发生在 coordinator 之前。
 - 无效 token、错误 scope、错误 cluster 和缺失客户端证书都会被拒绝，且不会创建 session。
 
-安全测试证书由 `rcgen` 在内存生成，不提交可用凭据。跨主机 RTT、证书轮换和限流尚未验证。
+安全测试证书由 `rcgen` 在内存生成，不提交可用凭据。跨主机 RTT 和证书热轮换尚未验证。
+
+### Token rotation and rate limit
+
+`AdmissionAccessPolicy` 现在由共享 `Arc<RwLock<_>>` 保存：
+
+- `replace_tokens` 可在服务运行中替换 token 集合。
+- 旧 token 对后续 RPC 立即失效，新 token 无需重启即可使用。
+- 每个 `ServiceToken` 可配置 `(requests_per_second, burst)` 令牌桶。
+- 限流是 per-token，不是 per-connection；共享同 token 的多个客户端共同消耗 bucket。
+- gRPC `ResourceExhausted` 映射为 `AdmissionError::RateLimited`，拒绝请求不写在线状态。
+
+测试覆盖在线轮换、旧 token 拒绝、新 token 准入和 burst=1 时第二次请求被限流。
 
 本原型尚未实现：
 
-- C 的证书轮换、限流和跨主机 RTT；mTLS 与 service token 授权已在 loopback 验证。
+- C 的证书热轮换和跨主机 RTT；service token 轮换和按 token 限流已完成。
 - Source 高并发性能基准；功能路径已完成 coordinator 批量化。
 - 多 owner 分片和跨分片 user/IP 额度协调。
 - 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。

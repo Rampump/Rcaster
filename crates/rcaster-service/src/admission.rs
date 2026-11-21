@@ -20,6 +20,7 @@ pub enum AdmissionError {
     CoordinatorUnavailable,
     Unauthenticated,
     PermissionDenied,
+    RateLimited,
     StaleLock,
     InvalidIdentifier(&'static str),
     CorruptState,
@@ -45,6 +46,7 @@ impl fmt::Display for AdmissionError {
             }
             Self::Unauthenticated => formatter.write_str("service authentication failed"),
             Self::PermissionDenied => formatter.write_str("service permission denied"),
+            Self::RateLimited => formatter.write_str("admission service rate limit exceeded"),
             Self::StaleLock => formatter.write_str("admission lock is stale"),
             Self::InvalidIdentifier(name) => write!(formatter, "invalid {name}"),
             Self::CorruptState => formatter.write_str("corrupt admission state"),

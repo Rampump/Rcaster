@@ -29,7 +29,7 @@ async fn mtls_and_service_scope_guard_admission() {
         .await
         .expect("publish config");
     let pki = TestPki::generate();
-    let (coordinator, shutdown, address, server) = start_server(&cluster, &pki).await;
+    let (coordinator, policy, shutdown, address, server) = start_server(&cluster, &pki).await;
     let endpoint = format!("https://{address}");
     let mut trusted = GrpcAdmissionClient::connect_mtls(
         endpoint.clone(),
@@ -99,7 +99,7 @@ async fn mtls_and_service_scope_guard_admission() {
     let cluster_permission = wrong_cluster
         .admit_client(
             grant_lease(&mut admin).await,
-            secure_request(user_id, "s_wrong_cluster", config),
+            secure_request(user_id, "s_wrong_cluster", config.clone()),
         )
         .await;
     assert!(matches!(
@@ -124,17 +124,53 @@ async fn mtls_and_service_scope_guard_admission() {
             .await;
         assert!(result.is_err());
     }
+
+    policy.replace_tokens([
+        ServiceToken::new("rotated-token", &cluster, ["admission:write"]).with_rate_limit(1, 1),
+    ]);
+    let old_after_rotation = trusted
+        .admit_client(
+            grant_lease(&mut admin).await,
+            secure_request(user_id, "s_old_after_rotation", config.clone()),
+        )
+        .await;
+    assert!(matches!(
+        old_after_rotation,
+        Err(AdmissionError::Unauthenticated)
+    ));
+
+    let mut rotated = GrpcAdmissionClient::connect_mtls(
+        format!("https://{address}"),
+        pki.client_tls("rotated-token", "localhost"),
+    )
+    .await
+    .expect("rotated-token client");
+    rotated
+        .admit_client(
+            grant_lease(&mut admin).await,
+            secure_request(user_id, "s_rotated", config.clone()),
+        )
+        .await
+        .expect("rotated token admission");
+    let rate_limited = rotated
+        .admit_client(
+            grant_lease(&mut admin).await,
+            secure_request(user_id, "s_rate_limited", config),
+        )
+        .await;
+    assert!(matches!(rate_limited, Err(AdmissionError::RateLimited)));
     assert_eq!(
         read_user_session_count(&mut admin, &cluster, user_id)
             .await
             .expect("count sessions"),
-        1
+        2
     );
 
     drop(trusted);
     drop(invalid);
     drop(read_only);
     drop(wrong_cluster);
+    drop(rotated);
     let _ = shutdown.send(());
     server.await.expect("grpc server");
     Arc::try_unwrap(coordinator)
@@ -169,6 +205,7 @@ async fn start_server(
     pki: &TestPki,
 ) -> (
     Arc<AdmissionCoordinator>,
+    AdmissionAccessPolicy,
     oneshot::Sender<()>,
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
@@ -191,6 +228,7 @@ async fn start_server(
             ServiceToken::new("wrong-cluster", "other-cluster", ["admission:write"]),
         ],
     );
+    let returned_policy = policy.clone();
     let server_tls = pki.server_tls();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -207,7 +245,7 @@ async fn start_server(
         .expect("serve mtls grpc");
     });
     tokio::time::sleep(Duration::from_millis(30)).await;
-    (coordinator, shutdown_tx, address, task)
+    (coordinator, returned_policy, shutdown_tx, address, task)
 }
 
 struct TestPki {
