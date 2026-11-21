@@ -1,0 +1,21 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.21
+    command:
+      - /usr/local/bin/etcd
+      - --name=rcaster-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://127.0.0.1:2380
+      - --initial-cluster=rcaster-etcd=http://127.0.0.1:2380
+      - --initial-cluster-state=new
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 1s
+      timeout: 1s
+      retries: 30

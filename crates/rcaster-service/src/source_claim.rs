@@ -1,0 +1,371 @@
+use std::fmt;
+
+use etcd_client::{Client, Compare, CompareOp, DeleteOptions, PutOptions, Txn, TxnOp};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug)]
+pub struct SourceClaimRequest {
+    mountpoint: String,
+    caster_id: String,
+    connection_id: String,
+    runtime_epoch: String,
+    relay_endpoint: String,
+    effective_user_id: String,
+    created_at: String,
+}
+
+impl SourceClaimRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mountpoint: impl Into<String>,
+        caster_id: impl Into<String>,
+        connection_id: impl Into<String>,
+        runtime_epoch: impl Into<String>,
+        relay_endpoint: impl Into<String>,
+        effective_user_id: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            mountpoint: mountpoint.into(),
+            caster_id: caster_id.into(),
+            connection_id: connection_id.into(),
+            runtime_epoch: runtime_epoch.into(),
+            relay_endpoint: relay_endpoint.into(),
+            effective_user_id: effective_user_id.into(),
+            created_at: created_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SourceClaim {
+    pub schema_version: u8,
+    pub source_generation: u64,
+    pub connection_id: String,
+    pub mountpoint: String,
+    pub caster_id: String,
+    pub runtime_epoch: String,
+    pub relay_endpoint: String,
+    pub effective_user_id: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaimedSource {
+    pub claim: SourceClaim,
+    pub claim_revision: i64,
+    pub source_revision: i64,
+    lease_id: i64,
+    claim_key: String,
+    source_key: String,
+    claim_value: Vec<u8>,
+    provisional_source_value: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum ClaimError {
+    AlreadyClaimed,
+    GenerationConflict,
+    StaleClaim,
+    InvalidArgument(&'static str),
+    CorruptState,
+    Etcd(etcd_client::Error),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for ClaimError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AlreadyClaimed => formatter.write_str("mountpoint already has a source claim"),
+            Self::GenerationConflict => formatter.write_str("source generation changed"),
+            Self::StaleClaim => formatter.write_str("source claim is stale"),
+            Self::InvalidArgument(message) => formatter.write_str(message),
+            Self::CorruptState => formatter.write_str("corrupt source claim state"),
+            Self::Etcd(error) => write!(formatter, "etcd error: {error}"),
+            Self::Json(error) => write!(formatter, "json error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ClaimError {}
+
+impl From<etcd_client::Error> for ClaimError {
+    fn from(error: etcd_client::Error) -> Self {
+        Self::Etcd(error)
+    }
+}
+
+impl From<serde_json::Error> for ClaimError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SourceRecord {
+    schema_version: u8,
+    state: SourceState,
+    source_generation: u64,
+    connection_id: String,
+    mountpoint: String,
+    caster_id: String,
+    runtime_epoch: String,
+    relay_endpoint: String,
+    effective_user_id: String,
+    created_at: String,
+}
+
+impl SourceRecord {
+    fn from_claim(claim: &SourceClaim, state: SourceState) -> Self {
+        Self {
+            schema_version: claim.schema_version,
+            state,
+            source_generation: claim.source_generation,
+            connection_id: claim.connection_id.clone(),
+            mountpoint: claim.mountpoint.clone(),
+            caster_id: claim.caster_id.clone(),
+            runtime_epoch: claim.runtime_epoch.clone(),
+            relay_endpoint: claim.relay_endpoint.clone(),
+            effective_user_id: claim.effective_user_id.clone(),
+            created_at: claim.created_at.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+enum SourceState {
+    #[serde(rename = "VALIDATING")]
+    Validating,
+    #[serde(rename = "ACTIVE")]
+    Active,
+}
+
+pub async fn claim_source(
+    client: &mut Client,
+    lease_id: i64,
+    cluster_id: &str,
+    request: SourceClaimRequest,
+) -> Result<ClaimedSource, ClaimError> {
+    validate_identifier(cluster_id, "cluster ID")?;
+    validate_mountpoint(&request.mountpoint)?;
+
+    let claim_key = format!(
+        "/rcaster/{cluster_id}/runtime/source-claims/{}",
+        request.mountpoint
+    );
+    let generation_key = format!(
+        "/rcaster/{cluster_id}/runtime/source-generations/{}",
+        request.mountpoint
+    );
+    let source_key = format!(
+        "/rcaster/{cluster_id}/runtime/sources/{}",
+        request.mountpoint
+    );
+
+    for _ in 0..8 {
+        if !client.get(claim_key.clone(), None).await?.kvs().is_empty() {
+            return Err(ClaimError::AlreadyClaimed);
+        }
+
+        let generation_value = client
+            .get(generation_key.clone(), None)
+            .await?
+            .kvs()
+            .first()
+            .cloned();
+        let old_generation = match &generation_value {
+            Some(value) => std::str::from_utf8(value.value())
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(ClaimError::CorruptState)?,
+            None => 0,
+        };
+        let next_generation = old_generation
+            .checked_add(1)
+            .ok_or(ClaimError::CorruptState)?;
+        let claim = SourceClaim {
+            schema_version: 1,
+            source_generation: next_generation,
+            connection_id: request.connection_id.clone(),
+            mountpoint: request.mountpoint.clone(),
+            caster_id: request.caster_id.clone(),
+            runtime_epoch: request.runtime_epoch.clone(),
+            relay_endpoint: request.relay_endpoint.clone(),
+            effective_user_id: request.effective_user_id.clone(),
+            created_at: request.created_at.clone(),
+        };
+        let claim_value = serde_json::to_vec(&claim)?;
+        let provisional_source_value =
+            serde_json::to_vec(&SourceRecord::from_claim(&claim, SourceState::Validating))?;
+        let generation_compare = match generation_value {
+            Some(value) => Compare::value(generation_key.clone(), CompareOp::Equal, value.value()),
+            None => Compare::create_revision(generation_key.clone(), CompareOp::Equal, 0),
+        };
+        let transaction = Txn::new()
+            .when([
+                Compare::create_revision(claim_key.clone(), CompareOp::Equal, 0),
+                generation_compare,
+            ])
+            .and_then([
+                TxnOp::put(generation_key.clone(), next_generation.to_string(), None),
+                TxnOp::put(
+                    claim_key.clone(),
+                    claim_value.clone(),
+                    Some(PutOptions::new().with_lease(lease_id)),
+                ),
+                TxnOp::put(
+                    source_key.clone(),
+                    provisional_source_value.clone(),
+                    Some(PutOptions::new().with_lease(lease_id)),
+                ),
+            ]);
+        let response = client.txn(transaction).await?;
+
+        if response.succeeded() {
+            let revision = response
+                .header()
+                .ok_or(ClaimError::CorruptState)?
+                .revision();
+            return Ok(ClaimedSource {
+                claim,
+                claim_revision: revision,
+                source_revision: revision,
+                lease_id,
+                claim_key,
+                source_key,
+                claim_value,
+                provisional_source_value,
+            });
+        }
+    }
+
+    Err(ClaimError::GenerationConflict)
+}
+
+pub async fn publish_active(
+    client: &mut Client,
+    claimed: &ClaimedSource,
+) -> Result<(), ClaimError> {
+    let active_source_value = serde_json::to_vec(&SourceRecord::from_claim(
+        &claimed.claim,
+        SourceState::Active,
+    ))?;
+    let transaction = Txn::new()
+        .when(claimed.publish_compares())
+        .and_then([TxnOp::put(
+            claimed.source_key.clone(),
+            active_source_value,
+            Some(PutOptions::new().with_lease(claimed.lease_id)),
+        )]);
+
+    if client.txn(transaction).await?.succeeded() {
+        Ok(())
+    } else {
+        Err(ClaimError::StaleClaim)
+    }
+}
+
+pub async fn release_source(
+    client: &mut Client,
+    claimed: &ClaimedSource,
+) -> Result<(), ClaimError> {
+    let transaction = Txn::new().when(claimed.claim_compares()).and_then([
+        TxnOp::delete(claimed.claim_key.clone(), Some(DeleteOptions::new())),
+        TxnOp::delete(claimed.source_key.clone(), Some(DeleteOptions::new())),
+    ]);
+
+    if client.txn(transaction).await?.succeeded() {
+        Ok(())
+    } else {
+        Err(ClaimError::StaleClaim)
+    }
+}
+
+impl ClaimedSource {
+    fn claim_compares(&self) -> [Compare; 3] {
+        [
+            Compare::mod_revision(
+                self.claim_key.clone(),
+                CompareOp::Equal,
+                self.claim_revision,
+            ),
+            Compare::value(
+                self.claim_key.clone(),
+                CompareOp::Equal,
+                self.claim_value.clone(),
+            ),
+            Compare::lease(self.claim_key.clone(), CompareOp::Equal, self.lease_id),
+        ]
+    }
+
+    fn publish_compares(&self) -> [Compare; 5] {
+        [
+            Compare::mod_revision(
+                self.claim_key.clone(),
+                CompareOp::Equal,
+                self.claim_revision,
+            ),
+            Compare::value(
+                self.claim_key.clone(),
+                CompareOp::Equal,
+                self.claim_value.clone(),
+            ),
+            Compare::lease(self.claim_key.clone(), CompareOp::Equal, self.lease_id),
+            Compare::mod_revision(
+                self.source_key.clone(),
+                CompareOp::Equal,
+                self.source_revision,
+            ),
+            Compare::value(
+                self.source_key.clone(),
+                CompareOp::Equal,
+                self.provisional_source_value.clone(),
+            ),
+        ]
+    }
+}
+
+fn validate_identifier(value: &str, name: &'static str) -> Result<(), ClaimError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ClaimError::InvalidArgument(name));
+    }
+    Ok(())
+}
+
+fn validate_mountpoint(value: &str) -> Result<(), ClaimError> {
+    if value.is_empty()
+        || value.len() > 100
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ClaimError::InvalidArgument("invalid mountpoint"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClaimError, validate_mountpoint};
+
+    #[test]
+    fn rejects_mountpoints_that_escape_the_etcd_key_segment() {
+        assert!(matches!(
+            validate_mountpoint("C63/extra"),
+            Err(ClaimError::InvalidArgument("invalid mountpoint"))
+        ));
+        assert!(matches!(
+            validate_mountpoint(""),
+            Err(ClaimError::InvalidArgument("invalid mountpoint"))
+        ));
+    }
+
+    #[test]
+    fn accepts_the_documented_mountpoint_character_set() {
+        validate_mountpoint("C63-east_1.test").expect("valid mountpoint");
+    }
+}

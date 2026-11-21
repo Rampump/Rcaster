@@ -1,0 +1,31 @@
+# RCaster
+
+RCaster is a Rust NTRIP Caster implemented from the design in
+[`rust-rewrite-plan.md`](rust-rewrite-plan.md).
+
+## Current state
+
+The repository currently contains the Gate 1 source-fencing prototype:
+
+- `rcaster-core` contains the in-process dispatch fence.
+- `rcaster-service` contains atomic etcd source claims, activation, and cleanup.
+- Integration tests verify single-claim ownership and stale-owner fencing after lease expiry.
+
+This is not yet a runnable NTRIP Caster.
+
+## Development
+
+Requirements:
+
+- Rust 1.87 or newer.
+- `protoc`, required by `etcd-client`.
+- etcd 3.5 reachable at `http://127.0.0.1:2379`.
+
+Start etcd and run the workspace tests:
+
+```bash
+docker compose up -d etcd
+cargo test --workspace
+```
+
+Set `RCASTER_ETCD_ENDPOINT` to test against a different etcd endpoint.
