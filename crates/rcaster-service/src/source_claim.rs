@@ -35,6 +35,14 @@ impl SourceClaimRequest {
             created_at: created_at.into(),
         }
     }
+
+    pub fn mountpoint(&self) -> &str {
+        &self.mountpoint
+    }
+
+    pub fn effective_user_id(&self) -> &str {
+        &self.effective_user_id
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -66,6 +74,7 @@ pub struct ClaimedSource {
 pub enum ClaimError {
     AlreadyClaimed,
     GenerationConflict,
+    GuardFailed,
     StaleClaim,
     InvalidArgument(&'static str),
     CorruptState,
@@ -78,6 +87,7 @@ impl fmt::Display for ClaimError {
         match self {
             Self::AlreadyClaimed => formatter.write_str("mountpoint already has a source claim"),
             Self::GenerationConflict => formatter.write_str("source generation changed"),
+            Self::GuardFailed => formatter.write_str("source admission guard failed"),
             Self::StaleClaim => formatter.write_str("source claim is stale"),
             Self::InvalidArgument(message) => formatter.write_str(message),
             Self::CorruptState => formatter.write_str("corrupt source claim state"),
@@ -146,6 +156,25 @@ pub async fn claim_source(
     cluster_id: &str,
     request: SourceClaimRequest,
 ) -> Result<ClaimedSource, ClaimError> {
+    claim_source_with_guards(
+        client,
+        lease_id,
+        cluster_id,
+        request,
+        Vec::new(),
+        Vec::new(),
+    )
+    .await
+}
+
+pub(crate) async fn claim_source_with_guards(
+    client: &mut Client,
+    lease_id: i64,
+    cluster_id: &str,
+    request: SourceClaimRequest,
+    additional_compares: Vec<Compare>,
+    additional_operations: Vec<TxnOp>,
+) -> Result<ClaimedSource, ClaimError> {
     validate_identifier(cluster_id, "cluster ID")?;
     validate_mountpoint(&request.mountpoint)?;
 
@@ -201,24 +230,26 @@ pub async fn claim_source(
             Some(value) => Compare::value(generation_key.clone(), CompareOp::Equal, value.value()),
             None => Compare::create_revision(generation_key.clone(), CompareOp::Equal, 0),
         };
-        let transaction = Txn::new()
-            .when([
-                Compare::create_revision(claim_key.clone(), CompareOp::Equal, 0),
-                generation_compare,
-            ])
-            .and_then([
-                TxnOp::put(generation_key.clone(), next_generation.to_string(), None),
-                TxnOp::put(
-                    claim_key.clone(),
-                    claim_value.clone(),
-                    Some(PutOptions::new().with_lease(lease_id)),
-                ),
-                TxnOp::put(
-                    source_key.clone(),
-                    provisional_source_value.clone(),
-                    Some(PutOptions::new().with_lease(lease_id)),
-                ),
-            ]);
+        let mut compares = vec![
+            Compare::create_revision(claim_key.clone(), CompareOp::Equal, 0),
+            generation_compare,
+        ];
+        compares.extend(additional_compares.iter().cloned());
+        let mut operations = vec![
+            TxnOp::put(generation_key.clone(), next_generation.to_string(), None),
+            TxnOp::put(
+                claim_key.clone(),
+                claim_value.clone(),
+                Some(PutOptions::new().with_lease(lease_id)),
+            ),
+            TxnOp::put(
+                source_key.clone(),
+                provisional_source_value.clone(),
+                Some(PutOptions::new().with_lease(lease_id)),
+            ),
+        ];
+        operations.extend(additional_operations.iter().cloned());
+        let transaction = Txn::new().when(compares).and_then(operations);
         let response = client.txn(transaction).await?;
 
         if response.succeeded() {
@@ -236,6 +267,10 @@ pub async fn claim_source(
                 claim_value,
                 provisional_source_value,
             });
+        }
+
+        if !additional_compares.is_empty() {
+            return Err(ClaimError::GuardFailed);
         }
     }
 

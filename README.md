@@ -5,11 +5,16 @@ RCaster is a Rust NTRIP Caster implemented from the design in
 
 ## Current state
 
-The repository currently contains the Gate 1 source-fencing prototype:
+The repository currently contains the Gate 1 source-fencing and user-admission
+prototypes:
 
 - `rcaster-core` contains the in-process dispatch fence.
 - `rcaster-service` contains atomic etcd source claims, activation, and cleanup.
+- User and IP admission locks serialize quota checks and conditionally commit session indexes.
+- Source admission commits the owner session and source claim in one transaction.
 - Integration tests verify single-claim ownership and stale-owner fencing after lease expiry.
+- Integration tests verify final-slot races, stale lock takeover, atomic source rollback,
+  cluster-wide user limits, and IP quota isolation.
 
 This is not yet a runnable NTRIP Caster.
 
