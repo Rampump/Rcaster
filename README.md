@@ -36,6 +36,9 @@ Local mTLS RTT emulation from 20–250 ms completed successfully; real
 cross-region network validation remains required.
 Client and Source admissions now share the coordinator's user quota and atomic
 Source claim transaction; gRPC exposes both admission types.
+`rcaster-rtklib` contains a supervised, bounded decoder-worker protocol; its
+fixture worker verifies crash, timeout, oversize, and restart behavior while the
+real RTKLIB ABI adapter remains pending.
 
 This is not yet a runnable NTRIP Caster.
 
