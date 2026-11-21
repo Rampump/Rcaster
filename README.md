@@ -21,10 +21,10 @@ prototypes:
   [`docs/superpowers/reports/2026-11-22-etcd-admission-spike.md`](docs/superpowers/reports/2026-11-22-etcd-admission-spike.md).
 
 The lock-based design saturated at roughly 100/s for one hot user and roughly
-66/s for one shared NAT IP. The revision-record prototype sustained 1000
-admissions/s for unique users with p99 around 8 ms, but still saturated near
-130/s for hot user/IP scopes. Revision records remain the normal-path candidate;
-the next gate is the independent admission-service design for contended scopes.
+66/s for one shared NAT IP. Revision records sustained 1000 admissions/s for
+unique users, but still saturated near 130/s for hot scopes. The selected
+coordinator prototype batches admissions under one lease-fenced owner and
+sustained 1000/s for hot users and shared NAT IP with p99 around 20 ms.
 
 This is not yet a runnable NTRIP Caster.
 

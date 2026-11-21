@@ -17,6 +17,7 @@ pub enum AdmissionError {
     IpQuotaExceeded,
     ConfigStale,
     AdmissionConflict,
+    CoordinatorUnavailable,
     StaleLock,
     InvalidIdentifier(&'static str),
     CorruptState,
@@ -37,6 +38,9 @@ impl fmt::Display for AdmissionError {
             Self::IpQuotaExceeded => formatter.write_str("IP session quota exceeded"),
             Self::ConfigStale => formatter.write_str("caster config snapshot is stale"),
             Self::AdmissionConflict => formatter.write_str("admission record changed concurrently"),
+            Self::CoordinatorUnavailable => {
+                formatter.write_str("admission coordinator is unavailable")
+            }
             Self::StaleLock => formatter.write_str("admission lock is stale"),
             Self::InvalidIdentifier(name) => write!(formatter, "invalid {name}"),
             Self::CorruptState => formatter.write_str("corrupt admission state"),

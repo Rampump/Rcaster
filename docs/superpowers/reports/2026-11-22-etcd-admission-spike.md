@@ -1,7 +1,7 @@
 # Etcd Admission Spike Report
 
 - 日期：2026-11-22
-- 分支：A：`gate-1-etcd-admission-spike`；B：`gate-1-revision-admission`
+- 分支：A：`gate-1-etcd-admission-spike`；B：`gate-1-revision-admission`；C：`gate-1-coordinator-admission`
 - 实现：Rust release build，`tokio`、`etcd-client 0.21.1`
 - 驱动：[`admission_spike.rs`](../../../crates/rcaster-service/examples/admission_spike.rs)
 
@@ -15,9 +15,9 @@
 - 1 万 session 前缀仍可在约 100/s 热点准入下完成，p99 约 70 ms；count-only 读避免了返回 1 万个 value。
 - leader 成员停止后，使用仍存活 endpoints 的 entry 可继续；使用包含失效 endpoint 的完整列表时，新客户端存在连接失败。leader 重启后准入恢复。
 
-因此最初选择方案 **B：per-user admission record + revision CAS** 进行原型验证。B 的结论是：它显著改善独立用户路径，但同一 user/IP key 仍将热点准入串行限制在约 130/s。最终选择 **C** 作为热点作用域必须完成的下一个设计门；B 保留为普通非热点路径的候选实现。
+因此最初选择方案 **B：per-user admission record + revision CAS** 进行原型验证。B 显著改善了独立用户路径，但同一 user/IP key 仍将热点准入串行限制在约 130/s。C 原型完成后，热点 Client/NAT 准入稳定达到 1000/s，因此最终选择 **C：单 owner 批量 admission coordinator** 作为生产 admission 架构。
 
-B 已证明无法满足热点 500/1000/s，因此进入 C 的条件已经满足。
+B 已证明无法满足热点 500/1000/s，因此进入 C 的条件已经满足。C 的 Client/NAT 原型随后达到目标；Source 批量化、网络 transport 和分片仍是后续工作。
 
 ## 方案 B 复测
 
@@ -41,6 +41,34 @@ B 使用：
 B 消除了多数 `USER_LOCK_BUSY` / `IP_LOCK_BUSY` 失败，但在热点下仍由单 record CAS 串行化；每个成功请求仍包含 record 读、session count 读和 Txn。若要求热点 1000/s，需要 C 级批量/分片或独立 admission 协调，而不能继续只调 retry。
 
 方案 B 功能测试覆盖 Client/Source 最终额度竞争、100 Caster 竞争、NAT IP 隔离、配置 revision 拒绝和 Source claim 回滚，均通过。
+
+## 方案 C 原型
+
+C 原型使用一个 etcd lease 绑定的 admission owner：
+
+- owner key 保证同一时刻只有一个 coordinator 提交准入。
+- 请求在一个进程内按最多 64 条或 5 ms 窗口聚合。
+- 每个 batch 对涉及的 user/IP 前缀并发执行线性 count-only 查询。
+- coordinator 在内存中按 batch 顺序分配额度，并将所有接受请求的 session/index 写入同一个 etcd Txn。
+- Txn 同时比较 config revision 和 owner key revision/value/lease。
+- owner keepalive 失败或 owner Txn 比较失败时，新准入立即 fencing。
+
+| workload | offered/s | success | failure | achieved/s | p50 ms | p95 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 独立用户 | 1000 | 5000 | 0 | 994.85 | 17.982 | 18.978 | 19.741 |
+| 热点用户 | 1000 | 5000 | 0 | 993.47 | 17.828 | 18.732 | 19.424 |
+| 共享 NAT IP | 500 | 2500 | 0 | 498.05 | 18.504 | 20.126 | 24.224 |
+| 共享 NAT IP | 1000 | 3000 | 0 | 993.64 | 18.777 | 20.003 | 20.767 |
+| 热点用户 + 1 万 session | 100 | 300 | 0 | 99.62 | 18.732 | 19.686 | 20.161 |
+
+正确性测试覆盖 100 Caster 最终额度竞争、Source 不占 IP 配额、旧配置拒绝、owner 排他和 lease 到期后的新 owner 接管。
+
+本原型尚未实现：
+
+- C 的 gRPC/mTLS 网络 transport；当前 benchmark 在进程内调用 coordinator 接口。
+- Source claim 批量化；Source 暂继续使用 B。
+- 多 owner 分片和跨分片 user/IP 额度协调。
+- 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。
 
 ## 环境
 

@@ -15,6 +15,7 @@ use rcaster_service::{
         AdmissionError, ClientAdmissionRequest, SessionRecord, admit_client, try_acquire_user_lock,
     },
     config::{CasterConfig, ConfigSnapshot, publish_config},
+    coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
     revision_admission::admit_client_revision,
 };
 use tokio::{
@@ -45,6 +46,7 @@ enum WorkloadMode {
 enum AdmissionMode {
     Lock,
     Revision,
+    Coordinator,
 }
 
 impl AdmissionMode {
@@ -52,6 +54,7 @@ impl AdmissionMode {
         match self {
             Self::Lock => "lock",
             Self::Revision => "revision",
+            Self::Coordinator => "coordinator",
         }
     }
 }
@@ -92,6 +95,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config_snapshot = publish_config(&mut admin, &cluster, CasterConfig::new(1)).await?;
     preload_sessions(&mut admin, &cluster, config.preload_sessions).await?;
     let workers = prepare_workers(config.endpoints.clone(), config.concurrency).await?;
+    let coordinator = if matches!(config.admission_mode, AdmissionMode::Coordinator) {
+        Some(Arc::new(
+            AdmissionCoordinator::start(
+                connect(config.endpoints.clone()).await?,
+                cluster.clone(),
+                CoordinatorOptions::default(),
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
     let (sender, mut receiver) = mpsc::unbounded_channel();
     let in_flight = Arc::new(Semaphore::new(config.concurrency));
     let worker_cursor = Arc::new(AtomicUsize::new(0));
@@ -118,6 +133,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let max_retries = config.max_lock_retries;
         let ip_max_sessions = config.ip_max_sessions;
         let admission_mode = config.admission_mode;
+        let coordinator = coordinator.clone();
 
         tokio::spawn(async move {
             let request_started = Instant::now();
@@ -131,6 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 max_retries,
                 ip_max_sessions,
                 admission_mode,
+                coordinator,
             )
             .await;
             let _ = sender.send(Sample {
@@ -155,6 +172,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(()) => successes += 1,
             Err(class) => *errors.entry(class).or_default() += 1,
         }
+    }
+
+    if let Some(coordinator) = coordinator
+        && let Ok(coordinator) = Arc::try_unwrap(coordinator)
+    {
+        coordinator.shutdown().await;
     }
 
     let elapsed = started.elapsed().as_secs_f64();
@@ -249,7 +272,32 @@ async fn admit_with_retry(
     max_retries: usize,
     ip_max_sessions: Option<usize>,
     admission_mode: AdmissionMode,
+    coordinator: Option<Arc<AdmissionCoordinator>>,
 ) -> (Result<(), String>, u32) {
+    if matches!(admission_mode, AdmissionMode::Coordinator) {
+        let request = ClientAdmissionRequest::new(
+            SessionRecord::client(
+                session_id,
+                user_id,
+                "C63",
+                worker.caster_id,
+                worker.runtime_epoch,
+                "198.51.100.10",
+                "2026-11-22T02:00:00Z",
+            ),
+            max_sessions,
+            ip_max_sessions,
+            config,
+        );
+        let result = coordinator
+            .expect("coordinator mode requires a coordinator")
+            .admit_client(worker.session_lease, request)
+            .await
+            .map(|_| ())
+            .map_err(classify_error);
+        return (result, 0);
+    }
+
     if matches!(admission_mode, AdmissionMode::Revision) {
         let request = ClientAdmissionRequest::new(
             SessionRecord::client(
@@ -377,6 +425,7 @@ fn parse_args() -> Result<SpikeConfig, Box<dyn Error>> {
                 admission_mode = match value.as_str() {
                     "lock" => AdmissionMode::Lock,
                     "revision" => AdmissionMode::Revision,
+                    "coordinator" => AdmissionMode::Coordinator,
                     _ => return Err(format!("unknown admission mode {value}").into()),
                 }
             }
