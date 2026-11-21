@@ -42,6 +42,21 @@ B 消除了多数 `USER_LOCK_BUSY` / `IP_LOCK_BUSY` 失败，但在热点下仍�
 
 方案 B 功能测试覆盖 Client/Source 最终额度竞争、100 Caster 竞争、NAT IP 隔离、配置 revision 拒绝和 Source claim 回滚，均通过。
 
+### Source coordinator integration
+
+Source 已接入 C：
+
+- 同一 batch 的 Client 和 Source 通过同一个 user 配额分配序列。
+- Source claim plan、generation 更新、owner session 和 VALIDATING route 记录追加到 coordinator batch Txn。
+- owner/config revision 条件覆盖整批写入。
+- 同一批重复 mountpoint 最多允许一个 Source，失败请求不消耗 user slot。
+- Source 不读写 IP session，也不受 NAT IP quota 影响。
+- gRPC 新增 `AdmitSource`，成功响应返回 `source_generation`。
+
+默认 batch size 从 64 调整为 16，以限制 Source claim 每项多个 etcd op 带来的 Txn 操作数增长。调整后热点用户 1000/s 仍完成 5000/5000，实际 `996.17/s`，p99 `19.0ms`。
+
+当前未单独做 Source 高并发吞吐基准；Source 主要验证了共享额度、原子性和重复 claim 语义。
+
 ## 方案 C 原型
 
 C 原型使用一个 etcd lease 绑定的 admission owner：
@@ -88,7 +103,7 @@ gRPC 已增加内部 mTLS 和 service token：
 本原型尚未实现：
 
 - C 的证书轮换、限流和跨主机 RTT；mTLS 与 service token 授权已在 loopback 验证。
-- Source claim 批量化；Source 暂继续使用 B。
+- Source 高并发性能基准；功能路径已完成 coordinator 批量化。
 - 多 owner 分片和跨分片 user/IP 额度协调。
 - 活动 owner 崩溃过程中的单个 in-flight batch 语义；当前由 owner lease 和 session lease 保守清理。
 

@@ -20,11 +20,12 @@ use tokio::{
 
 use crate::{
     admission::{
-        AdmissionError, ClientAdmissionRequest, ClientPermit, config_compare, ip_session_key,
-        read_ip_session_count, read_user_session_count, user_session_key, validate_key_segment,
-        validate_session,
+        AdmissionError, ClientAdmissionRequest, ClientPermit, SourceAdmissionRequest, SourcePermit,
+        config_compare, ip_session_key, read_ip_session_count, read_user_session_count,
+        user_session_key, validate_key_segment, validate_session,
     },
     config::{ConfigSnapshot, load_config_snapshot},
+    source_claim::{ClaimError, PreparedSourceClaim, prepare_source_claim},
 };
 
 #[derive(Clone, Debug)]
@@ -38,7 +39,7 @@ pub struct CoordinatorOptions {
 impl Default for CoordinatorOptions {
     fn default() -> Self {
         Self {
-            batch_size: 64,
+            batch_size: 16,
             batch_window: Duration::from_millis(5),
             owner_lease_ttl_s: 15,
             keep_alive: true,
@@ -53,10 +54,17 @@ pub struct AdmissionCoordinator {
     done: oneshot::Receiver<()>,
 }
 
-struct PendingAdmission {
-    lease_id: i64,
-    request: ClientAdmissionRequest,
-    response: oneshot::Sender<Result<ClientPermit, AdmissionError>>,
+enum PendingAdmission {
+    Client {
+        lease_id: i64,
+        request: ClientAdmissionRequest,
+        response: oneshot::Sender<Result<ClientPermit, AdmissionError>>,
+    },
+    Source {
+        lease_id: i64,
+        request: SourceAdmissionRequest,
+        response: oneshot::Sender<Result<SourcePermit, AdmissionError>>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -145,7 +153,29 @@ impl AdmissionCoordinator {
         }
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
-            .send(PendingAdmission {
+            .send(PendingAdmission::Client {
+                lease_id,
+                request,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| AdmissionError::CoordinatorUnavailable)?;
+        response_rx
+            .await
+            .map_err(|_| AdmissionError::CoordinatorUnavailable)?
+    }
+
+    pub async fn admit_source(
+        &self,
+        lease_id: i64,
+        request: SourceAdmissionRequest,
+    ) -> Result<SourcePermit, AdmissionError> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(AdmissionError::CoordinatorUnavailable);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(PendingAdmission::Source {
                 lease_id,
                 request,
                 response: response_tx,
@@ -276,11 +306,11 @@ async fn process_batch(
 ) {
     let mut groups = BTreeMap::<i64, (ConfigSnapshot, Vec<PendingAdmission>)>::new();
     for pending in batch {
-        if let Err(error) = validate_request(&pending.request) {
-            let _ = pending.response.send(Err(error));
+        if let Err(error) = validate_pending(&pending) {
+            reject_pending(pending, error);
             continue;
         }
-        let config = pending.request.config.clone();
+        let config = pending_config(&pending).clone();
         groups
             .entry(config.revision)
             .or_insert_with(|| (config, Vec::new()))
@@ -297,6 +327,20 @@ async fn process_batch(
     }
 }
 
+enum AcceptedAdmission {
+    Client {
+        lease_id: i64,
+        request: ClientAdmissionRequest,
+        response: oneshot::Sender<Result<ClientPermit, AdmissionError>>,
+    },
+    Source {
+        lease_id: i64,
+        request: SourceAdmissionRequest,
+        prepared: Box<PreparedSourceClaim>,
+        response: oneshot::Sender<Result<SourcePermit, AdmissionError>>,
+    },
+}
+
 async fn process_group(
     client: &mut Client,
     cluster_id: &str,
@@ -307,50 +351,96 @@ async fn process_group(
 ) -> Result<(), AdmissionError> {
     let users = group
         .iter()
-        .map(|pending| pending.request.session.user_id.clone())
+        .map(|pending| pending_session(pending).user_id.clone())
         .collect::<HashSet<_>>();
     let ips = group
         .iter()
-        .filter(|pending| pending.request.ip_max_sessions.is_some())
-        .filter_map(|pending| pending.request.session.client_ip.clone())
+        .filter_map(|pending| match pending {
+            PendingAdmission::Client { request, .. } if request.ip_max_sessions.is_some() => {
+                request.session.client_ip.clone()
+            }
+            _ => None,
+        })
         .collect::<HashSet<_>>();
     let user_counts = count_users(client, cluster_id, users).await?;
     let ip_counts = count_ips(client, cluster_id, ips).await?;
     let mut accepted = Vec::new();
     let mut used_users = user_counts;
     let mut used_ips = ip_counts;
+    let mut seen_mountpoints = HashSet::new();
 
     for pending in group {
-        let user_count = used_users
-            .get(&pending.request.session.user_id)
-            .copied()
-            .unwrap_or(0);
-        if user_count >= pending.request.max_sessions {
-            let _ = pending
-                .response
-                .send(Err(AdmissionError::UserQuotaExceeded));
+        let user_id = pending_session(&pending).user_id.clone();
+        let user_count = used_users.get(&user_id).copied().unwrap_or(0);
+        if user_count >= pending_max_sessions(&pending) {
+            reject_pending(pending, AdmissionError::UserQuotaExceeded);
             continue;
         }
 
-        if let Some(ip_max_sessions) = pending.request.ip_max_sessions {
-            let client_ip = pending
-                .request
+        if let PendingAdmission::Client {
+            request: client_request,
+            ..
+        } = &pending
+            && let Some(ip_max_sessions) = client_request.ip_max_sessions
+        {
+            let client_ip = client_request
                 .session
                 .client_ip
                 .as_deref()
                 .expect("validated request");
             let ip_count = used_ips.get(client_ip).copied().unwrap_or(0);
             if ip_count >= ip_max_sessions {
-                let _ = pending.response.send(Err(AdmissionError::IpQuotaExceeded));
+                reject_pending(pending, AdmissionError::IpQuotaExceeded);
                 continue;
             }
             *used_ips.entry(client_ip.to_owned()).or_default() += 1;
         }
 
-        *used_users
-            .entry(pending.request.session.user_id.clone())
-            .or_default() += 1;
-        accepted.push(pending);
+        match pending {
+            PendingAdmission::Client {
+                lease_id,
+                request,
+                response,
+            } => {
+                *used_users.entry(user_id).or_default() += 1;
+                accepted.push(AcceptedAdmission::Client {
+                    lease_id,
+                    request,
+                    response,
+                });
+            }
+            PendingAdmission::Source {
+                lease_id,
+                request,
+                response,
+            } => {
+                if !seen_mountpoints.insert(request.source_claim.mountpoint().to_owned()) {
+                    let _ = response.send(Err(AdmissionError::Source(ClaimError::AlreadyClaimed)));
+                    continue;
+                }
+                let prepared = match prepare_source_claim(
+                    client,
+                    lease_id,
+                    cluster_id,
+                    request.source_claim.clone(),
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let _ = response.send(Err(AdmissionError::Source(error)));
+                        continue;
+                    }
+                };
+                *used_users.entry(user_id).or_default() += 1;
+                accepted.push(AcceptedAdmission::Source {
+                    lease_id,
+                    request,
+                    prepared: Box::new(prepared),
+                    response,
+                });
+            }
+        }
     }
 
     if accepted.is_empty() {
@@ -362,37 +452,91 @@ async fn process_group(
     let mut prepared = Vec::with_capacity(accepted.len());
     let mut operations = Vec::with_capacity(accepted.len() * 2);
     for pending in accepted {
-        let session_value = serde_json::to_vec(&pending.request.session)?;
-        operations.push(TxnOp::put(
-            user_session_key(cluster_id, &pending.request.session),
-            session_value.clone(),
-            Some(PutOptions::new().with_lease(pending.lease_id)),
-        ));
-        if pending.request.ip_max_sessions.is_some() {
-            let client_ip = pending
-                .request
-                .session
-                .client_ip
-                .as_deref()
-                .expect("validated request");
-            operations.push(TxnOp::put(
-                ip_session_key(cluster_id, client_ip, &pending.request.session.session_id),
-                session_value,
-                Some(PutOptions::new().with_lease(pending.lease_id)),
-            ));
+        match pending {
+            AcceptedAdmission::Client {
+                lease_id,
+                request,
+                response,
+            } => {
+                let session_value = serde_json::to_vec(&request.session)?;
+                operations.push(TxnOp::put(
+                    user_session_key(cluster_id, &request.session),
+                    session_value.clone(),
+                    Some(PutOptions::new().with_lease(lease_id)),
+                ));
+                if request.ip_max_sessions.is_some() {
+                    let client_ip = request
+                        .session
+                        .client_ip
+                        .as_deref()
+                        .expect("validated request");
+                    operations.push(TxnOp::put(
+                        ip_session_key(cluster_id, client_ip, &request.session.session_id),
+                        session_value,
+                        Some(PutOptions::new().with_lease(lease_id)),
+                    ));
+                }
+                prepared.push(AcceptedAdmission::Client {
+                    lease_id,
+                    request,
+                    response,
+                });
+            }
+            AcceptedAdmission::Source {
+                lease_id,
+                request,
+                prepared: mut source_prepared,
+                response,
+            } => {
+                let session_value = serde_json::to_vec(&request.session)?;
+                operations.push(TxnOp::put(
+                    user_session_key(cluster_id, &request.session),
+                    session_value,
+                    Some(PutOptions::new().with_lease(lease_id)),
+                ));
+                compares.append(&mut source_prepared.compares);
+                operations.append(&mut source_prepared.operations);
+                prepared.push(AcceptedAdmission::Source {
+                    lease_id,
+                    request,
+                    prepared: source_prepared,
+                    response,
+                });
+            }
         }
-        prepared.push(pending);
     }
     if operations.is_empty() {
         return Ok(());
     }
 
     let transaction = Txn::new().when(compares).and_then(operations);
-    if client.txn(transaction).await?.succeeded() {
+    let response = client.txn(transaction).await?;
+    if response.succeeded() {
+        let revision = response
+            .header()
+            .ok_or(AdmissionError::CorruptState)?
+            .revision();
         for pending in prepared {
-            let _ = pending.response.send(Ok(ClientPermit {
-                session: pending.request.session,
-            }));
+            match pending {
+                AcceptedAdmission::Client {
+                    request, response, ..
+                } => {
+                    let _ = response.send(Ok(ClientPermit {
+                        session: request.session,
+                    }));
+                }
+                AcceptedAdmission::Source {
+                    request,
+                    prepared,
+                    response,
+                    ..
+                } => {
+                    let _ = response.send(Ok(SourcePermit {
+                        session: request.session,
+                        claimed_source: prepared.finalize(revision),
+                    }));
+                }
+            }
         }
         return Ok(());
     }
@@ -404,12 +548,72 @@ async fn process_group(
         } else {
             AdmissionError::CoordinatorUnavailable
         };
-        let _ = pending.response.send(Err(error));
+        reject_accepted(pending, error);
     }
     if !config_stale {
         alive.store(false, Ordering::Release);
     }
     Ok(())
+}
+
+fn pending_config(pending: &PendingAdmission) -> &ConfigSnapshot {
+    match pending {
+        PendingAdmission::Client { request, .. } => &request.config,
+        PendingAdmission::Source { request, .. } => &request.config,
+    }
+}
+
+fn pending_session(pending: &PendingAdmission) -> &crate::admission::SessionRecord {
+    match pending {
+        PendingAdmission::Client { request, .. } => &request.session,
+        PendingAdmission::Source { request, .. } => &request.session,
+    }
+}
+
+fn pending_max_sessions(pending: &PendingAdmission) -> usize {
+    match pending {
+        PendingAdmission::Client { request, .. } => request.max_sessions,
+        PendingAdmission::Source { request, .. } => request.max_sessions,
+    }
+}
+
+fn validate_pending(pending: &PendingAdmission) -> Result<(), AdmissionError> {
+    match pending {
+        PendingAdmission::Client { request, .. } => {
+            validate_request(request)?;
+        }
+        PendingAdmission::Source { request, .. } => {
+            validate_session(&request.session)?;
+            if request.session.user_id != request.source_claim.effective_user_id()
+                || request.session.mountpoint != request.source_claim.mountpoint()
+            {
+                return Err(AdmissionError::SessionIdentityMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_pending(pending: PendingAdmission, error: AdmissionError) {
+    match pending {
+        PendingAdmission::Client { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        PendingAdmission::Source { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+    }
+}
+
+fn reject_accepted(pending: AcceptedAdmission, error: AdmissionError) {
+    match pending {
+        AcceptedAdmission::Client { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+        AcceptedAdmission::Source { response, .. } => {
+            let _ = response.send(Err(error));
+        }
+    }
 }
 
 async fn count_users(

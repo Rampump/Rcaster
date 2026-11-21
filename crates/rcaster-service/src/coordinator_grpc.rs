@@ -11,9 +11,12 @@ use tonic::{
 };
 
 use crate::{
-    admission::{AdmissionError, ClientAdmissionRequest, ClientPermit, SessionRecord},
+    admission::{
+        AdmissionError, ClientAdmissionRequest, ClientPermit, SessionRecord, SourceAdmissionRequest,
+    },
     config::{CasterConfig, ConfigSnapshot},
     coordinator_admission::AdmissionCoordinator,
+    source_claim::{ClaimError, SourceClaimRequest},
 };
 
 pub mod proto {
@@ -22,10 +25,10 @@ pub mod proto {
 
 use proto::{
     AdmissionError as ProtoAdmissionError, AdmitClientRequest, AdmitClientResponse,
-    AdmitClientSuccess,
+    AdmitClientSuccess, AdmitSourceRequest, AdmitSourceResponse, AdmitSourceSuccess,
     admission_service_client::AdmissionServiceClient,
     admission_service_server::{AdmissionService, AdmissionServiceServer},
-    admit_client_response,
+    admit_client_response, admit_source_response,
 };
 
 #[derive(Clone)]
@@ -40,6 +43,12 @@ pub struct GrpcClientTls {
     pub private_key_pem: String,
     pub server_name: String,
     pub service_token: String,
+}
+
+#[derive(Debug)]
+pub struct GrpcSourcePermit {
+    pub session: SessionRecord,
+    pub source_generation: u64,
 }
 
 #[derive(Clone)]
@@ -200,6 +209,28 @@ impl GrpcAdmissionClient {
             None => Err(AdmissionError::CoordinatorUnavailable),
         }
     }
+
+    pub async fn admit_source(
+        &mut self,
+        lease_id: i64,
+        request: SourceAdmissionRequest,
+    ) -> Result<GrpcSourcePermit, AdmissionError> {
+        let response = self
+            .inner
+            .admit_source(source_request_to_proto(lease_id, &request))
+            .await
+            .map_err(status_to_admission_error)?
+            .into_inner();
+
+        match response.result {
+            Some(admit_source_response::Result::Success(success)) => Ok(GrpcSourcePermit {
+                session: request.session,
+                source_generation: success.source_generation,
+            }),
+            Some(admit_source_response::Result::Error(error)) => Err(error_from_proto(error.code)),
+            None => Err(AdmissionError::CoordinatorUnavailable),
+        }
+    }
 }
 
 pub struct AdmissionGrpcService {
@@ -229,6 +260,26 @@ impl AdmissionService for AdmissionGrpcService {
             },
             Err(error) => AdmitClientResponse {
                 result: Some(admit_client_response::Result::Error(error_to_proto(&error))),
+            },
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn admit_source(
+        &self,
+        request: Request<AdmitSourceRequest>,
+    ) -> Result<Response<AdmitSourceResponse>, Status> {
+        let request = request.into_inner();
+        let lease_id = request.caster_lease_id;
+        let request = source_request_from_proto(request);
+        let response = match self.coordinator.admit_source(lease_id, request).await {
+            Ok(permit) => AdmitSourceResponse {
+                result: Some(admit_source_response::Result::Success(AdmitSourceSuccess {
+                    source_generation: permit.claimed_source.claim.source_generation,
+                })),
+            },
+            Err(error) => AdmitSourceResponse {
+                result: Some(admit_source_response::Result::Error(error_to_proto(&error))),
             },
         };
         Ok(Response::new(response))
@@ -320,6 +371,54 @@ fn request_from_proto(request: AdmitClientRequest) -> ClientAdmissionRequest {
     )
 }
 
+fn source_request_to_proto(lease_id: i64, request: &SourceAdmissionRequest) -> AdmitSourceRequest {
+    AdmitSourceRequest {
+        caster_lease_id: lease_id,
+        session_id: request.session.session_id.clone(),
+        user_id: request.session.user_id.clone(),
+        mountpoint: request.session.mountpoint.clone(),
+        caster_id: request.session.caster_id.clone(),
+        runtime_epoch: request.session.runtime_epoch.clone(),
+        max_sessions: request.max_sessions as u64,
+        started_at: request.session.started_at.clone(),
+        connection_id: request.source_claim.connection_id.clone(),
+        relay_endpoint: request.source_claim.relay_endpoint.clone(),
+        config_generation: request.config.config.generation,
+        config_revision: request.config.revision,
+    }
+}
+
+fn source_request_from_proto(request: AdmitSourceRequest) -> SourceAdmissionRequest {
+    let created_at = request.started_at.clone();
+    SourceAdmissionRequest::new(
+        SessionRecord::source(
+            request.session_id,
+            request.user_id.clone(),
+            request.mountpoint.clone(),
+            request.caster_id.clone(),
+            request.runtime_epoch.clone(),
+            request.started_at,
+        ),
+        request.max_sessions as usize,
+        SourceClaimRequest::new(
+            request.mountpoint,
+            request.caster_id,
+            request.connection_id,
+            request.runtime_epoch,
+            request.relay_endpoint,
+            request.user_id,
+            created_at,
+        ),
+        ConfigSnapshot {
+            config: CasterConfig {
+                schema_version: 1,
+                generation: request.config_generation,
+            },
+            revision: request.config_revision,
+        },
+    )
+}
+
 fn error_to_proto(error: &AdmissionError) -> ProtoAdmissionError {
     ProtoAdmissionError {
         code: error_code(error).to_owned(),
@@ -335,6 +434,7 @@ fn error_from_proto(code: String) -> AdmissionError {
         "ADMISSION_CONFLICT" => AdmissionError::AdmissionConflict,
         "UNAUTHENTICATED" => AdmissionError::Unauthenticated,
         "PERMISSION_DENIED" => AdmissionError::PermissionDenied,
+        "SOURCE_ALREADY_CLAIMED" => AdmissionError::Source(ClaimError::AlreadyClaimed),
         _ => AdmissionError::CoordinatorUnavailable,
     }
 }
@@ -348,6 +448,7 @@ fn error_code(error: &AdmissionError) -> &'static str {
         AdmissionError::CoordinatorUnavailable => "COORDINATOR_UNAVAILABLE",
         AdmissionError::Unauthenticated => "UNAUTHENTICATED",
         AdmissionError::PermissionDenied => "PERMISSION_DENIED",
+        AdmissionError::Source(ClaimError::AlreadyClaimed) => "SOURCE_ALREADY_CLAIMED",
         _ => "ADMISSION_FAILED",
     }
 }

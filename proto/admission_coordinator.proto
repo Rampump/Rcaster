@@ -4,6 +4,7 @@ package rcaster.admission.v1;
 
 service AdmissionService {
   rpc AdmitClient(AdmitClientRequest) returns (AdmitClientResponse);
+  rpc AdmitSource(AdmitSourceRequest) returns (AdmitSourceResponse);
 }
 
 message AdmitClientRequest {
@@ -33,4 +34,30 @@ message AdmitClientSuccess {}
 message AdmissionError {
   string code = 1;
   string message = 2;
+}
+
+message AdmitSourceRequest {
+  int64 caster_lease_id = 1;
+  string session_id = 2;
+  string user_id = 3;
+  string mountpoint = 4;
+  string caster_id = 5;
+  string runtime_epoch = 6;
+  uint64 max_sessions = 7;
+  string started_at = 8;
+  string connection_id = 9;
+  string relay_endpoint = 10;
+  uint64 config_generation = 11;
+  int64 config_revision = 12;
+}
+
+message AdmitSourceResponse {
+  oneof result {
+    AdmitSourceSuccess success = 1;
+    AdmissionError error = 2;
+  }
+}
+
+message AdmitSourceSuccess {
+  uint64 source_generation = 1;
 }

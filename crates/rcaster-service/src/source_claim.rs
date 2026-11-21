@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
 pub struct SourceClaimRequest {
-    mountpoint: String,
-    caster_id: String,
-    connection_id: String,
-    runtime_epoch: String,
-    relay_endpoint: String,
-    effective_user_id: String,
-    created_at: String,
+    pub(crate) mountpoint: String,
+    pub(crate) caster_id: String,
+    pub(crate) connection_id: String,
+    pub(crate) runtime_epoch: String,
+    pub(crate) relay_endpoint: String,
+    pub(crate) effective_user_id: String,
+    pub(crate) created_at: String,
 }
 
 impl SourceClaimRequest {
@@ -68,6 +68,32 @@ pub struct ClaimedSource {
     source_key: String,
     claim_value: Vec<u8>,
     provisional_source_value: Vec<u8>,
+}
+
+pub(crate) struct PreparedSourceClaim {
+    claim: SourceClaim,
+    lease_id: i64,
+    claim_key: String,
+    source_key: String,
+    claim_value: Vec<u8>,
+    provisional_source_value: Vec<u8>,
+    pub(crate) compares: Vec<Compare>,
+    pub(crate) operations: Vec<TxnOp>,
+}
+
+impl PreparedSourceClaim {
+    pub(crate) fn finalize(self, revision: i64) -> ClaimedSource {
+        ClaimedSource {
+            claim: self.claim,
+            claim_revision: revision,
+            source_revision: revision,
+            lease_id: self.lease_id,
+            claim_key: self.claim_key,
+            source_key: self.source_key,
+            claim_value: self.claim_value,
+            provisional_source_value: self.provisional_source_value,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -175,6 +201,39 @@ pub(crate) async fn claim_source_with_guards(
     additional_compares: Vec<Compare>,
     additional_operations: Vec<TxnOp>,
 ) -> Result<ClaimedSource, ClaimError> {
+    for _ in 0..8 {
+        let mut prepared =
+            prepare_source_claim(client, lease_id, cluster_id, request.clone()).await?;
+        prepared
+            .compares
+            .extend(additional_compares.iter().cloned());
+        prepared
+            .operations
+            .extend(additional_operations.iter().cloned());
+        let transaction = Txn::new()
+            .when(std::mem::take(&mut prepared.compares))
+            .and_then(std::mem::take(&mut prepared.operations));
+        let response = client.txn(transaction).await?;
+        if response.succeeded() {
+            let revision = response
+                .header()
+                .ok_or(ClaimError::CorruptState)?
+                .revision();
+            return Ok(prepared.finalize(revision));
+        }
+        if !additional_compares.is_empty() {
+            return Err(ClaimError::GuardFailed);
+        }
+    }
+    Err(ClaimError::GenerationConflict)
+}
+
+pub(crate) async fn prepare_source_claim(
+    client: &mut Client,
+    lease_id: i64,
+    cluster_id: &str,
+    request: SourceClaimRequest,
+) -> Result<PreparedSourceClaim, ClaimError> {
     validate_identifier(cluster_id, "cluster ID")?;
     validate_mountpoint(&request.mountpoint)?;
 
@@ -191,90 +250,70 @@ pub(crate) async fn claim_source_with_guards(
         request.mountpoint
     );
 
-    for _ in 0..8 {
-        if !client.get(claim_key.clone(), None).await?.kvs().is_empty() {
-            return Err(ClaimError::AlreadyClaimed);
-        }
-
-        let generation_value = client
-            .get(generation_key.clone(), None)
-            .await?
-            .kvs()
-            .first()
-            .cloned();
-        let old_generation = match &generation_value {
-            Some(value) => std::str::from_utf8(value.value())
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .ok_or(ClaimError::CorruptState)?,
-            None => 0,
-        };
-        let next_generation = old_generation
-            .checked_add(1)
-            .ok_or(ClaimError::CorruptState)?;
-        let claim = SourceClaim {
-            schema_version: 1,
-            source_generation: next_generation,
-            connection_id: request.connection_id.clone(),
-            mountpoint: request.mountpoint.clone(),
-            caster_id: request.caster_id.clone(),
-            runtime_epoch: request.runtime_epoch.clone(),
-            relay_endpoint: request.relay_endpoint.clone(),
-            effective_user_id: request.effective_user_id.clone(),
-            created_at: request.created_at.clone(),
-        };
-        let claim_value = serde_json::to_vec(&claim)?;
-        let provisional_source_value =
-            serde_json::to_vec(&SourceRecord::from_claim(&claim, SourceState::Validating))?;
-        let generation_compare = match generation_value {
-            Some(value) => Compare::value(generation_key.clone(), CompareOp::Equal, value.value()),
-            None => Compare::create_revision(generation_key.clone(), CompareOp::Equal, 0),
-        };
-        let mut compares = vec![
-            Compare::create_revision(claim_key.clone(), CompareOp::Equal, 0),
-            generation_compare,
-        ];
-        compares.extend(additional_compares.iter().cloned());
-        let mut operations = vec![
-            TxnOp::put(generation_key.clone(), next_generation.to_string(), None),
-            TxnOp::put(
-                claim_key.clone(),
-                claim_value.clone(),
-                Some(PutOptions::new().with_lease(lease_id)),
-            ),
-            TxnOp::put(
-                source_key.clone(),
-                provisional_source_value.clone(),
-                Some(PutOptions::new().with_lease(lease_id)),
-            ),
-        ];
-        operations.extend(additional_operations.iter().cloned());
-        let transaction = Txn::new().when(compares).and_then(operations);
-        let response = client.txn(transaction).await?;
-
-        if response.succeeded() {
-            let revision = response
-                .header()
-                .ok_or(ClaimError::CorruptState)?
-                .revision();
-            return Ok(ClaimedSource {
-                claim,
-                claim_revision: revision,
-                source_revision: revision,
-                lease_id,
-                claim_key,
-                source_key,
-                claim_value,
-                provisional_source_value,
-            });
-        }
-
-        if !additional_compares.is_empty() {
-            return Err(ClaimError::GuardFailed);
-        }
+    if !client.get(claim_key.clone(), None).await?.kvs().is_empty() {
+        return Err(ClaimError::AlreadyClaimed);
     }
 
-    Err(ClaimError::GenerationConflict)
+    let generation_value = client
+        .get(generation_key.clone(), None)
+        .await?
+        .kvs()
+        .first()
+        .cloned();
+    let old_generation = match &generation_value {
+        Some(value) => std::str::from_utf8(value.value())
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(ClaimError::CorruptState)?,
+        None => 0,
+    };
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or(ClaimError::CorruptState)?;
+    let claim = SourceClaim {
+        schema_version: 1,
+        source_generation: next_generation,
+        connection_id: request.connection_id.clone(),
+        mountpoint: request.mountpoint.clone(),
+        caster_id: request.caster_id.clone(),
+        runtime_epoch: request.runtime_epoch.clone(),
+        relay_endpoint: request.relay_endpoint.clone(),
+        effective_user_id: request.effective_user_id.clone(),
+        created_at: request.created_at.clone(),
+    };
+    let claim_value = serde_json::to_vec(&claim)?;
+    let provisional_source_value =
+        serde_json::to_vec(&SourceRecord::from_claim(&claim, SourceState::Validating))?;
+    let generation_compare = match generation_value {
+        Some(value) => Compare::value(generation_key.clone(), CompareOp::Equal, value.value()),
+        None => Compare::create_revision(generation_key.clone(), CompareOp::Equal, 0),
+    };
+
+    Ok(PreparedSourceClaim {
+        claim,
+        lease_id,
+        claim_key: claim_key.clone(),
+        source_key: source_key.clone(),
+        claim_value: claim_value.clone(),
+        provisional_source_value: provisional_source_value.clone(),
+        compares: vec![
+            Compare::create_revision(claim_key.clone(), CompareOp::Equal, 0),
+            generation_compare,
+        ],
+        operations: vec![
+            TxnOp::put(generation_key, next_generation.to_string(), None),
+            TxnOp::put(
+                claim_key,
+                claim_value,
+                Some(PutOptions::new().with_lease(lease_id)),
+            ),
+            TxnOp::put(
+                source_key,
+                provisional_source_value,
+                Some(PutOptions::new().with_lease(lease_id)),
+            ),
+        ],
+    })
 }
 
 pub async fn publish_active(

@@ -5,10 +5,14 @@ use std::{
 
 use etcd_client::{Client, ConnectOptions};
 use rcaster_service::{
-    admission::{AdmissionError, ClientAdmissionRequest, SessionRecord, read_user_session_count},
+    admission::{
+        AdmissionError, ClientAdmissionRequest, SessionRecord, SourceAdmissionRequest,
+        read_user_session_count,
+    },
     config::{CasterConfig, publish_config},
     coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
     coordinator_grpc::{GrpcAdmissionClient, serve_admission_grpc},
+    source_claim::SourceClaimRequest,
 };
 use tokio::{net::TcpListener, sync::oneshot};
 
@@ -64,7 +68,7 @@ async fn grpc_admission_preserves_quota_and_config_errors() {
                 ),
                 1,
                 None,
-                current,
+                current.clone(),
             ),
         )
         .await;
@@ -90,6 +94,34 @@ async fn grpc_admission_preserves_quota_and_config_errors() {
         )
         .await;
     assert!(matches!(stale_result, Err(AdmissionError::ConfigStale)));
+    let source = grpc
+        .admit_source(
+            grant_lease(&mut admin).await,
+            SourceAdmissionRequest::new(
+                SessionRecord::source(
+                    "s_source_grpc",
+                    "u_source_grpc",
+                    "C64",
+                    "caster-west-02",
+                    "boot_west",
+                    "2026-11-22T06:00:03Z",
+                ),
+                1,
+                SourceClaimRequest::new(
+                    "C64",
+                    "caster-west-02",
+                    "c_source_grpc",
+                    "boot_west",
+                    "10.20.0.12:12102",
+                    "u_source_grpc",
+                    "2026-11-22T06:00:03Z",
+                ),
+                current,
+            ),
+        )
+        .await
+        .expect("source admitted through grpc");
+    assert_eq!(source.source_generation, 1);
     assert_eq!(
         read_user_session_count(&mut admin, &cluster, user_id)
             .await

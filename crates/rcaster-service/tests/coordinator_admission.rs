@@ -12,7 +12,7 @@ use rcaster_service::{
     config::{CasterConfig, publish_config},
     coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
     revision_admission::admit_source_revision,
-    source_claim::SourceClaimRequest,
+    source_claim::{ClaimError, SourceClaimRequest},
 };
 
 #[tokio::test]
@@ -265,6 +265,247 @@ async fn coordinator_owner_lease_recovers_after_expiry() {
 
     first.shutdown().await;
     replacement.shutdown().await;
+}
+
+#[tokio::test]
+async fn coordinator_mixes_client_and_source_for_the_final_slot() {
+    let cluster = unique("coordinator-mixed");
+    let user_id = "u_mixed";
+    let mut admin = connect().await;
+    let config = publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let options = CoordinatorOptions {
+        batch_window: std::time::Duration::from_millis(50),
+        ..CoordinatorOptions::default()
+    };
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, options)
+            .await
+            .expect("start coordinator"),
+    );
+    let mut client_caster = connect().await;
+    let mut source_caster = connect().await;
+    let client_config = config.clone();
+    let client_coordinator = coordinator.clone();
+    let client = tokio::spawn(async move {
+        client_coordinator
+            .admit_client(
+                grant_lease(&mut client_caster).await,
+                ClientAdmissionRequest::new(
+                    SessionRecord::client(
+                        "s_client",
+                        user_id,
+                        "C63",
+                        "caster-east-01",
+                        "boot_east",
+                        "203.0.113.84",
+                        "2026-11-22T08:00:00Z",
+                    ),
+                    1,
+                    None,
+                    client_config,
+                ),
+            )
+            .await
+    });
+    let source_coordinator = coordinator.clone();
+    let source = tokio::spawn(async move {
+        source_coordinator
+            .admit_source(
+                grant_lease(&mut source_caster).await,
+                source_request(user_id, "C63", "c_source", 1, config),
+            )
+            .await
+    });
+
+    let client = client.await.expect("client task");
+    let source = source.await.expect("source task");
+    let source_admitted = source.is_ok();
+    assert_eq!(
+        usize::from(client.is_ok()) + usize::from(source_admitted),
+        1
+    );
+    assert_eq!(
+        read_user_session_count(&mut admin, &cluster, user_id)
+            .await
+            .expect("count sessions"),
+        1
+    );
+    assert_eq!(
+        admin
+            .get(
+                format!("/rcaster/{cluster}/runtime/source-claims/C63"),
+                None
+            )
+            .await
+            .expect("read claim")
+            .count(),
+        i64::from(source_admitted)
+    );
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
+}
+
+#[tokio::test]
+async fn coordinator_batches_multiple_source_claims() {
+    let cluster = unique("coordinator-sources");
+    let user_id = "u_sources";
+    let mut admin = connect().await;
+    let config = publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let options = CoordinatorOptions {
+        batch_window: std::time::Duration::from_millis(50),
+        ..CoordinatorOptions::default()
+    };
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, options)
+            .await
+            .expect("start coordinator"),
+    );
+    let mut first_caster = connect().await;
+    let mut second_caster = connect().await;
+    let first_coordinator = coordinator.clone();
+    let first_config = config.clone();
+    let first = tokio::spawn(async move {
+        first_coordinator
+            .admit_source(
+                grant_lease(&mut first_caster).await,
+                source_request(user_id, "C63", "c_63", 4, first_config),
+            )
+            .await
+    });
+    let second_coordinator = coordinator.clone();
+    let second = tokio::spawn(async move {
+        second_coordinator
+            .admit_source(
+                grant_lease(&mut second_caster).await,
+                source_request(user_id, "C64", "c_64", 4, config),
+            )
+            .await
+    });
+
+    assert!(first.await.expect("first source task").is_ok());
+    assert!(second.await.expect("second source task").is_ok());
+    assert_eq!(
+        read_user_session_count(&mut admin, &cluster, user_id)
+            .await
+            .expect("count sessions"),
+        2
+    );
+    for mountpoint in ["C63", "C64"] {
+        assert_eq!(
+            admin
+                .get(
+                    format!("/rcaster/{cluster}/runtime/source-claims/{mountpoint}"),
+                    None
+                )
+                .await
+                .expect("read claim")
+                .count(),
+            1
+        );
+    }
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
+}
+
+#[tokio::test]
+async fn coordinator_rejects_duplicate_source_claims_in_one_batch() {
+    let cluster = unique("coordinator-duplicate-source");
+    let user_id = "u_duplicate";
+    let mut admin = connect().await;
+    let config = publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let options = CoordinatorOptions {
+        batch_window: std::time::Duration::from_millis(50),
+        ..CoordinatorOptions::default()
+    };
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, options)
+            .await
+            .expect("start coordinator"),
+    );
+    let mut first_caster = connect().await;
+    let mut second_caster = connect().await;
+    let first_coordinator = coordinator.clone();
+    let first_config = config.clone();
+    let first = tokio::spawn(async move {
+        first_coordinator
+            .admit_source(
+                grant_lease(&mut first_caster).await,
+                source_request(user_id, "C63", "c_first", 4, first_config),
+            )
+            .await
+    });
+    let second_coordinator = coordinator.clone();
+    let second = tokio::spawn(async move {
+        second_coordinator
+            .admit_source(
+                grant_lease(&mut second_caster).await,
+                source_request(user_id, "C63", "c_second", 4, config),
+            )
+            .await
+    });
+
+    let first = first.await.expect("first source task");
+    let second = second.await.expect("second source task");
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    let error = match (first, second) {
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+        (Ok(_), Ok(_)) => panic!("both duplicate claims succeeded"),
+        (Err(_), Err(_)) => panic!("both duplicate claims failed"),
+    };
+    assert!(matches!(
+        error,
+        AdmissionError::Source(ClaimError::AlreadyClaimed)
+    ));
+    assert_eq!(
+        read_user_session_count(&mut admin, &cluster, user_id)
+            .await
+            .expect("count sessions"),
+        1
+    );
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
+}
+
+fn source_request(
+    user_id: &str,
+    mountpoint: &str,
+    connection_id: &str,
+    max_sessions: usize,
+    config: rcaster_service::config::ConfigSnapshot,
+) -> SourceAdmissionRequest {
+    SourceAdmissionRequest::new(
+        SessionRecord::source(
+            format!("s_{connection_id}"),
+            user_id,
+            mountpoint,
+            "caster-west-02",
+            "boot_west",
+            "2026-11-22T08:00:00Z",
+        ),
+        max_sessions,
+        SourceClaimRequest::new(
+            mountpoint,
+            "caster-west-02",
+            connection_id,
+            "boot_west",
+            "10.20.0.12:12102",
+            user_id,
+            "2026-11-22T08:00:00Z",
+        ),
+        config,
+    )
 }
 
 async fn connect() -> Client {
