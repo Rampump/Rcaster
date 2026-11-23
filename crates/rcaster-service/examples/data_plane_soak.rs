@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster_runtime: None,
         relay_manager: None,
         source_admission: None,
+        accounts: None,
         near: None,
         metrics: None,
         connections: None,

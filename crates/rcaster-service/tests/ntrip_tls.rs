@@ -84,6 +84,7 @@ async fn tls_listener_accepts_ntrip1_source() {
             relay_manager: None,
             source_admission: None,
             near: None,
+            accounts: None,
             metrics: None,
             connections: None,
             proxy_protocol: None,

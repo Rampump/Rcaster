@@ -790,6 +790,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
         cluster_runtime: cluster_runtime.clone(),
         relay_manager,
         source_admission,
+        accounts: Some(account_directory.clone()),
         near: config
             .near
             .as_ref()

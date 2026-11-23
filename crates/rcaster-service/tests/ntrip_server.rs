@@ -1,10 +1,12 @@
 use std::{collections::BTreeMap, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use rcaster_core::{
+    account::{AccountSnapshot, Mountpoint, User, UserRole},
     protocol::{AdmissionMode, AdmissionPolicy, DataFormat, DataProfile, ProtocolDemux},
     str_record::StrRecord,
 };
 use rcaster_service::{
+    account_directory::AccountDirectory,
     health::HealthState,
     hub::MountpointHub,
     ntrip_server::{
@@ -102,6 +104,7 @@ async fn proxy_protocol_source_ip_drives_ip_quota() {
             relay_manager: None,
             source_admission: None,
             near: None,
+            accounts: None,
             metrics: None,
             connections: None,
             proxy_protocol: Some(
@@ -149,6 +152,7 @@ async fn max_connections_rejects_pre_auth_connection_flood() {
             relay_manager: None,
             source_admission: None,
             near: None,
+            accounts: None,
             metrics: None,
             connections: None,
             proxy_protocol: None,
@@ -213,6 +217,7 @@ async fn maintenance_rejects_new_connections_but_keeps_existing_streams() {
             relay_manager: None,
             source_admission: None,
             near: None,
+            accounts: None,
             metrics: Some(Arc::clone(&health)),
             connections: None,
             proxy_protocol: None,
@@ -511,6 +516,90 @@ async fn ntrip1_missing_mountpoint_returns_current_sourcetable() {
             .windows(b"STR;C63;".len())
             .any(|window| window == b"STR;C63;")
     );
+
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("server join").expect("NTRIP server");
+}
+
+#[tokio::test]
+async fn sourcetable_hides_mountpoints_not_advertised() {
+    let hub = Arc::new(MountpointHub::new(8).expect("hub"));
+    let _hidden = activate_at(&hub, "C63", 0.0);
+    let _public = activate_at(&hub, "C64", 0.0);
+    let account = User {
+        schema_version: 1,
+        mod_revision: 0,
+        user_id: "owner".to_owned(),
+        username: "owner".to_owned(),
+        password_hash: "test-hash".to_owned(),
+        auth_version: 1,
+        enabled: true,
+        ntrip_enabled: true,
+        web_enabled: false,
+        role: UserRole::User,
+        created_at: "0".to_owned(),
+        updated_at: "0".to_owned(),
+    };
+    let mountpoint = |name: &str, advertise: bool| Mountpoint {
+        schema_version: 1,
+        mod_revision: 0,
+        mountpoint: name.to_owned(),
+        owner_user_id: "owner".to_owned(),
+        enabled: true,
+        ntrip1_upload_password_hash: None,
+        advertise,
+        region: None,
+        source_expectation: None,
+        created_at: "0".to_owned(),
+        updated_at: "0".to_owned(),
+    };
+    let accounts = AccountDirectory::static_snapshot(
+        AccountSnapshot::new(
+            [account],
+            [mountpoint("C63", false), mountpoint("C64", true)],
+        )
+        .expect("accounts"),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind NTRIP listener");
+    let address = listener.local_addr().expect("listener address");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_ntrip(
+        listener,
+        Arc::clone(&hub),
+        TestAuthorizer,
+        NtripServerConfig {
+            head_timeout: Duration::from_secs(1),
+            content_length_max_bytes: 1024,
+            client_auth_required: false,
+            session_limiter: Arc::new(
+                LocalSessionLimiter::new(SessionLimitConfig::default()).expect("limiter"),
+            ),
+            connection_limiter: Arc::new(ConnectionLimiter::new(100).expect("connections")),
+            cluster_runtime: None,
+            relay_manager: None,
+            source_admission: None,
+            accounts: Some(accounts),
+            near: None,
+            metrics: None,
+            connections: None,
+            proxy_protocol: None,
+            auth_login_limiter: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut client = TcpStream::connect(address).await.expect("client connect");
+    client
+        .write_all(b"GET / HTTP/1.1\r\nNtrip-Version: Ntrip/2.0\r\n\r\n")
+        .await
+        .expect("sourcetable request");
+    let response = read_http_response(&mut client).await;
+    assert!(windows_contains(&response, b"STR;C64;"));
+    assert!(!windows_contains(&response, b"STR;C63;"));
 
     shutdown_tx.send(()).expect("shutdown");
     server.await.expect("server join").expect("NTRIP server");
@@ -1001,6 +1090,7 @@ async fn start_test_server_for_existing_hub(
             relay_manager: None,
             source_admission: None,
             near,
+            accounts: None,
             metrics: None,
             connections: None,
             proxy_protocol: None,
@@ -1142,6 +1232,7 @@ async fn start_test_server_with_admission_inner_with_hub(
             relay_manager: None,
             source_admission,
             near,
+            accounts: None,
             metrics: None,
             connections: None,
             proxy_protocol: None,

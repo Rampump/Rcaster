@@ -62,6 +62,7 @@ pub struct NtripServerConfig {
     pub cluster_runtime: Option<SharedClusterRuntime>,
     pub relay_manager: Option<Arc<RelayManager>>,
     pub source_admission: Option<SourceAdmissionConfig>,
+    pub accounts: Option<crate::account_directory::AccountDirectory>,
     pub near: Option<NearServerConfig>,
     pub metrics: Option<Arc<HealthState>>,
     pub connections: Option<Arc<ConnectionController>>,
@@ -1735,6 +1736,14 @@ async fn sourcetable_records(hub: &MountpointHub, config: &NtripServerConfig) ->
                 .entry(record.mountpoint.clone())
                 .or_insert(record);
         }
+    }
+    if let Some(accounts) = &config.accounts {
+        let snapshot = accounts.snapshot();
+        by_mountpoint.retain(|mountpoint, _| {
+            snapshot
+                .mountpoint(mountpoint)
+                .is_none_or(|mountpoint| mountpoint.advertise)
+        });
     }
     let near_record = config
         .near

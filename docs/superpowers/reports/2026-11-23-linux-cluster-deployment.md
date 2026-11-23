@@ -630,12 +630,12 @@ previous unit and environment files were preserved under
 ### Final Candidate and Quorum Recovery
 
 The final candidate
-`cd94a4d06da1a85ab01420ad648ac13ef41c67f68ab3f42d6084b0812121a3ad`
+`7fb534a98681e0ef24869257b8d3b7bc806a4098cea889f072bf3473d6fb3d48`
 was rolled to all four Casters and the 101 coordinator on 2026-11-24 between
-03:30:36 and 03:30:51 CST. Upload and hash checks preceded each atomic replace;
+04:06:21 and 04:06:35 CST. Upload and hash checks preceded each atomic replace;
 every service returned live/ready and reported all five cluster dependencies
 healthy. The coordinator mTLS verification returned 0. Per-node rollback files
-use the suffix `cd94a4d0`.
+use the suffix `7fb534a9`.
 
 The edge node initially ran NTPsec. Its kernel offset repeatedly drifted from
 milliseconds to roughly 0.56 seconds even while the selected peer reported a
@@ -687,27 +687,37 @@ all-feature Clippy and release build. A live 15-second cross-region smoke
 reported the correct 3/3/2/2 owner distribution before returning to zero
 sources and sessions.
 
+A public-interface audit then found that NTRIP source tables did not apply the
+mountpoint `advertise` flag. Ten private `SOAK*` sources were reachable through
+private subscriptions but still appeared in public TLS source tables. Source
+table generation now filters through the account directory; a regression test
+keeps advertised `C64` while hiding non-advertised `C63`. Final binary
+`7fb534a9…` passed 319 workspace tests, all-feature Clippy and release build.
+During a live 10-source smoke, all four public TLS source tables contained zero
+`STR;SOAK*` entries while subscriptions still transferred data.
+
 ### Final 72-Hour Acceptance Run
 
 The final local soak units `rcaster-final-soak-72h.service` started on all four
-nodes between 03:31:34 and 03:31:36 CST on 2026-11-24. The 101, 134, and 139
+nodes between 04:07:20 and 04:07:22 CST on 2026-11-24. The 101, 134, and 139
 nodes run 10 sources and 100 subscribers; the smaller 43 edge node runs 5
 sources and 50 subscribers. All four units are active with zero restarts and
 empty stderr.
 
 The cross-region unit `rcaster-final-cluster-soak-72h.service` started on 101
-at 03:31:36 CST with 10 sources and 50 subscribers distributed over all four
+at 04:07:23 CST with 10 sources and 50 subscribers distributed over all four
 TLS endpoints. Twenty seconds after start it was active with zero restarts,
 empty stderr, 10 cluster sources, and 60 total sessions (10 sources plus 50
-subscribers). Its expected completion is 2026-11-27 03:31:36 CST. Source-connect
+subscribers). Its expected completion is 2026-11-27 04:07:23 CST. Source-connect
 setup in the soak helper now retries transient 503/connection failures 20 times
 at 500 ms intervals; this changes only the test helper, not the production
 Caster binary.
 
 Earlier final-run attempts were discarded after the edge node was switched from
-NTPsec to chrony and after the source-ownership admin fix. Every code or node
-configuration change restarted all five units from zero, so the reported
-72-hour window begins from the final binary and frozen node configuration.
+NTPsec to chrony and after the source-ownership and source-table privacy fixes.
+Every code or node configuration change restarted all five units from zero, so
+the reported 72-hour window begins from the final binary and frozen node
+configuration.
 
 Final result files are `/tmp/rcaster-final-soak-72h.json` on each node and
 `/tmp/rcaster-final-cluster-soak-72h.json` on 101. They remain empty until the
