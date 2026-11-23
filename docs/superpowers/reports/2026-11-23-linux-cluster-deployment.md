@@ -630,12 +630,12 @@ previous unit and environment files were preserved under
 ### Final Candidate and Quorum Recovery
 
 The final candidate
-`7fb534a98681e0ef24869257b8d3b7bc806a4098cea889f072bf3473d6fb3d48`
+`b2e06330cc60ceb954b5f49a010dcdc1b84e50a6efee19985d101cdfa3a4e43f`
 was rolled to all four Casters and the 101 coordinator on 2026-11-24 between
-04:06:21 and 04:06:35 CST. Upload and hash checks preceded each atomic replace;
+04:23:32 and 04:23:45 CST. Upload and hash checks preceded each atomic replace;
 every service returned live/ready and reported all five cluster dependencies
 healthy. The coordinator mTLS verification returned 0. Per-node rollback files
-use the suffix `7fb534a9`.
+use the suffix `b2e06330`.
 
 The edge node initially ran NTPsec. Its kernel offset repeatedly drifted from
 milliseconds to roughly 0.56 seconds even while the selected peer reported a
@@ -691,30 +691,37 @@ A public-interface audit then found that NTRIP source tables did not apply the
 mountpoint `advertise` flag. Ten private `SOAK*` sources were reachable through
 private subscriptions but still appeared in public TLS source tables. Source
 table generation now filters through the account directory; a regression test
-keeps advertised `C64` while hiding non-advertised `C63`. Final binary
+keeps advertised `C64` while hiding non-advertised `C63`. The intermediate binary
 `7fb534a9…` passed 319 workspace tests, all-feature Clippy and release build.
 During a live 10-source smoke, all four public TLS source tables contained zero
 `STR;SOAK*` entries while subscriptions still transferred data.
 
+The filter was further tightened to fail closed: a mountpoint is public only
+when its account record exists, is enabled, and has `advertise=true`. Unknown
+or disabled cached entries are hidden from both NTRIP source tables and the
+public HTTP API. Final binary `b2e06330…` passed 319 workspace tests, all-feature
+Clippy and release build. Regression coverage exercises unknown, disabled,
+private, and public mountpoints together.
+
 The latest local commit, intentionally not pushed at the operator's request,
 was also rechecked against all eight ignored external integrations: etcd client
 credential rotation, leader failure, total quorum recovery, snapshot restore to
-a ready Caster (1626 ms this run), HAProxy PROXY v2, RTKLIB `str2str`, official
+a ready Caster (2080 ms this run), HAProxy PROXY v2, RTKLIB `str2str`, official
 RTCM2/RTCM3 fixtures, and the 17.6 MB BINEX stream. All passed.
 
 ### Final 72-Hour Acceptance Run
 
 The final local soak units `rcaster-final-soak-72h.service` started on all four
-nodes between 04:07:20 and 04:07:22 CST on 2026-11-24. The 101, 134, and 139
+nodes between 04:24:29 and 04:24:31 CST on 2026-11-24. The 101, 134, and 139
 nodes run 10 sources and 100 subscribers; the smaller 43 edge node runs 5
 sources and 50 subscribers. All four units are active with zero restarts and
 empty stderr.
 
 The cross-region unit `rcaster-final-cluster-soak-72h.service` started on 101
-at 04:07:23 CST with 10 sources and 50 subscribers distributed over all four
+at 04:24:31 CST with 10 sources and 50 subscribers distributed over all four
 TLS endpoints. Twenty seconds after start it was active with zero restarts,
 empty stderr, 10 cluster sources, and 60 total sessions (10 sources plus 50
-subscribers). Its expected completion is 2026-11-27 04:07:23 CST. Source-connect
+subscribers). Its expected completion is 2026-11-27 04:24:31 CST. Source-connect
 setup in the soak helper now retries transient 503/connection failures 20 times
 at 500 ms intervals; this changes only the test helper, not the production
 Caster binary.

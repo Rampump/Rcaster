@@ -945,7 +945,7 @@ async fn public_records(state: &PublicState) -> BTreeMap<String, PublicRecord> {
     records.retain(|name, _| {
         accounts
             .mountpoint(name)
-            .is_none_or(|mountpoint| mountpoint.advertise)
+            .is_some_and(|mountpoint| mountpoint.enabled && mountpoint.advertise)
     });
     records
 }

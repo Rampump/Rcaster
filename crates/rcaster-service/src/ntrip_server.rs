@@ -1742,7 +1742,7 @@ async fn sourcetable_records(hub: &MountpointHub, config: &NtripServerConfig) ->
         by_mountpoint.retain(|mountpoint, _| {
             snapshot
                 .mountpoint(mountpoint)
-                .is_none_or(|mountpoint| mountpoint.advertise)
+                .is_some_and(|mountpoint| mountpoint.enabled && mountpoint.advertise)
         });
     }
     let near_record = config

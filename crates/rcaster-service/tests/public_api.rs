@@ -29,6 +29,10 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     let hub = Arc::new(MountpointHub::new(16).expect("hub"));
     let _public_source = activate(&hub, "C63");
     let _private_source = activate(&hub, "PRIVATE");
+    let _disabled_source = activate(&hub, "DISABLED");
+    let _unknown_source = activate(&hub, "UNKNOWN");
+    let mut disabled = mountpoint("DISABLED", "east", true);
+    disabled.enabled = false;
     let accounts = AccountDirectory::static_snapshot(
         AccountSnapshot::new(
             [User {
@@ -48,6 +52,7 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
             [
                 mountpoint("C63", "east", true),
                 mountpoint("PRIVATE", "east", false),
+                disabled,
             ],
         )
         .expect("accounts"),
@@ -108,6 +113,8 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     let str = request(address, "/api/v1/public/str").await;
     assert!(str.contains("\"mountpoint\":\"C63\""));
     assert!(!str.contains("PRIVATE"));
+    assert!(!str.contains("DISABLED"));
+    assert!(!str.contains("UNKNOWN"));
     assert!(!str.contains("owner-id"));
     assert!(!str.contains("password"));
     assert!(str.contains("Cache-Control: public, max-age=5"));

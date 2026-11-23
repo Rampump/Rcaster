@@ -524,6 +524,8 @@ async fn ntrip1_missing_mountpoint_returns_current_sourcetable() {
 #[tokio::test]
 async fn sourcetable_hides_mountpoints_not_advertised() {
     let hub = Arc::new(MountpointHub::new(8).expect("hub"));
+    let _unknown = activate_at(&hub, "C61", 0.0);
+    let _disabled = activate_at(&hub, "C62", 0.0);
     let _hidden = activate_at(&hub, "C63", 0.0);
     let _public = activate_at(&hub, "C64", 0.0);
     let account = User {
@@ -540,12 +542,12 @@ async fn sourcetable_hides_mountpoints_not_advertised() {
         created_at: "0".to_owned(),
         updated_at: "0".to_owned(),
     };
-    let mountpoint = |name: &str, advertise: bool| Mountpoint {
+    let mountpoint = |name: &str, enabled: bool, advertise: bool| Mountpoint {
         schema_version: 1,
         mod_revision: 0,
         mountpoint: name.to_owned(),
         owner_user_id: "owner".to_owned(),
-        enabled: true,
+        enabled,
         ntrip1_upload_password_hash: None,
         advertise,
         region: None,
@@ -556,7 +558,11 @@ async fn sourcetable_hides_mountpoints_not_advertised() {
     let accounts = AccountDirectory::static_snapshot(
         AccountSnapshot::new(
             [account],
-            [mountpoint("C63", false), mountpoint("C64", true)],
+            [
+                mountpoint("C62", false, true),
+                mountpoint("C63", true, false),
+                mountpoint("C64", true, true),
+            ],
         )
         .expect("accounts"),
     );
@@ -599,6 +605,8 @@ async fn sourcetable_hides_mountpoints_not_advertised() {
         .expect("sourcetable request");
     let response = read_http_response(&mut client).await;
     assert!(windows_contains(&response, b"STR;C64;"));
+    assert!(!windows_contains(&response, b"STR;C61;"));
+    assert!(!windows_contains(&response, b"STR;C62;"));
     assert!(!windows_contains(&response, b"STR;C63;"));
 
     shutdown_tx.send(()).expect("shutdown");
