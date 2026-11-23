@@ -731,6 +731,13 @@ PROXY v2, official RTKLIB, RTCM and BINEX fixtures, all-feature tests,
 data-plane smoke tests, and the release build. GitCode's pre-receive checks
 also passed for both final code pushes.
 
+The alert ruleset now also covers backup failure and staleness:
+`RCasterEtcdBackupFailed` detects a failed snapshot service, and
+`RCasterEtcdBackupStale` fires when the timer has not triggered for more than
+20 minutes. These rules use the node_exporter systemd collector metrics
+`node_systemd_unit_state` and `node_systemd_timer_last_trigger_seconds`; the
+runbook documents that dependency. The YAML parses to 12 rules.
+
 ### Watch Health and Silent-Stall Recovery
 
 `ConfigWatcher` previously set its healthy flag before the asynchronous

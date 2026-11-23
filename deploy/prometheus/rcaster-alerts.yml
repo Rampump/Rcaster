@@ -109,3 +109,25 @@ groups:
           summary: "RCaster open file descriptors approach the default budget"
           description: "Open file descriptors exceed 30000 of the documented 32768 budget."
           runbook_url: "docs/runbooks/rcaster.md#rcasterfiledescriptorpressure"
+
+      - alert: RCasterEtcdBackupFailed
+        expr: node_systemd_unit_state{name="rcaster-etcd-backup.service",state="failed"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          service: rcaster
+        annotations:
+          summary: "RCaster etcd backup failed on {{ $labels.instance }}"
+          description: "The scheduled etcd snapshot service remains in the failed state."
+          runbook_url: "docs/runbooks/rcaster.md#rcasteretcdbackendfailed"
+
+      - alert: RCasterEtcdBackupStale
+        expr: time() - max by (instance) (node_systemd_timer_last_trigger_seconds{name="rcaster-etcd-backup.timer"}) > 20 * 60
+        for: 5m
+        labels:
+          severity: critical
+          service: rcaster
+        annotations:
+          summary: "RCaster etcd backup is stale on {{ $labels.instance }}"
+          description: "The 15-minute backup timer has not triggered successfully for more than 20 minutes."
+          runbook_url: "docs/runbooks/rcaster.md#rcasteretcdbackendstale"

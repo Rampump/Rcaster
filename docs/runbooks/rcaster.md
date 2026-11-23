@@ -100,6 +100,26 @@ affected mountpoint.
    capacity justify it.
 4. Restart only after capturing the FD count and connection state.
 
+## RCasterEtcdBackupFailed
+
+1. Run `systemctl status rcaster-etcd-backup.service` and inspect its journal.
+2. Verify `/etc/rcaster/etcd-backup.env`, etcd client certificate permissions,
+   endpoint reachability, quorum, and `/var/lib/rcaster/etcd-backups`.
+3. Run the service manually and confirm a new private `rcaster-*.db` snapshot
+   and successful retention.
+4. Do not clear the failed state until a real snapshot has completed.
+
+## RCasterEtcdBackupStale
+
+1. Run `systemctl list-timers rcaster-etcd-backup.timer` and check that the timer
+   is active with a next elapse no later than 15 minutes.
+2. Inspect the latest snapshot modification time and
+   `rcaster-etcd-backup.service` journal.
+3. Confirm the node's systemd collector exports
+   `node_systemd_timer_last_trigger_seconds`; without that collector this alert
+   cannot be evaluated.
+4. Restore scheduling and take a fresh snapshot before accepting the RPO.
+
 ## Etcd Backup Restore Drill
 
 1. Take a backup without overwriting an existing file:
