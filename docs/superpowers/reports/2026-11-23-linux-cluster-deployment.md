@@ -696,6 +696,12 @@ keeps advertised `C64` while hiding non-advertised `C63`. Final binary
 During a live 10-source smoke, all four public TLS source tables contained zero
 `STR;SOAK*` entries while subscriptions still transferred data.
 
+The latest local commit, intentionally not pushed at the operator's request,
+was also rechecked against all eight ignored external integrations: etcd client
+credential rotation, leader failure, total quorum recovery, snapshot restore to
+a ready Caster (1626 ms this run), HAProxy PROXY v2, RTKLIB `str2str`, official
+RTCM2/RTCM3 fixtures, and the 17.6 MB BINEX stream. All passed.
+
 ### Final 72-Hour Acceptance Run
 
 The final local soak units `rcaster-final-soak-72h.service` started on all four
