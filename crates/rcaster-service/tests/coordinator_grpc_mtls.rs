@@ -401,6 +401,8 @@ impl TestPki {
             certificate_pem: self.server_certificate.clone(),
             private_key_pem: self.server_key.clone(),
             client_ca_pem: self.ca_certificate.clone(),
+            client_crl_pem: None,
+            server_ocsp_der: None,
         }
     }
 

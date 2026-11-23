@@ -1,0 +1,111 @@
+groups:
+  - name: rcaster
+    rules:
+      - alert: RCasterNotReady
+        expr: rcaster_up == 1 and rcaster_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: rcaster
+        annotations:
+          summary: "RCaster node {{ $labels.instance }} is not ready"
+          description: "The process is alive but readiness has remained false for two minutes."
+          runbook_url: "docs/runbooks/rcaster.md#rcasternotready"
+
+      - alert: RCasterDependencyUnhealthy
+        expr: rcaster_cluster_dependency_healthy < 1
+        for: 5m
+        labels:
+          severity: critical
+          service: rcaster
+        annotations:
+          summary: "RCaster dependency {{ $labels.kind }} is unhealthy"
+          description: "A lease, config, blacklist, source-watch, or account-watch dependency has remained unhealthy."
+          runbook_url: "docs/runbooks/rcaster.md#rcasterdependencyunhealthy"
+
+      - alert: RCasterAuthLimiterFallback
+        expr: increase(rcaster_auth_failure_fallback_total[5m]) > 0
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster authentication limiting degraded to node-local state"
+          description: "Shared authentication failure state was unavailable and local protection remained active."
+          runbook_url: "docs/runbooks/rcaster.md#rcasterauthlimiterfallback"
+
+      - alert: RCasterTlsCertificateExpiring
+        expr: rcaster_tls_certificate_expires_seconds < 14 * 24 * 60 * 60
+        for: 10m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster listener certificate expires soon"
+          description: "The listener certificate has less than 14 days remaining."
+          runbook_url: "docs/runbooks/rcaster.md#rcastertlscertificateexpiring"
+
+      - alert: RCasterClockNotSynchronized
+        expr: rcaster_node_clock_synchronized == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster node {{ $labels.instance }} is not NTP synchronized"
+          description: "The Linux kernel clock discipline has remained unsynchronized for five minutes."
+          runbook_url: "docs/runbooks/rcaster.md#rcasterclocknotsynchronized"
+
+      - alert: RCasterClockSkewHigh
+        expr: max by (job) (rcaster_node_clock_offset_seconds) - min by (job) (rcaster_node_clock_offset_seconds) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster node clock offsets differ by more than 250 ms"
+          description: "The spread between node NTP offsets has remained above 250 ms for five minutes."
+          runbook_url: "docs/runbooks/rcaster.md#rcasterclockskewhigh"
+
+      - alert: RCasterSourceRejectionSpike
+        expr: sum(increase(rcaster_source_rejections_total[10m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster source rejection rate is elevated"
+          description: "More than 100 source admissions were rejected in the last ten minutes."
+          runbook_url: "docs/runbooks/rcaster.md#rcastersourcerejectionspike"
+
+      - alert: RCasterCrcErrorSpike
+        expr: increase(rcaster_source_crc_errors_total[10m]) > 1000
+        for: 10m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster source CRC errors are elevated"
+          description: "CRC24Q, parity, or checksum failures increased sharply over ten minutes."
+          runbook_url: "docs/runbooks/rcaster.md#rcastercrcerrorspike"
+
+      - alert: RCasterMemoryPressure
+        expr: rcaster_process_resident_memory_bytes > 1.8 * 1024 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster resident memory exceeds 1.8 GiB"
+          description: "The default 2 GiB deployment target is above 90% memory utilization."
+          runbook_url: "docs/runbooks/rcaster.md#rcastermemorypressure"
+
+      - alert: RCasterFileDescriptorPressure
+        expr: rcaster_process_open_fds > 30000
+        for: 5m
+        labels:
+          severity: warning
+          service: rcaster
+        annotations:
+          summary: "RCaster open file descriptors approach the default budget"
+          description: "Open file descriptors exceed 30000 of the documented 32768 budget."
+          runbook_url: "docs/runbooks/rcaster.md#rcasterfiledescriptorpressure"

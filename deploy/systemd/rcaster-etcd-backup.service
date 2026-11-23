@@ -1,0 +1,31 @@
+[Unit]
+Description=RCaster etcd snapshot backup
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/rcaster/etcd-backup.env
+
+[Service]
+Type=oneshot
+User=rcaster
+Group=rcaster
+EnvironmentFile=/etc/rcaster/etcd-backup.env
+ExecStart=/opt/rcaster/rcaster etcd-backup --etcd-endpoint ${RCASTER_BACKUP_ETCD_ENDPOINT} --backup-dir /var/lib/rcaster/etcd-backups --retention ${RCASTER_BACKUP_RETENTION} --etcd-ca ${RCASTER_BACKUP_ETCD_CA} --etcd-certificate ${RCASTER_BACKUP_ETCD_CERTIFICATE} --etcd-private-key ${RCASTER_BACKUP_ETCD_PRIVATE_KEY} --etcd-domain ${RCASTER_BACKUP_ETCD_DOMAIN}
+TimeoutStartSec=2min
+UMask=0077
+
+StateDirectory=rcaster
+ReadWritePaths=/var/lib/rcaster
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=

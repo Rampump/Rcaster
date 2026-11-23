@@ -4,6 +4,7 @@ use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, PutOpti
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use crate::account_directory::{mountpoint_key, user_key};
 use crate::config::{ConfigError, ConfigSnapshot, load_config_snapshot};
 use crate::source_claim::{
     ClaimError, ClaimedSource, SourceClaimRequest, claim_source_with_guards,
@@ -126,7 +127,17 @@ pub struct SessionRecord {
     pub caster_id: String,
     pub runtime_epoch: String,
     pub client_ip: Option<String>,
+    #[serde(default)]
+    pub ntrip_version: Option<String>,
+    #[serde(default)]
+    pub software: Option<String>,
     pub started_at: String,
+    #[serde(default)]
+    pub user_auth_version: u64,
+    #[serde(default)]
+    pub user_mod_revision: u64,
+    #[serde(default)]
+    pub mountpoint_mod_revision: u64,
 }
 
 impl SessionRecord {
@@ -149,7 +160,12 @@ impl SessionRecord {
             caster_id: caster_id.into(),
             runtime_epoch: runtime_epoch.into(),
             client_ip: Some(client_ip.into()),
+            ntrip_version: None,
+            software: None,
             started_at: started_at.into(),
+            user_auth_version: 0,
+            user_mod_revision: 0,
+            mountpoint_mod_revision: 0,
         }
     }
 
@@ -171,8 +187,31 @@ impl SessionRecord {
             caster_id: caster_id.into(),
             runtime_epoch: runtime_epoch.into(),
             client_ip: None,
+            ntrip_version: None,
+            software: None,
             started_at: started_at.into(),
+            user_auth_version: 0,
+            user_mod_revision: 0,
+            mountpoint_mod_revision: 0,
         }
+    }
+
+    pub fn with_protocol(mut self, ntrip_version: String, software: Option<String>) -> Self {
+        self.ntrip_version = Some(ntrip_version);
+        self.software = software;
+        self
+    }
+
+    pub fn with_account_revisions(
+        mut self,
+        auth_version: u64,
+        user_mod_revision: u64,
+        mountpoint_mod_revision: u64,
+    ) -> Self {
+        self.user_auth_version = auth_version;
+        self.user_mod_revision = user_mod_revision;
+        self.mountpoint_mod_revision = mountpoint_mod_revision;
+        self
     }
 }
 
@@ -376,6 +415,7 @@ pub async fn admit_client(
     let session_value = serde_json::to_vec(&request.session)?;
     let mut compares = user_lock.lock.compares().to_vec();
     compares.push(config_compare(cluster_id, &request.config));
+    compares.extend(account_compares(cluster_id, &request.session)?);
     let mut operations = Vec::new();
 
     if let Some(ip_max_sessions) = request.ip_max_sessions {
@@ -504,6 +544,7 @@ pub async fn admit_source(
     );
     let mut compares = user_lock.lock.compares().to_vec();
     compares.push(config_compare(cluster_id, &request.config));
+    compares.extend(account_compares(cluster_id, &request.session)?);
     let claim = claim_source_with_guards(
         client,
         lease_id,
@@ -529,6 +570,54 @@ pub async fn admit_source(
         }
         Err(error) => Err(AdmissionError::Source(error)),
     }
+}
+
+pub async fn release_session(
+    client: &mut Client,
+    cluster_id: &str,
+    session: &SessionRecord,
+) -> Result<(), AdmissionError> {
+    validate_key_segment(cluster_id, "cluster ID")?;
+    validate_session(session)?;
+    let mut operations = vec![TxnOp::delete(
+        user_session_key(cluster_id, session),
+        Some(DeleteOptions::new()),
+    )];
+    if let Some(client_ip) = &session.client_ip {
+        operations.push(TxnOp::delete(
+            ip_session_key(cluster_id, client_ip, &session.session_id),
+            Some(DeleteOptions::new()),
+        ));
+    }
+    client
+        .txn(Txn::new().and_then(operations))
+        .await
+        .map_err(AdmissionError::Etcd)?;
+    Ok(())
+}
+
+pub(crate) fn account_compares(
+    cluster_id: &str,
+    session: &SessionRecord,
+) -> Result<Vec<Compare>, AdmissionError> {
+    let mut compares = Vec::with_capacity(2);
+    if session.user_mod_revision > 0 {
+        compares.push(Compare::mod_revision(
+            user_key(cluster_id, &session.user_id)
+                .map_err(|_| AdmissionError::InvalidIdentifier("user ID"))?,
+            CompareOp::Equal,
+            session.user_mod_revision as i64,
+        ));
+    }
+    if session.mountpoint_mod_revision > 0 {
+        compares.push(Compare::mod_revision(
+            mountpoint_key(cluster_id, &session.mountpoint)
+                .map_err(|_| AdmissionError::InvalidIdentifier("mountpoint"))?,
+            CompareOp::Equal,
+            session.mountpoint_mod_revision as i64,
+        ));
+    }
+    Ok(compares)
 }
 
 pub(crate) fn validate_session(session: &SessionRecord) -> Result<(), AdmissionError> {

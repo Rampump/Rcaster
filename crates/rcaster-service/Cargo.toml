@@ -5,22 +5,41 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+argon2.workspace = true
+asn1-rs.workspace = true
+brotli.workspace = true
+ed25519-dalek.workspace = true
 etcd-client.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
 prost.workspace = true
 rand.workspace = true
+rcaster-core = { path = "../rcaster-core" }
+redb.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+der.workspace = true
+x509-cert.workspace = true
+x509-ocsp.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+ureq.workspace = true
+x509-parser.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 [build-dependencies]
 tonic-prost-build = "0.14.5"
 
 [dev-dependencies]
 rcgen = "0.13.2"
+ring = "0.17.14"

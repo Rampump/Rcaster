@@ -1,0 +1,12 @@
+[Unit]
+Description=Schedule periodic RCaster etcd snapshots
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*:0/15
+AccuracySec=1s
+Persistent=true
+Unit=rcaster-etcd-backup.service
+
+[Install]
+WantedBy=timers.target

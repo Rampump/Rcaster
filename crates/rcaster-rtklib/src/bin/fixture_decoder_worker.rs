@@ -123,7 +123,9 @@ fn main() -> io::Result<()> {
 fn decode_hex(value: &str) -> Vec<u8> {
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter_map(|pair| {
             std::str::from_utf8(pair)
                 .ok()

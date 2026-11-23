@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler haproxy
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check minimum Rust version
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run Clippy on minimum Rust version
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.21
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://127.0.0.1:2380
+          ETCD_INITIAL_CLUSTER: default=http://127.0.0.1:2380
+          ETCD_INITIAL_CLUSTER_STATE: new
+        ports:
+          - 2379:2379
+        options: >-
+          --health-cmd "etcdctl endpoint health"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      RCASTER_ETCD_ENDPOINT: http://127.0.0.1:2379
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan Rust dependencies for security advisories
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Verify systemd service unit
+        run: |
+          sudo cp deploy/sysusers/rcaster.conf /usr/lib/sysusers.d/rcaster.conf
+          sudo systemd-sysusers
+          sudo mkdir -p /opt/rcaster
+          sudo install -m 0755 /bin/true /opt/rcaster/rcaster
+          sudo install -m 0755 /bin/true /opt/rcaster/rcaster-updater
+          systemd-analyze verify deploy/systemd/rcaster.service deploy/systemd/rcaster-updater.service deploy/systemd/rcaster-etcd-backup.service deploy/systemd/rcaster-etcd-backup.timer
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Verify online OCSP responder refresh
+        run: >-
+          cargo test -p rcaster-service --locked
+          tls_reload::tests::ocsp_responder_refreshes_without_blocking_tokio_worker
+
+      - name: Verify Caster lease recovery
+        run: >-
+          cargo test -p rcaster-service --locked
+          cluster_runtime::lease_tests::revoked_caster_lease_is_regranted_without_restart
+
+      - name: Verify cross-node soak client framing
+        run: cargo test -p rcaster-service --example cluster_soak --locked
+
+      - name: Download etcd binary for TLS reload test
+        run: |
+          curl -fsSL \
+            https://github.com/etcd-io/etcd/releases/download/v3.5.21/etcd-v3.5.21-linux-amd64.tar.gz \
+            -o /tmp/etcd.tar.gz
+          tar -xzf /tmp/etcd.tar.gz -C /tmp
+
+      - name: Verify etcd client credential rotation
+        env:
+          RCASTER_ETCD_BIN: /tmp/etcd-v3.5.21-linux-amd64/etcd
+        run: cargo test -p rcaster-service --test etcd_credentials_reload --locked -- --ignored
+
+      - name: Verify etcd leader failover recovery
+        env:
+          RCASTER_ETCD_BIN: /tmp/etcd-v3.5.21-linux-amd64/etcd
+        run: cargo test -p rcaster-service --test etcd_leader_failover --locked -- --ignored
+
+      - name: Verify etcd snapshot restore drill
+        env:
+          RCASTER_ETCD_BIN: /tmp/etcd-v3.5.21-linux-amd64/etcd
+        run: cargo test -p rcaster-app --test etcd_restore_drill --locked -- --ignored
+
+      - name: Verify HAProxy PROXY protocol v2
+        run: >-
+          HAPROXY_BIN="$(command -v haproxy)" cargo test
+          -p rcaster-app --test serve_binary --locked
+          haproxy_proxy_protocol_v2_preserves_the_client_ip -- --ignored
+
+      - name: Build official RTKLIB str2str
+        run: |
+          git init /tmp/RTKLIB
+          git -C /tmp/RTKLIB remote add origin https://github.com/tomojitakasu/RTKLIB.git
+          git -C /tmp/RTKLIB fetch --depth 1 origin 71db0ffa0d9735697c6adfd06fdf766d0e5ce807
+          git -C /tmp/RTKLIB checkout --detach FETCH_HEAD
+          make -C /tmp/RTKLIB/app/str2str/gcc
+
+      - name: Build RTKLIB FFI worker
+        env:
+          RTKLIB_SOURCE_DIR: /tmp/RTKLIB
+        run: >-
+          cargo build -p rcaster-rtklib --features rtklib-ffi --locked
+          --bin rtklib-decoder-worker
+
+      - name: Verify RTKLIB FFI worker
+        env:
+          RTKLIB_SOURCE_DIR: /tmp/RTKLIB
+        run: |
+          cp target/debug/rtklib-decoder-worker /tmp/rtklib-decoder-worker
+          RCASTER_RTKLIB_WORKER_BIN=/tmp/rtklib-decoder-worker \
+            cargo test -p rcaster-rtklib --features rtklib-ffi --locked
+
+      - name: Verify workspace with all features
+        env:
+          RTKLIB_SOURCE_DIR: /tmp/RTKLIB
+          RCASTER_RTKLIB_WORKER_BIN: /tmp/rtklib-decoder-worker
+        run: cargo test --workspace --all-features --locked
+
+      - name: Verify RTKLIB source and client round trip
+        env:
+          RCASTER_STR2STR_BIN: /tmp/RTKLIB/app/str2str/gcc/str2str
+        run: >-
+          cargo test -p rcaster-app --test rtklib_str2str --locked --
+          --ignored
+
+      - name: Verify official RTCM2 and RTCM3 fixtures
+        env:
+          RCASTER_RTKLIB_TEST_DATA: /tmp/RTKLIB/test/data/rcvraw
+        run: >-
+          cargo test -p rcaster-core --test real_fixtures --locked --
+          --ignored
+
+      - name: Verify public BINEX stream fixture
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/nav-solutions/data/ac313e643ca24e8f06bd6c280198b28c14d467a9/BIN/mfle20200105.bnx.gz \
+            -o /tmp/mfle20200105.bnx.gz
+          gzip -dc /tmp/mfle20200105.bnx.gz > /tmp/mfle20200105.bnx
+          RCASTER_BINEX_FIXTURE=/tmp/mfle20200105.bnx \
+            cargo test -p rcaster-core --test real_binex --locked -- --ignored
+
+      - name: Run data-plane smoke test
+        run: >-
+          cargo run -p rcaster-service --example data_plane_soak --locked --
+          --sources 2 --subscribers 50 --duration-s 5 --rate-kib 64
+
+      - name: Run 1000-subscriber data-plane smoke test
+        run: >-
+          cargo run -p rcaster-service --example data_plane_soak --locked --
+          --sources 10 --subscribers 1000 --duration-s 10 --rate-kib 1
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --locked

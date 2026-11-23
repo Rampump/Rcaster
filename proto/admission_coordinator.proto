@@ -7,6 +7,34 @@ service AdmissionService {
   rpc AdmitSource(AdmitSourceRequest) returns (AdmitSourceResponse);
 }
 
+service RelayService {
+  rpc Open(RelayOpenRequest) returns (stream RelayChunk);
+  rpc Health(RelayHealthRequest) returns (RelayHealthResponse);
+}
+
+message RelayOpenRequest {
+  string cluster_id = 1;
+  string mountpoint = 2;
+  uint64 source_generation = 3;
+  string connection_id = 4;
+  string requesting_caster_id = 5;
+}
+
+message RelayChunk {
+  bytes data = 1;
+}
+
+message RelayHealthRequest {
+  string cluster_id = 1;
+  string mountpoint = 2;
+  uint64 source_generation = 3;
+  string connection_id = 4;
+}
+
+message RelayHealthResponse {
+  bytes payload = 1;
+}
+
 message AdmitClientRequest {
   int64 caster_lease_id = 1;
   string session_id = 2;
@@ -20,6 +48,10 @@ message AdmitClientRequest {
   string started_at = 10;
   uint64 config_generation = 11;
   int64 config_revision = 12;
+  string ntrip_version = 13;
+  optional string software = 14;
+  uint64 user_mod_revision = 15;
+  uint64 mountpoint_mod_revision = 16;
 }
 
 message AdmitClientResponse {
@@ -49,6 +81,10 @@ message AdmitSourceRequest {
   string relay_endpoint = 10;
   uint64 config_generation = 11;
   int64 config_revision = 12;
+  string ntrip_version = 13;
+  optional string software = 14;
+  uint64 user_mod_revision = 15;
+  uint64 mountpoint_mod_revision = 16;
 }
 
 message AdmitSourceResponse {

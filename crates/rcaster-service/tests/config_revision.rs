@@ -5,7 +5,10 @@ use rcaster_service::admission::{
     AdmissionError, ClientAdmissionRequest, SessionRecord, SourceAdmissionRequest, admit_client,
     admit_source, read_user_session_count, try_acquire_user_lock,
 };
-use rcaster_service::config::{CasterConfig, ConfigError, load_config_snapshot, publish_config};
+use rcaster_service::config::{
+    CasterConfig, ConfigError, load_config_revisions, load_config_snapshot, prune_config_revisions,
+    publish_config,
+};
 use rcaster_service::source_claim::SourceClaimRequest;
 
 #[tokio::test]
@@ -194,6 +197,79 @@ async fn stale_config_rejects_source_without_claim_or_session() {
 }
 
 #[tokio::test]
+async fn stale_account_revisions_reject_client_admission() {
+    let cluster = unique("account-revision");
+    let user_id = "u_account_revision";
+    let mountpoint = "C63";
+    let mut client = connect().await;
+    let current = publish_config(&mut client, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let user_put = client
+        .put(
+            format!("/rcaster/{cluster}/config/users/{user_id}"),
+            br#"{"enabled":true}"#.to_vec(),
+            None,
+        )
+        .await
+        .expect("write user");
+    let user_revision = user_put.header().expect("user header").revision() as u64;
+    let mount_put = client
+        .put(
+            format!("/rcaster/{cluster}/config/mounts/{mountpoint}"),
+            br#"{"enabled":true}"#.to_vec(),
+            None,
+        )
+        .await
+        .expect("write mountpoint");
+    let mount_revision = mount_put.header().expect("mount header").revision() as u64;
+
+    let lock_lease = grant_lease(&mut client).await;
+    let lock = try_acquire_user_lock(&mut client, lock_lease, &cluster, user_id)
+        .await
+        .expect("user lock");
+    client
+        .put(
+            format!("/rcaster/{cluster}/config/mounts/{mountpoint}"),
+            br#"{"enabled":false}"#.to_vec(),
+            None,
+        )
+        .await
+        .expect("disable mountpoint");
+    let session_lease = grant_lease(&mut client).await;
+    let result = admit_client(
+        &mut client,
+        session_lease,
+        &cluster,
+        lock,
+        ClientAdmissionRequest::new(
+            SessionRecord::client(
+                "s_account_stale",
+                user_id,
+                mountpoint,
+                "caster-east-01",
+                "boot_east",
+                "203.0.113.41",
+                "2026-11-22T01:00:00Z",
+            )
+            .with_account_revisions(1, user_revision, mount_revision),
+            2,
+            None,
+            current,
+        ),
+    )
+    .await;
+
+    assert!(matches!(result, Err(AdmissionError::StaleLock)));
+    assert_eq!(
+        read_user_session_count(&mut client, &cluster, user_id)
+            .await
+            .expect("count sessions"),
+        0
+    );
+}
+
+#[tokio::test]
 async fn published_generation_must_increase() {
     let cluster = unique("config-generation");
     let mut client = connect().await;
@@ -210,6 +286,33 @@ async fn published_generation_must_increase() {
         duplicate,
         Err(ConfigError::GenerationNotMonotonic)
     ));
+}
+
+#[tokio::test]
+async fn config_revision_retention_removes_old_generations() {
+    let cluster = unique("config-retention");
+    let mut client = connect().await;
+    for generation in 1..=6 {
+        publish_config(&mut client, &cluster, CasterConfig::new(generation))
+            .await
+            .expect("publish config");
+    }
+    assert_eq!(
+        prune_config_revisions(&mut client, &cluster, 3)
+            .await
+            .expect("prune revisions"),
+        3
+    );
+    let revisions = load_config_revisions(&mut client, &cluster, 10)
+        .await
+        .expect("load revisions");
+    assert_eq!(
+        revisions
+            .iter()
+            .map(|revision| revision.config.generation)
+            .collect::<Vec<_>>(),
+        vec![6, 5, 4]
+    );
 }
 
 async fn connect() -> Client {

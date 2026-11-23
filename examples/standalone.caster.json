@@ -1,0 +1,18 @@
+{
+  "bind": "127.0.0.1:2101",
+  "account_db": "accounts.redb",
+  "head_timeout_ms": 10000,
+  "content_length_max_bytes": 1048576,
+  "subscriber_buffer_events": 64,
+  "client_auth_required": false,
+  "client_auth_require_tls": false,
+  "source_auth_require_tls": false,
+  "session_limits": {
+    "default_max_sessions": 3,
+    "default_max_ip_sessions": 16,
+    "per_username": {
+      "owner": 5
+    },
+    "per_ip": {}
+  }
+}

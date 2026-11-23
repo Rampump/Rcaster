@@ -1,6 +1,7 @@
 use std::fmt;
 
 use etcd_client::{Client, Compare, CompareOp, DeleteOptions, PutOptions, Txn, TxnOp};
+use rcaster_core::{protocol::DataProfile, str_record::StrRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -56,6 +57,17 @@ pub struct SourceClaim {
     pub relay_endpoint: String,
     pub effective_user_id: String,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRoute {
+    pub source_generation: u64,
+    pub connection_id: String,
+    pub mountpoint: String,
+    pub caster_id: String,
+    pub runtime_epoch: String,
+    pub relay_endpoint: String,
+    pub str_record: StrRecord,
 }
 
 #[derive(Clone, Debug)]
@@ -149,10 +161,14 @@ struct SourceRecord {
     relay_endpoint: String,
     effective_user_id: String,
     created_at: String,
+    #[serde(rename = "str")]
+    str_record: StrRecord,
 }
 
 impl SourceRecord {
-    fn from_claim(claim: &SourceClaim, state: SourceState) -> Self {
+    fn from_claim(claim: &SourceClaim, state: SourceState, str_record: &StrRecord) -> Self {
+        let mut str_record = str_record.clone();
+        str_record.mountpoint = claim.mountpoint.clone();
         Self {
             schema_version: claim.schema_version,
             state,
@@ -164,6 +180,7 @@ impl SourceRecord {
             relay_endpoint: claim.relay_endpoint.clone(),
             effective_user_id: claim.effective_user_id.clone(),
             created_at: claim.created_at.clone(),
+            str_record,
         }
     }
 }
@@ -174,6 +191,25 @@ enum SourceState {
     Validating,
     #[serde(rename = "ACTIVE")]
     Active,
+}
+
+pub(crate) fn decode_source_route(value: &[u8]) -> Result<Option<SourceRoute>, ClaimError> {
+    let record: SourceRecord = serde_json::from_slice(value)?;
+    if record.schema_version != 1 {
+        return Err(ClaimError::CorruptState);
+    }
+    if matches!(record.state, SourceState::Validating) {
+        return Ok(None);
+    }
+    Ok(Some(SourceRoute {
+        source_generation: record.source_generation,
+        connection_id: record.connection_id,
+        mountpoint: record.mountpoint,
+        caster_id: record.caster_id,
+        runtime_epoch: record.runtime_epoch,
+        relay_endpoint: record.relay_endpoint,
+        str_record: record.str_record,
+    }))
 }
 
 pub async fn claim_source(
@@ -282,8 +318,12 @@ pub(crate) async fn prepare_source_claim(
         created_at: request.created_at.clone(),
     };
     let claim_value = serde_json::to_vec(&claim)?;
-    let provisional_source_value =
-        serde_json::to_vec(&SourceRecord::from_claim(&claim, SourceState::Validating))?;
+    let provisional_str = StrRecord::from_profile(&claim.mountpoint, &DataProfile::default());
+    let provisional_source_value = serde_json::to_vec(&SourceRecord::from_claim(
+        &claim,
+        SourceState::Validating,
+        &provisional_str,
+    ))?;
     let generation_compare = match generation_value {
         Some(value) => Compare::value(generation_key.clone(), CompareOp::Equal, value.value()),
         None => Compare::create_revision(generation_key.clone(), CompareOp::Equal, 0),
@@ -319,10 +359,12 @@ pub(crate) async fn prepare_source_claim(
 pub async fn publish_active(
     client: &mut Client,
     claimed: &ClaimedSource,
+    str_record: &StrRecord,
 ) -> Result<(), ClaimError> {
     let active_source_value = serde_json::to_vec(&SourceRecord::from_claim(
         &claimed.claim,
         SourceState::Active,
+        str_record,
     ))?;
     let transaction = Txn::new()
         .when(claimed.publish_compares())
@@ -348,6 +390,98 @@ pub async fn release_source(
         TxnOp::delete(claimed.source_key.clone(), Some(DeleteOptions::new())),
     ]);
 
+    if client.txn(transaction).await?.succeeded() {
+        Ok(())
+    } else {
+        Err(ClaimError::StaleClaim)
+    }
+}
+
+pub async fn release_source_for_connection(
+    client: &mut Client,
+    cluster_id: &str,
+    mountpoint: &str,
+    connection_id: &str,
+    runtime_epoch: &str,
+) -> Result<(), ClaimError> {
+    validate_identifier(cluster_id, "cluster ID")?;
+    validate_mountpoint(mountpoint)?;
+    let claim_key = format!("/rcaster/{cluster_id}/runtime/source-claims/{mountpoint}");
+    let source_key = format!("/rcaster/{cluster_id}/runtime/sources/{mountpoint}");
+    let response = client.get(claim_key.clone(), None).await?;
+    let value = response.kvs().first().ok_or(ClaimError::StaleClaim)?;
+    let claim: SourceClaim = serde_json::from_slice(value.value())?;
+    if claim.connection_id != connection_id || claim.runtime_epoch != runtime_epoch {
+        return Err(ClaimError::StaleClaim);
+    }
+    let transaction = Txn::new()
+        .when([
+            Compare::mod_revision(claim_key.clone(), CompareOp::Equal, value.mod_revision()),
+            Compare::value(claim_key.clone(), CompareOp::Equal, value.value().to_vec()),
+        ])
+        .and_then([
+            TxnOp::delete(claim_key, Some(DeleteOptions::new())),
+            TxnOp::delete(source_key, Some(DeleteOptions::new())),
+        ]);
+    if client.txn(transaction).await?.succeeded() {
+        Ok(())
+    } else {
+        Err(ClaimError::StaleClaim)
+    }
+}
+
+pub async fn activate_source_for_connection(
+    client: &mut Client,
+    cluster_id: &str,
+    mountpoint: &str,
+    connection_id: &str,
+    runtime_epoch: &str,
+    str_record: &StrRecord,
+) -> Result<(), ClaimError> {
+    validate_identifier(cluster_id, "cluster ID")?;
+    validate_mountpoint(mountpoint)?;
+    let claim_key = format!("/rcaster/{cluster_id}/runtime/source-claims/{mountpoint}");
+    let source_key = format!("/rcaster/{cluster_id}/runtime/sources/{mountpoint}");
+    let claim_response = client.get(claim_key.clone(), None).await?;
+    let claim_kv = claim_response.kvs().first().ok_or(ClaimError::StaleClaim)?;
+    let claim: SourceClaim = serde_json::from_slice(claim_kv.value())?;
+    if claim.connection_id != connection_id || claim.runtime_epoch != runtime_epoch {
+        return Err(ClaimError::StaleClaim);
+    }
+    let source_response = client.get(source_key.clone(), None).await?;
+    let source_kv = source_response
+        .kvs()
+        .first()
+        .ok_or(ClaimError::StaleClaim)?;
+    let active = serde_json::to_vec(&SourceRecord::from_claim(
+        &claim,
+        SourceState::Active,
+        str_record,
+    ))?;
+    let transaction = Txn::new()
+        .when([
+            Compare::mod_revision(claim_key, CompareOp::Equal, claim_kv.mod_revision()),
+            Compare::value(
+                format!("/rcaster/{cluster_id}/runtime/source-claims/{mountpoint}"),
+                CompareOp::Equal,
+                claim_kv.value().to_vec(),
+            ),
+            Compare::mod_revision(
+                source_key.clone(),
+                CompareOp::Equal,
+                source_kv.mod_revision(),
+            ),
+            Compare::value(
+                source_key.clone(),
+                CompareOp::Equal,
+                source_kv.value().to_vec(),
+            ),
+        ])
+        .and_then([TxnOp::put(
+            source_key,
+            active,
+            Some(PutOptions::new().with_lease(source_kv.lease())),
+        )]);
     if client.txn(transaction).await?.succeeded() {
         Ok(())
     } else {

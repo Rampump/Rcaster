@@ -1,12 +1,62 @@
-use std::fmt;
+use std::{
+    fmt,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp};
+use etcd_client::{Client, Compare, CompareOp, EventType, GetOptions, Txn, TxnOp, WatchOptions};
 use serde::{Deserialize, Serialize};
+use tokio::{sync::oneshot, task::JoinHandle};
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+use crate::ETCD_WATCH_IDLE_TIMEOUT;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CasterConfig {
     pub schema_version: u8,
     pub generation: u64,
+    #[serde(default)]
+    pub source_health: SourceHealthConfig,
+    #[serde(default)]
+    pub limits: CasterLimits,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SourceHealthConfig {
+    pub observation_timeout_s: u64,
+    pub crc_error_ratio_max: f64,
+}
+
+impl Default for SourceHealthConfig {
+    fn default() -> Self {
+        Self {
+            observation_timeout_s: 10,
+            crc_error_ratio_max: 0.1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CasterLimits {
+    pub max_source_bitrate_bps: u64,
+    pub max_sources: usize,
+    #[serde(default = "default_max_validating_sources")]
+    pub max_validating_sources: usize,
+    pub max_subscribers: usize,
+    pub max_subscribers_per_source: usize,
+}
+
+impl Default for CasterLimits {
+    fn default() -> Self {
+        Self {
+            max_source_bitrate_bps: 2_000_000,
+            max_sources: 500,
+            max_validating_sources: 64,
+            max_subscribers: 2500,
+            max_subscribers_per_source: 2000,
+        }
+    }
 }
 
 impl CasterConfig {
@@ -14,14 +64,29 @@ impl CasterConfig {
         Self {
             schema_version: 1,
             generation,
+            source_health: SourceHealthConfig::default(),
+            limits: CasterLimits::default(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConfigSnapshot {
     pub config: CasterConfig,
     pub revision: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConfigRevision {
+    pub config: CasterConfig,
+    pub revision: i64,
+}
+
+pub struct ConfigWatcher {
+    snapshot: Arc<RwLock<ConfigSnapshot>>,
+    healthy: Arc<AtomicBool>,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -85,9 +150,11 @@ pub async fn publish_config(
         None => Compare::create_revision(key.clone(), CompareOp::Equal, 0),
     };
     let value = serde_json::to_vec(&config)?;
-    let transaction = Txn::new()
-        .when([compare])
-        .and_then([TxnOp::put(key, value, None)]);
+    let archive_key = config_revision_key(cluster_id, config.generation)?;
+    let transaction = Txn::new().when([compare]).and_then([
+        TxnOp::put(key, value.clone(), None),
+        TxnOp::put(archive_key, value, None),
+    ]);
     let response = client.txn(transaction).await?;
     if !response.succeeded() {
         return Err(ConfigError::ConfigConflict);
@@ -98,6 +165,75 @@ pub async fn publish_config(
         .revision();
 
     Ok(ConfigSnapshot { config, revision })
+}
+
+pub async fn load_config_revisions(
+    client: &mut Client,
+    cluster_id: &str,
+    limit: usize,
+) -> Result<Vec<ConfigRevision>, ConfigError> {
+    let prefix = format!(
+        "/rcaster/{}/config/revisions/",
+        validate_cluster_id(cluster_id)?
+    );
+    let response = client
+        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .await?;
+    let mut revisions = response
+        .kvs()
+        .iter()
+        .map(|value| {
+            Ok(ConfigRevision {
+                config: decode_config(value.value())?,
+                revision: value.mod_revision(),
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    revisions.sort_by_key(|revision| std::cmp::Reverse(revision.config.generation));
+    revisions.truncate(limit.clamp(1, 500));
+    Ok(revisions)
+}
+
+pub async fn prune_config_revisions(
+    client: &mut Client,
+    cluster_id: &str,
+    retain: usize,
+) -> Result<usize, ConfigError> {
+    let prefix = format!(
+        "/rcaster/{}/config/revisions/",
+        validate_cluster_id(cluster_id)?
+    );
+    let response = client
+        .get(prefix, Some(GetOptions::new().with_prefix()))
+        .await?;
+    let mut all = response
+        .kvs()
+        .iter()
+        .map(|value| {
+            Ok(ConfigRevision {
+                config: decode_config(value.value())?,
+                revision: value.mod_revision(),
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    all.sort_by_key(|revision| std::cmp::Reverse(revision.config.generation));
+    if all.len() <= retain {
+        return Ok(0);
+    }
+    let remove = all.split_off(retain);
+    let removed = remove.len();
+    let mut operations = Vec::with_capacity(remove.len());
+    for revision in remove {
+        operations.push(TxnOp::delete(
+            config_revision_key(cluster_id, revision.config.generation)?,
+            None,
+        ));
+    }
+    client
+        .txn(Txn::new().and_then(operations))
+        .await
+        .map_err(ConfigError::Etcd)?;
+    Ok(removed)
 }
 
 pub async fn load_config_snapshot(
@@ -119,7 +255,186 @@ pub async fn load_config_snapshot(
     })
 }
 
-fn config_key(cluster_id: &str) -> Result<String, ConfigError> {
+impl ConfigWatcher {
+    pub async fn start(mut client: Client, cluster_id: &str) -> Result<Self, ConfigError> {
+        let snapshot = load_config_snapshot(&mut client, cluster_id).await?;
+        let snapshot = Arc::new(RwLock::new(snapshot));
+        let healthy = Arc::new(AtomicBool::new(false));
+        let key = config_key(cluster_id)?;
+        let cluster_id = cluster_id.to_owned();
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let task_snapshot = Arc::clone(&snapshot);
+        let task_healthy = Arc::clone(&healthy);
+        let task = tokio::spawn(async move {
+            run_config_watch(
+                client,
+                cluster_id,
+                key,
+                task_snapshot,
+                task_healthy,
+                &mut stop_rx,
+            )
+            .await;
+        });
+        Ok(Self {
+            snapshot,
+            healthy,
+            stop: Some(stop_tx),
+            task: Some(task),
+        })
+    }
+
+    pub fn snapshot(&self) -> ConfigSnapshot {
+        self.snapshot
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|_| ConfigSnapshot {
+                config: CasterConfig::new(0),
+                revision: 0,
+            })
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn replace_snapshot(&self, snapshot: ConfigSnapshot) {
+        if let Ok(mut current) = self.snapshot.write()
+            && snapshot.revision >= current.revision
+        {
+            *current = snapshot;
+        }
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+async fn run_config_watch(
+    mut client: Client,
+    cluster_id: String,
+    key: String,
+    snapshot: Arc<RwLock<ConfigSnapshot>>,
+    healthy: Arc<AtomicBool>,
+    stop: &mut oneshot::Receiver<()>,
+) {
+    loop {
+        let loaded = tokio::select! {
+            _ = &mut *stop => return,
+            result = load_config_snapshot(&mut client, &cluster_id) => result,
+        };
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                healthy.store(false, Ordering::Release);
+                if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        if let Ok(mut current) = snapshot.write()
+            && loaded.revision >= current.revision
+        {
+            *current = loaded;
+        }
+        let start_revision = snapshot
+            .read()
+            .map(|current| current.revision + 1)
+            .unwrap_or(1);
+        let stream = tokio::select! {
+            _ = &mut *stop => return,
+            result = client.watch(
+                key.clone(),
+                Some(
+                    WatchOptions::new()
+                        .with_start_revision(start_revision)
+                        .with_progress_notify(),
+                ),
+            ) => result,
+        };
+        let Ok(mut stream) = stream else {
+            healthy.store(false, Ordering::Release);
+            if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
+                return;
+            }
+            continue;
+        };
+        healthy.store(true, Ordering::Release);
+
+        loop {
+            let response = tokio::select! {
+                _ = &mut *stop => return,
+                response = tokio::time::timeout(ETCD_WATCH_IDLE_TIMEOUT, stream.message()) => response,
+            };
+            let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                break;
+            };
+            if response.canceled() {
+                healthy.store(false, Ordering::Release);
+                break;
+            }
+            for event in response.events() {
+                let Some(kv) = event.kv() else {
+                    continue;
+                };
+                if event.event_type() == EventType::Delete {
+                    healthy.store(false, Ordering::Release);
+                    continue;
+                }
+                let Ok(config) = decode_config(kv.value()) else {
+                    healthy.store(false, Ordering::Release);
+                    continue;
+                };
+                let next = ConfigSnapshot {
+                    config,
+                    revision: kv.mod_revision(),
+                };
+                let Ok(mut current) = snapshot.write() else {
+                    healthy.store(false, Ordering::Release);
+                    return;
+                };
+                if next.revision >= current.revision {
+                    *current = next;
+                    healthy.store(true, Ordering::Release);
+                }
+            }
+        }
+        healthy.store(false, Ordering::Release);
+        if stop_or_sleep(stop, std::time::Duration::from_millis(100)).await {
+            return;
+        }
+    }
+}
+
+async fn stop_or_sleep(stop: &mut oneshot::Receiver<()>, duration: std::time::Duration) -> bool {
+    tokio::select! {
+        _ = &mut *stop => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+pub(crate) fn config_key(cluster_id: &str) -> Result<String, ConfigError> {
+    Ok(format!(
+        "/rcaster/{}/config/caster",
+        validate_cluster_id(cluster_id)?
+    ))
+}
+
+fn config_revision_key(cluster_id: &str, generation: u64) -> Result<String, ConfigError> {
+    Ok(format!(
+        "/rcaster/{}/config/revisions/{generation}",
+        validate_cluster_id(cluster_id)?
+    ))
+}
+
+fn validate_cluster_id(cluster_id: &str) -> Result<&str, ConfigError> {
     if cluster_id.is_empty()
         || !cluster_id
             .bytes()
@@ -127,7 +442,7 @@ fn config_key(cluster_id: &str) -> Result<String, ConfigError> {
     {
         return Err(ConfigError::InvalidIdentifier("cluster ID"));
     }
-    Ok(format!("/rcaster/{cluster_id}/config/caster"))
+    Ok(cluster_id)
 }
 
 fn decode_config(value: &[u8]) -> Result<CasterConfig, ConfigError> {
@@ -135,7 +450,21 @@ fn decode_config(value: &[u8]) -> Result<CasterConfig, ConfigError> {
     if config.schema_version != 1 {
         return Err(ConfigError::UnsupportedSchema(config.schema_version));
     }
+    if config.source_health.observation_timeout_s == 0
+        || !(0.0..=1.0).contains(&config.source_health.crc_error_ratio_max)
+        || config.limits.max_source_bitrate_bps == 0
+        || config.limits.max_sources == 0
+        || config.limits.max_validating_sources == 0
+        || config.limits.max_subscribers == 0
+        || config.limits.max_subscribers_per_source == 0
+    {
+        return Err(ConfigError::InvalidConfig);
+    }
     Ok(config)
+}
+
+fn default_max_validating_sources() -> usize {
+    64
 }
 
 #[cfg(test)]
@@ -152,5 +481,19 @@ mod tests {
     #[test]
     fn rejects_invalid_config_json() {
         assert!(decode_config(b"{not-json}").is_err());
+    }
+
+    #[test]
+    fn validates_source_health_thresholds() {
+        let mut config = super::CasterConfig::new(1);
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_ok());
+        config.source_health.observation_timeout_s = 0;
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
+        config.source_health.observation_timeout_s = 10;
+        config.source_health.crc_error_ratio_max = 1.1;
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
+        config.source_health.crc_error_ratio_max = 0.1;
+        config.limits.max_source_bitrate_bps = 0;
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
     }
 }

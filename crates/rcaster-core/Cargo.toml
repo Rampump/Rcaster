@@ -3,3 +3,6 @@ name = "rcaster-core"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true

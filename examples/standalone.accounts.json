@@ -1,0 +1,32 @@
+{
+  "users": [
+    {
+      "schema_version": 1,
+      "mod_revision": 1,
+      "user_id": "owner-id",
+      "username": "owner",
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$5h0tQ12kLI/I7eXwIOKLDg$xyNhl6pJkANHrKA09mKnAFbZJ5oKl6/ciBn3tlRxTWE",
+      "auth_version": 1,
+      "enabled": true,
+      "ntrip_enabled": true,
+      "web_enabled": true,
+      "role": "user",
+      "created_at": "2026-11-22T00:00:00Z",
+      "updated_at": "2026-11-22T00:00:00Z"
+    }
+  ],
+  "mountpoints": [
+    {
+      "schema_version": 1,
+      "mod_revision": 1,
+      "mountpoint": "C63",
+      "owner_user_id": "owner-id",
+      "enabled": true,
+      "ntrip1_upload_password_hash": "$argon2id$v=19$m=19456,t=2,p=1$5h0tQ12kLI/I7eXwIOKLDg$xyNhl6pJkANHrKA09mKnAFbZJ5oKl6/ciBn3tlRxTWE",
+      "advertise": true,
+      "region": "development",
+      "created_at": "2026-11-22T00:00:00Z",
+      "updated_at": "2026-11-22T00:00:00Z"
+    }
+  ]
+}

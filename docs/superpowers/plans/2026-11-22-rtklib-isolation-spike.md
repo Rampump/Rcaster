@@ -39,3 +39,11 @@
 
 - [x] Run format, Clippy, and full workspace tests.
 - [x] Record isolation limitations and the next RTKLIB ABI step.
+
+### Task 4: Add Optional RTKLIB ABI Worker
+
+- [x] Add a stable C shim around RTKLIB 2.4.3 RTCM3 framing.
+- [x] Add a feature-gated JSON-lines worker using the existing supervisor.
+- [x] Compile against RTKLIB tag `v2.4.3-b34`.
+- [x] Test capability probe, RTCM3 1005 decode, and request frame boundaries.
+- [x] Document the build-time source requirement and remaining semantic limits.

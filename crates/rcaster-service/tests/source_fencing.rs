@@ -1,6 +1,7 @@
 use etcd_client::{Client, ConnectOptions};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rcaster_core::{protocol::DataProfile, str_record::StrRecord};
 use rcaster_service::source_claim::{
     ClaimError, SourceClaim, SourceClaimRequest, claim_source, publish_active, release_source,
 };
@@ -128,7 +129,7 @@ async fn takeover_fences_the_previous_caster() {
     assert_eq!(second.claim.source_generation, 2);
 
     assert!(matches!(
-        publish_active(&mut client, &first).await,
+        publish_active(&mut client, &first, &default_str("C63")).await,
         Err(ClaimError::StaleClaim)
     ));
     assert!(matches!(
@@ -151,12 +152,16 @@ async fn takeover_fences_the_previous_caster() {
         serde_json::from_slice(current_claim.value()).expect("valid claim JSON");
     assert_eq!(current_claim.connection_id, "c_02j");
 
-    publish_active(&mut client, &second)
+    publish_active(&mut client, &second, &default_str("C63"))
         .await
         .expect("current caster must publish");
     release_source(&mut client, &second)
         .await
         .expect("current caster must release");
+}
+
+fn default_str(mountpoint: &str) -> StrRecord {
+    StrRecord::from_profile(mountpoint, &DataProfile::default())
 }
 
 async fn wait_for_missing_key(client: &mut Client, key: &str) {

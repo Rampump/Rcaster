@@ -1,2 +1,5 @@
 /target
 .env
+/rcaster-src*.tgz
+/rcaster-src*.tgz.sha256
+/test.etcd/

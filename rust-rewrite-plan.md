@@ -87,6 +87,8 @@
 
 * 第一版提供必要的管理页面和监控页面，但不实现复杂大屏、挂载点级 ACL、计费或完整多租户。
 
+* 不实现 on-demand 外部上游拉流（`on_demand` / `on_demand_upstream`）；跨节点数据源只走内部 relay，不主动拨号外部上游。
+
 ### 1.3 基本术语
 
 
@@ -386,8 +388,6 @@ West source -> src-west.example.com -> West core/edge
   "enabled": true,
   "ntrip1_upload_password_hash": "$argon2id$...",
   "region": "east-china",
-  "on_demand": false,
-  "on_demand_upstream": null,
   "advertise": true,
   "lat": 31.234,
   "lon": 121.456,
@@ -430,6 +430,8 @@ West source -> src-west.example.com -> West core/edge
 * NTRIP2 上传不验证该密码，而是验证 owner 用户名和 owner 用户密码。
 
 * 客户端订阅不验证 owner，也不验证该上传密码。
+
+> **本期非目标（见 1.2）：以下 `on_demand` / `on_demand_upstream` 外部上游相关字段与安全约束均不实现，跨节点只走内部 relay。**
 
 * `on_demand=true` 表示可按需建立源站或外部拉流。
 
@@ -557,7 +559,7 @@ relay:
   idle_grace_ms: 500
   connect_timeout_ms: 5000
   read_timeout_s: 30
-  on_demand_source_timeout_s: 60
+  # on_demand_source_timeout_s: 60  # 本期非目标，on-demand 上游不实现（见 1.2 / 6.7）
   reconnect_delay_s: 10
   max_concurrent_starting: 16
   max_input_bitrate_bps: 2000000
@@ -728,7 +730,7 @@ rtklib:
 
 * `subscriber_backlog_bytes` 默认 16 KiB，沿用 Millipede 的 `backlog_evbuffer=16384`；`socket_send_buffer_bytes` 默认 114688，对应 `backlog_socket=112 KiB`。
 
-* `source_read_timeout_s=60` 沿用 Millipede 默认值；relay 和 on-demand 上游使用同类读超时。
+* `source_read_timeout_s=60` 沿用 Millipede 默认值；relay 上游使用同类读超时。（on-demand 上游为本期非目标，不实现。）
 
 * `client_idle_timeout_s` 只约束请求体、GGA 上行或需要客户端输入的阶段；普通只下行客户端即使不上传 GGA 也不能仅因读空闲而断开。
 
@@ -2154,7 +2156,9 @@ Fencing 规则：
 
 只有进入 ACTIVE 的源站才出现在公共 STR 和 relay 路由中；VALIDATING、REJECTED 不会作为可用源公开。
 
-### 6.7 On-Demand Source
+### 6.7 On-Demand Source（本期非目标，不实现）
+
+> **本期决策：不实现 on-demand 外部上游拉流。** 跨节点数据源只走第 9 章内部 relay，Caster 不主动拨号管理员预设或外部上游；`on_demand` / `on_demand_upstream` 字段、外部上游连接、idle 拉起/断开状态机均不落地。以下仅为历史设计背景，不作为本期待办。
 
 外部代理或按需源也必须先占用 source key：
 
@@ -2401,7 +2405,7 @@ cooldown value：
 
 * User config：`user_id`、`username`、`password_hash`、`auth_version`、`role`、`enabled`、`ntrip_enabled`、`created_at`、`updated_at`、`mod_revision`。
 
-* Mountpoint config：`mountpoint`、`owner_user_id`、`enabled`、`ntrip1_upload_password_hash`、`region`、`on_demand`、`advertise`、经纬度、`str_fields`、`source_expectation`、`mod_revision`。
+* Mountpoint config：`mountpoint`、`owner_user_id`、`enabled`、`ntrip1_upload_password_hash`、`region`、`advertise`、经纬度、`str_fields`、`source_expectation`、`mod_revision`。（`on_demand` 为本期非目标字段，不落地，见 1.2 / 6.7。）
 
 * Client session：`session_id`、`user_id`、`username`、`auth_version`、`mountpoint`、`client_ip`、`remote_port`、`caster_id`、`runtime_epoch`、`session_type`、`ntrip_version`、`auth_scheme`、`client_software`、`started_at`。
 
@@ -2699,7 +2703,7 @@ CLOSED
 
 5. 如果集群其他 Caster 有 active source，自动建立 / 复用 relay。
 
-6. 如果挂载点支持 on-demand，先占用 source claim，再建立上游。
+6. ~~如果挂载点支持 on-demand，先占用 source claim，再建立上游。~~ **本期非目标，不实现**（见 1.2 / 6.7）；无源时走第 8 步的 404/503。
 
 7. 如果客户端认证开启，认证用户；认证通过后执行 user admission 和正数 IP quota 并发事务。
 
@@ -3452,7 +3456,7 @@ source SharedPacket
 A 本地 Hub 有 C63 -> 直接订阅
 A 本地 Hub 没有 C63
   -> 读本地 watch cache 的 runtime/sources/C63
-  -> 不存在：404/503 或 on-demand
+  -> 不存在：404/503（on-demand 拉起为本期非目标，见 1.2 / 6.7）
   -> owner endpoint == A：本地转发
   -> owner endpoint != A：确保本地 C63 relay
 ```
@@ -3638,7 +3642,7 @@ ConfigSnapshot
 
 * 启用且允许 advertise 的系统合成 mountpoint，名称取 `near.mountpoint`。
 
-* 配置中允许 advertise 的 on-demand mountpoint。
+* ~~配置中允许 advertise 的 on-demand mountpoint。~~ **本期非目标，不实现**（见 1.2 / 6.7）。
 
 不会把仅存在于内存的 relay、`VALIDATING` source 或失败的临时 STR 当成可订阅源。
 
@@ -3831,7 +3835,7 @@ MountViewCache
 
 * 已通过准入且 `has_usable_rtcm3_correction=true`。
 
-* 可用的 RTCM3 on-demand source；第一版不让 on-demand 源参与 NEAR，避免并发拉流放大。
+* ~~可用的 RTCM3 on-demand source；第一版不让 on-demand 源参与 NEAR，避免并发拉流放大。~~ **本期非目标，on-demand source 整体不实现**（见 1.2 / 6.7）。
 
 * 排除配置的 `near.mountpoint` 合成挂载点。
 
@@ -4415,7 +4419,7 @@ ready 条件：
 
 
 
-* 节点健康：listener、FD、CPU、RSS、redb、证书有效期。
+* 节点健康：listener、FD、CPU、RSS、redb、证书有效期、NTP 偏移和同步状态。
 
 * 集群健康：etcd quorum、lease 剩余、watch lag、config generation、relay 可达性、时钟偏差。
 
@@ -5157,7 +5161,8 @@ apps/
 
 * 解码器之间只对同一 fixture 做差分测试，不在生产流量上重复解析；RTKLIB 崩溃不能影响 framing 或 fan-out。
 
-Rust workspace 的 MSRV 暂定为 1.87，由当前 `nmea 0.8.0` 决定；升级依赖前单独复核 MSRV。
+Rust workspace 的 MSRV 当前为 1.88，由修复 RUSTSEC-2026-0009 的 `time`
+版本决定；后续升级依赖前仍需单独复核 MSRV。
 
 不建议使用的现成方案：
 
@@ -5455,7 +5460,7 @@ Rust workspace 的 MSRV 暂定为 1.87，由当前 `nmea 0.8.0` 决定；升级�
 
 * etcd 分区时旧源站先 fencing，再允许其他 Caster 接管。
 
-* on-demand source 不会跨 Caster 重复拉取。
+* ~~on-demand source 不会跨 Caster 重复拉取。~~ **本期非目标，on-demand source 不实现，本验收项移除**（见 1.2 / 6.7）。
 
 * 旧 source 任务恢复后不能覆盖或删除新 `connection_id` 的 claim/source。
 

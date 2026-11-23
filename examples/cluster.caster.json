@@ -1,0 +1,27 @@
+{
+  "bind": "0.0.0.0:2101",
+  "account_db": "accounts.redb",
+  "head_timeout_ms": 10000,
+  "content_length_max_bytes": 1048576,
+  "subscriber_buffer_events": 64,
+  "client_auth_required": true,
+  "client_auth_require_tls": false,
+  "source_auth_require_tls": false,
+  "session_limits": {
+    "default_max_sessions": 3,
+    "default_max_ip_sessions": 16,
+    "per_username": {},
+    "per_ip": {}
+  },
+  "cluster": {
+    "etcd_endpoints": [
+      "http://127.0.0.1:2379"
+    ],
+    "cluster_id": "development",
+    "caster_id": "caster-dev-01",
+    "runtime_epoch": "boot-dev-01",
+    "relay_endpoint": "10.0.0.10:12102",
+    "lease_ttl_s": 30,
+    "coordinator_endpoint": "http://127.0.0.1:19090"
+  }
+}

@@ -3,7 +3,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
+use rustls::{
+    RootCertStore, ServerConfig,
+    pki_types::{CertificateDer, CertificateRevocationListDer, PrivateKeyDer, pem::PemObject},
+    server::WebPkiClientVerifier,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, oneshot},
@@ -138,15 +142,14 @@ async fn accept_loop(
     }
 }
 
-fn server_config(tls: &GrpcServerTls) -> Result<Arc<ServerConfig>, GrpcTlsError> {
+pub(crate) fn server_config(tls: &GrpcServerTls) -> Result<Arc<ServerConfig>, GrpcTlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certificates = rustls_pemfile::certs(&mut tls.certificate_pem.as_bytes())
+    let certificates = CertificateDer::pem_slice_iter(tls.certificate_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| GrpcTlsError::Certificate(error.to_string()))?;
-    let private_key = rustls_pemfile::private_key(&mut tls.private_key_pem.as_bytes())
-        .map_err(|error| GrpcTlsError::Certificate(error.to_string()))?
-        .ok_or(GrpcTlsError::MissingPrivateKey)?;
-    let ca_certificates = rustls_pemfile::certs(&mut tls.client_ca_pem.as_bytes())
+    let private_key = PrivateKeyDer::from_pem_slice(tls.private_key_pem.as_bytes())
+        .map_err(|error| GrpcTlsError::Certificate(error.to_string()))?;
+    let ca_certificates = CertificateDer::pem_slice_iter(tls.client_ca_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| GrpcTlsError::Certificate(error.to_string()))?;
     let mut roots = RootCertStore::empty();
@@ -156,13 +159,30 @@ fn server_config(tls: &GrpcServerTls) -> Result<Arc<ServerConfig>, GrpcTlsError>
             "client CA contains invalid certificates".to_owned(),
         ));
     }
-    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+    let mut verifier = WebPkiClientVerifier::builder(Arc::new(roots));
+    if let Some(client_crl_pem) = &tls.client_crl_pem {
+        let crls = CertificateRevocationListDer::pem_slice_iter(client_crl_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| GrpcTlsError::Certificate(error.to_string()))?;
+        if crls.is_empty() {
+            return Err(GrpcTlsError::Certificate(
+                "client CRL contains no CRLs".to_owned(),
+            ));
+        }
+        verifier = verifier.with_crls(crls);
+    }
+    let verifier = verifier
         .build()
         .map_err(|error| GrpcTlsError::Rustls(error.to_string()))?;
-    let mut config = ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(certificates, private_key)
-        .map_err(|error| GrpcTlsError::Rustls(error.to_string()))?;
+    let builder = ServerConfig::builder().with_client_cert_verifier(verifier);
+    let mut config = if let Some(server_ocsp_der) = &tls.server_ocsp_der {
+        crate::tls_reload::validate_ocsp_response(server_ocsp_der, &tls.certificate_pem)
+            .map_err(|error| GrpcTlsError::Certificate(error.to_string()))?;
+        builder.with_single_cert_with_ocsp(certificates, private_key, server_ocsp_der.clone())
+    } else {
+        builder.with_single_cert(certificates, private_key)
+    }
+    .map_err(|error| GrpcTlsError::Rustls(error.to_string()))?;
     config.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(config))
 }

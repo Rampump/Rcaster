@@ -1,0 +1,32 @@
+[package]
+name = "rcaster-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+etcd-client.workspace = true
+rcaster-core = { path = "../rcaster-core" }
+rcaster-service = { path = "../rcaster-service" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13.2"
+rustls.workspace = true
+tokio-rustls.workspace = true
+
+[[bin]]
+name = "rcaster"
+path = "src/main.rs"
+
+[[bin]]
+name = "rcaster-updater"
+path = "src/bin/rcaster-updater.rs"
+
+[[bin]]
+name = "rcaster-upgrade-signer"
+path = "src/bin/rcaster-upgrade-signer.rs"

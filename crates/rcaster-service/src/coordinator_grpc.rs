@@ -60,6 +60,8 @@ pub struct GrpcServerTls {
     pub certificate_pem: String,
     pub private_key_pem: String,
     pub client_ca_pem: String,
+    pub client_crl_pem: Option<String>,
+    pub server_ocsp_der: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -152,7 +154,7 @@ impl AdmissionAccessPolicy {
         }
     }
 
-    fn authorize(&self, presented: &str) -> Result<(), Status> {
+    pub(crate) fn authorize(&self, presented: &str, required_scope: &str) -> Result<(), Status> {
         let token = {
             let state = self
                 .state
@@ -175,7 +177,7 @@ impl AdmissionAccessPolicy {
             .cluster_id
             .clone();
         if token.cluster_id != cluster_id
-            || !token.scopes.iter().any(|scope| scope == "admission:write")
+            || !token.scopes.iter().any(|scope| scope == required_scope)
         {
             return Err(Status::permission_denied("service token scope denied"));
         }
@@ -217,7 +219,7 @@ impl Interceptor for ServerTokenInterceptor {
         let token = authorization
             .strip_prefix("Bearer ")
             .ok_or_else(|| Status::unauthenticated("invalid authorization scheme"))?;
-        self.policy.authorize(token)?;
+        self.policy.authorize(token, "admission:write")?;
         Ok(request)
     }
 }
@@ -417,6 +419,10 @@ fn request_to_proto(lease_id: i64, request: &ClientAdmissionRequest) -> AdmitCli
         started_at: request.session.started_at.clone(),
         config_generation: request.config.config.generation,
         config_revision: request.config.revision,
+        ntrip_version: request.session.ntrip_version.clone().unwrap_or_default(),
+        software: request.session.software.clone(),
+        user_mod_revision: request.session.user_mod_revision,
+        mountpoint_mod_revision: request.session.mountpoint_mod_revision,
     }
 }
 
@@ -432,15 +438,19 @@ fn request_from_proto(request: AdmitClientRequest) -> ClientAdmissionRequest {
         request.started_at,
     );
     session.client_ip = client_ip;
+    session.ntrip_version = (!request.ntrip_version.is_empty()).then_some(request.ntrip_version);
+    session.software = request.software;
+    session = session.with_account_revisions(
+        0,
+        request.user_mod_revision,
+        request.mountpoint_mod_revision,
+    );
     ClientAdmissionRequest::new(
         session,
         request.max_sessions as usize,
         request.ip_max_sessions.map(|value| value as usize),
         ConfigSnapshot {
-            config: CasterConfig {
-                schema_version: 1,
-                generation: request.config_generation,
-            },
+            config: CasterConfig::new(request.config_generation),
             revision: request.config_revision,
         },
     )
@@ -460,20 +470,32 @@ fn source_request_to_proto(lease_id: i64, request: &SourceAdmissionRequest) -> A
         relay_endpoint: request.source_claim.relay_endpoint.clone(),
         config_generation: request.config.config.generation,
         config_revision: request.config.revision,
+        ntrip_version: request.session.ntrip_version.clone().unwrap_or_default(),
+        software: request.session.software.clone(),
+        user_mod_revision: request.session.user_mod_revision,
+        mountpoint_mod_revision: request.session.mountpoint_mod_revision,
     }
 }
 
 fn source_request_from_proto(request: AdmitSourceRequest) -> SourceAdmissionRequest {
     let created_at = request.started_at.clone();
+    let mut session = SessionRecord::source(
+        request.session_id,
+        request.user_id.clone(),
+        request.mountpoint.clone(),
+        request.caster_id.clone(),
+        request.runtime_epoch.clone(),
+        request.started_at,
+    );
+    session.ntrip_version = (!request.ntrip_version.is_empty()).then_some(request.ntrip_version);
+    session.software = request.software;
+    session = session.with_account_revisions(
+        0,
+        request.user_mod_revision,
+        request.mountpoint_mod_revision,
+    );
     SourceAdmissionRequest::new(
-        SessionRecord::source(
-            request.session_id,
-            request.user_id.clone(),
-            request.mountpoint.clone(),
-            request.caster_id.clone(),
-            request.runtime_epoch.clone(),
-            request.started_at,
-        ),
+        session,
         request.max_sessions as usize,
         SourceClaimRequest::new(
             request.mountpoint,
@@ -485,10 +507,7 @@ fn source_request_from_proto(request: AdmitSourceRequest) -> SourceAdmissionRequ
             created_at,
         ),
         ConfigSnapshot {
-            config: CasterConfig {
-                schema_version: 1,
-                generation: request.config_generation,
-            },
+            config: CasterConfig::new(request.config_generation),
             revision: request.config_revision,
         },
     )

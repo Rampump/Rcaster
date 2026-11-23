@@ -7,10 +7,7 @@ use std::{
     time::Duration,
 };
 
-use etcd_client::{
-    Client, Compare, CompareOp, DeleteOptions, LeaseKeepAliveStream, LeaseKeeper, PutOptions, Txn,
-    TxnOp,
-};
+use etcd_client::{Client, Compare, CompareOp, DeleteOptions, PutOptions, Txn, TxnOp};
 use rand::Rng;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -21,8 +18,8 @@ use tokio::{
 use crate::{
     admission::{
         AdmissionError, ClientAdmissionRequest, ClientPermit, SourceAdmissionRequest, SourcePermit,
-        config_compare, ip_session_key, read_ip_session_count, read_user_session_count,
-        user_session_key, validate_key_segment, validate_session,
+        account_compares, config_compare, ip_session_key, read_ip_session_count,
+        read_user_session_count, user_session_key, validate_key_segment, validate_session,
     },
     config::{ConfigSnapshot, load_config_snapshot},
     source_claim::{ClaimError, PreparedSourceClaim, prepare_source_claim},
@@ -107,18 +104,10 @@ impl AdmissionCoordinator {
         let (keepalive_stop_tx, keepalive_stop_rx) = oneshot::channel();
 
         if options.keep_alive {
-            let mut keepalive_client = client.clone();
-            let (keeper, stream) = match keepalive_client.lease_keep_alive(owner.lease_id).await {
-                Ok(keepalive) => keepalive,
-                Err(error) => {
-                    let mut cleanup_client = client.clone();
-                    release_owner(&mut cleanup_client, &owner).await;
-                    return Err(error.into());
-                }
-            };
+            let keepalive_client = client.clone();
             tokio::spawn(keep_owner_alive(
-                keeper,
-                stream,
+                keepalive_client,
+                owner.lease_id,
                 options.owner_lease_ttl_s,
                 alive.clone(),
                 keepalive_stop_rx,
@@ -228,27 +217,39 @@ async fn acquire_owner(
 }
 
 async fn keep_owner_alive(
-    mut keeper: LeaseKeeper,
-    mut stream: LeaseKeepAliveStream,
+    client: Client,
+    lease_id: i64,
     lease_ttl_s: i64,
     alive: Arc<AtomicBool>,
     mut stop: oneshot::Receiver<()>,
 ) {
     let interval = Duration::from_secs((lease_ttl_s / 3).max(1) as u64);
     loop {
+        let mut client = client.clone();
+        let (mut keeper, mut stream) = match client.lease_keep_alive(lease_id).await {
+            Ok(keepalive) => keepalive,
+            Err(_) => {
+                alive.store(false, Ordering::Release);
+                tokio::select! {
+                    _ = &mut stop => return,
+                    _ = sleep(interval) => continue,
+                }
+            }
+        };
+        alive.store(true, Ordering::Release);
         tokio::select! {
             _ = &mut stop => return,
             _ = sleep(interval) => {}
         }
         if keeper.keep_alive().await.is_err() {
             alive.store(false, Ordering::Release);
-            return;
+            continue;
         }
         match stream.message().await {
             Ok(Some(response)) if response.ttl() > 0 => {}
             _ => {
                 alive.store(false, Ordering::Release);
-                return;
+                continue;
             }
         }
     }
@@ -458,6 +459,7 @@ async fn process_group(
                 request,
                 response,
             } => {
+                compares.extend(account_compares(cluster_id, &request.session)?);
                 let session_value = serde_json::to_vec(&request.session)?;
                 operations.push(TxnOp::put(
                     user_session_key(cluster_id, &request.session),
@@ -488,6 +490,7 @@ async fn process_group(
                 prepared: mut source_prepared,
                 response,
             } => {
+                compares.extend(account_compares(cluster_id, &request.session)?);
                 let session_value = serde_json::to_vec(&request.session)?;
                 operations.push(TxnOp::put(
                     user_session_key(cluster_id, &request.session),
