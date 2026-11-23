@@ -59,7 +59,7 @@
 | 1000 次配置更新 | ConfigWatcher 保持健康并收敛到 generation 1001 |
 | Linux 进程资源指标 | RSS/FD 采集路径与指标测试已加入 |
 | Rust 1.88 MSRV | `check --all-targets`、Clippy `-D warnings` 和完整 workspace 测试通过；CI 已增加固定 1.88 作业 |
-| RustSec advisory 门禁 | CI 配置已加入，等待远端 GitHub Actions 首跑 |
+| RustSec advisory 门禁 | GitHub Actions 已实际执行并通过，包含 RustSec、MSRV、Clippy 和完整测试 |
 
 2026-11-23 的最终本地复核将 `time` 升级到 0.3.47，移除已停止维护的
 `rustls-pemfile`，改用 `rustls-pki-types` 的 PEM 解码接口，并将 MSRV
@@ -138,7 +138,7 @@ readiness 置为 false 并停止健康采样，再开始关闭 listener。
   返回 `Mount Point Taken or Invalid`，避免客户端只看到 EOF。
 - 新增真实 HAProxy PROXY Protocol v2 集成测试：HAProxy 从 `127.0.0.2`
   建立客户端连接并发送 v2 头，后端只有采用头内源 IP 时才会返回 403。
-  测试已编译通过，等待 GitHub Actions 远端首次执行。
+  测试已在本地和 GitHub Actions Ubuntu runner 上通过。
 - 新增三成员 etcd leader 故障测试：杀死 leader 后，两个存活成员维持
   quorum，原 ConfigWatcher 重连并应用新 generation；本地真实二进制执行通过。
 - 新增本地 TCP 分区测试：Watcher 只通过受控 TCP 代理访问 etcd，代理断开
@@ -225,8 +225,10 @@ readiness 置为 false 并停止健康采样，再开始关闭 listener。
 - 已完成目标测试集群真实 etcd 快照的隔离恢复和 stale runtime 清理；仍需
   完成 etcd 单成员恢复、全 quorum 丢失、redb/TLS 私钥恢复及正式 RPO/RTO
   记录。
-- GitHub Actions 尚未在远端实际运行首轮 push/PR；本地 YAML 解析通过不等于
-  GitHub runner 已验证。
+- GitHub Actions 首轮暴露了 service container 和 HAProxy 安装缺失两个环境
+  问题；改为直接启动 etcd 二进制并补齐 HAProxy 后，run `45242799276` 的
+  `msrv` 与 `test` 两个 job 全部通过，包括 RustSec、完整测试、PROXY v2、
+  etcd 故障/恢复、官方 RTKLIB、RTCM/BINEX 和 release 构建。
 
 本报告中的本地结果只证明对应代码路径在当前 Windows 环境可运行。生产结论
 必须补充目标 Linux 节点、真实网络、真实设备和长稳态证据。

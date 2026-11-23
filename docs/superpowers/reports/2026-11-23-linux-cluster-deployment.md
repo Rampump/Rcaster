@@ -698,6 +698,23 @@ Final result files are `/tmp/rcaster-final-soak-72h.json` on each node and
 processes exit normally after 259,200 seconds. No further production code or
 node configuration changes are part of this acceptance window.
 
+### Repository and CI
+
+The source is published to both
+`https://github.com/Rampump/Rcaster.git` and
+`https://gitcode.com/rampump/Rcaster`. The local README modification was not
+committed and is excluded from the source archive. GitHub Actions initially
+failed at environment setup because its etcd service container did not start
+and the test job lacked HAProxy. The workflow now downloads and starts the etcd
+binary directly and installs HAProxy in the test job.
+
+GitHub Actions run `45242799276` completed successfully for both `msrv` and
+`test`, covering RustSec, formatting, Clippy, workspace tests, OCSP and lease
+recovery, etcd credential rotation/leader failover/snapshot restore, HAProxy
+PROXY v2, official RTKLIB, RTCM and BINEX fixtures, all-feature tests,
+data-plane smoke tests, and the release build. GitCode's pre-receive checks
+also passed for both final code pushes.
+
 ### Watch Health and Silent-Stall Recovery
 
 `ConfigWatcher` previously set its healthy flag before the asynchronous
