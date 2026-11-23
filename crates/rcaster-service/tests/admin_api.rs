@@ -337,6 +337,46 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .await
         .expect("admin listener");
     let address = listener.local_addr().expect("admin address");
+    let hub = Arc::new(MountpointHub::new(8).expect("hub"));
+    let remote_relay_source = hub.claim_source("REMOTE").expect("remote relay source");
+    let remote_record = StrRecord::from_profile("REMOTE", &DataProfile::default());
+    remote_relay_source
+        .set_str_record(remote_record.clone())
+        .expect("remote relay STR");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/sources/REMOTE"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "state": "ACTIVE",
+            "source_generation": 7,
+            "connection_id": "remote-connection",
+            "mountpoint": "REMOTE",
+            "caster_id": "caster-remote",
+            "runtime_epoch": "remote-epoch",
+            "relay_endpoint": "127.0.0.1:12103",
+            "effective_user_id": "owner",
+            "created_at": "0",
+            "str": remote_record,
+        }))
+        .expect("encode remote source"),
+        None,
+    )
+    .await
+    .expect("publish remote source");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime
+                .source_route("REMOTE")
+                .await
+                .is_some_and(|route| route.caster_id == "caster-remote")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("remote source route");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let accounts = runtime
         .account_directory()
@@ -369,7 +409,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             caster_id: "caster-admin".to_owned(),
             token: "secret".to_owned(),
             ready: Arc::new(HealthState::default()),
-            hub: Arc::new(MountpointHub::new(8).expect("hub")),
+            hub,
             runtime: Some(runtime.clone()),
             relays: None,
             near_mountpoint: None,
@@ -402,6 +442,24 @@ async fn admin_writes_blacklist_with_revision_cas() {
     )
     .await;
     assert!(created.starts_with("HTTP/1.1 201 Created"));
+    let remote_source = response_body(
+        &request(
+            address,
+            &pki,
+            "/admin/v1/sources?caster_id=caster-remote",
+            "Bearer secret",
+        )
+        .await,
+    );
+    assert_eq!(
+        remote_source
+            .get("sources")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|sources| sources.first())
+            .and_then(|source| source.get("caster_id"))
+            .and_then(serde_json::Value::as_str),
+        Some("caster-remote")
+    );
     let revision = created
         .split("\r\n\r\n")
         .nth(1)

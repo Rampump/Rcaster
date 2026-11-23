@@ -2806,13 +2806,14 @@ async fn sources(state: &AdminState, query: &BTreeMap<&str, &str>) -> Result<Val
             let region = accounts
                 .mountpoint(&record.mountpoint)
                 .and_then(|mountpoint| mountpoint.region.clone());
-            entries
-                .entry(record.mountpoint.clone())
-                .or_insert(SourceEntry {
+            entries.insert(
+                record.mountpoint.clone(),
+                SourceEntry {
                     record,
                     caster_id,
                     region,
-                });
+                },
+            );
         }
     }
     let caster_id = query.get("caster_id").copied();

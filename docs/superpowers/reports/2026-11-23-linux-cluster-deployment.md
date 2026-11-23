@@ -510,8 +510,9 @@ Fresh verification completed at 20:57 CST:
 All four nodes reported `NTPSynchronized=yes` in `Asia/Shanghai`. The three
 nodes exposing chrony tracking data had system-time offsets between roughly
 0.014 ms and 0.096 ms, with a maximum RMS offset of about 0.196 ms during this
-observation. The Debian 12 edge node runs NTPsec and does not provide
-`chronyc`; an unprivileged `adjtimex` read as the `rcaster` user succeeds.
+observation. The Debian 12 edge node used NTPsec during that observation and
+did not provide `chronyc`; an unprivileged `adjtimex` read as the `rcaster`
+user succeeded. It was later switched to chrony after repeated PLL drift.
 At 01:39 CST its kernel offset was about 0.3465 seconds, consistent with
 `ntpq` reporting 0.370 seconds for the selected NTP peer. This is a genuine
 clock-skew finding that should activate `RCasterClockSkewHigh`, not a metric
@@ -629,18 +630,19 @@ previous unit and environment files were preserved under
 ### Final Candidate and Quorum Recovery
 
 The final candidate
-`8e29de8b864d53acc80dbf5b906e18a905358c9aaed4e6a8e3fd1e4e25458a0d`
+`cd94a4d06da1a85ab01420ad648ac13ef41c67f68ab3f42d6084b0812121a3ad`
 was rolled to all four Casters and the 101 coordinator on 2026-11-24 between
-02:21:06 and 02:21:20 CST. Upload and hash checks preceded each atomic replace;
+03:30:36 and 03:30:51 CST. Upload and hash checks preceded each atomic replace;
 every service returned live/ready and reported all five cluster dependencies
 healthy. The coordinator mTLS verification returned 0. Per-node rollback files
-use the suffix `8e29de8b`.
+use the suffix `cd94a4d0`.
 
-The edge node runs NTPsec rather than chrony. Before its service restart its
-kernel offset was approximately 0.37 seconds; after restart the new
-`rcaster_node_clock_offset_seconds` metric reported 0.038 seconds, below the
-250 ms skew guard. The metric reads the kernel `adjtimex` syscall directly as
-the unprivileged `rcaster` user.
+The edge node initially ran NTPsec. Its kernel offset repeatedly drifted from
+milliseconds to roughly 0.56 seconds even while the selected peer reported a
+sub-millisecond offset. NTPsec was removed and replaced with chrony; the clock
+was stepped and `rcaster_node_clock_offset_seconds` now reports sub-millisecond
+offset with `synchronized=1`. The metric prefers chrony and falls back to the
+kernel `adjtimex` syscall.
 
 For the Watch regression, an independent `nft` table dropped bidirectional TCP
 port 2380 on all three etcd members. Within 20 seconds all four Casters returned
@@ -672,33 +674,40 @@ Before the final soak, a management API shape regression was found in
 `GET /admin/v1/sources`: the route wrapped the already paginated response a
 second time. The route now returns `sources` as a top-level array plus
 `next_cursor`, and the admin integration test parses and asserts that shape.
-This changed the release hash from `8b10ad7f…` to `8e29de8b…`; the new binary
-was revalidated with 318 passing tests, Clippy, a 60-second cross-region relay
-smoke, and another full-quorum loss/recovery drill before the final soak.
+This changed the release from `8b10ad7f…` to the later final candidate.
+
+A subsequent cross-node audit found a distinct source-ownership display bug:
+the admin source list seeded entries from the local relay cache and used
+`or_insert`, so every remote source appeared owned by the Caster serving the
+admin request. The authoritative etcd claims were correct and distributed
+3/3/2/2 across all four Casters. Runtime routes now replace cached entries, and
+the admin integration test verifies a locally cached relay record is reported
+with its etcd owner. Final binary `cd94a4d0…` passed the complete workspace,
+all-feature Clippy and release build. A live 15-second cross-region smoke
+reported the correct 3/3/2/2 owner distribution before returning to zero
+sources and sessions.
 
 ### Final 72-Hour Acceptance Run
 
 The final local soak units `rcaster-final-soak-72h.service` started on all four
-nodes between 03:06:48 and 03:06:50 CST on 2026-11-24. The 101, 134, and 139
+nodes between 03:31:34 and 03:31:36 CST on 2026-11-24. The 101, 134, and 139
 nodes run 10 sources and 100 subscribers; the smaller 43 edge node runs 5
 sources and 50 subscribers. All four units are active with zero restarts and
 empty stderr.
 
 The cross-region unit `rcaster-final-cluster-soak-72h.service` started on 101
-at 03:06:51 CST with 10 sources and 50 subscribers distributed over all four
+at 03:31:36 CST with 10 sources and 50 subscribers distributed over all four
 TLS endpoints. Twenty seconds after start it was active with zero restarts,
 empty stderr, 10 cluster sources, and 60 total sessions (10 sources plus 50
-subscribers). Its expected completion is 2026-11-27 03:06:51 CST. Source-connect
+subscribers). Its expected completion is 2026-11-27 03:31:36 CST. Source-connect
 setup in the soak helper now retries transient 503/connection failures 20 times
 at 500 ms intervals; this changes only the test helper, not the production
 Caster binary.
 
-An earlier final-run attempt began about 40 minutes before this window. NTPsec
-on the 43 edge node drifted to roughly 0.56 seconds despite its selected peer
-reporting sub-millisecond offset. The node was switched from NTPsec to chrony,
-the clock was stepped, and RCaster reported offset 0 with synchronized=1. The
-soak was restarted from zero after this node-level change so the reported
-72-hour window begins from a fully frozen node configuration.
+Earlier final-run attempts were discarded after the edge node was switched from
+NTPsec to chrony and after the source-ownership admin fix. Every code or node
+configuration change restarted all five units from zero, so the reported
+72-hour window begins from the final binary and frozen node configuration.
 
 Final result files are `/tmp/rcaster-final-soak-72h.json` on each node and
 `/tmp/rcaster-final-cluster-soak-72h.json` on 101. They remain empty until the
