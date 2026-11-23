@@ -695,6 +695,8 @@ keeps advertised `C64` while hiding non-advertised `C63`. The intermediate binar
 `7fb534a9…` passed 319 workspace tests, all-feature Clippy and release build.
 During a live 10-source smoke, all four public TLS source tables contained zero
 `STR;SOAK*` entries while subscriptions still transferred data.
+The loopback NTRIP1 source tables on all four nodes likewise returned 177 bytes
+with zero `STR;SOAK*` entries.
 
 The filter was further tightened to fail closed: a mountpoint is public only
 when its account record exists, is enabled, and has `advertise=true`. Unknown
