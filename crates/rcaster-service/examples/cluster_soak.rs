@@ -54,19 +54,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &options.mount_prefix,
             options.mount_start.saturating_add(index),
         );
-        let mut stream = connect(endpoint, &tls).await?;
-        stream
-            .write_all(
-                format!(
-                    "POST /{mountpoint} HTTP/1.1\r\nHost: {endpoint}\r\nNtrip-Version: Ntrip/2.0\r\nAuthorization: {authorization}\r\nContent-Type: gnss/data\r\nUser-Agent: RCaster-cluster-soak\r\n\r\n"
+        let mut last_error = String::new();
+        let mut connected = None;
+        for _ in 0..20 {
+            let mut stream = match connect(endpoint, &tls).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    last_error = error.to_string();
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+            stream
+                .write_all(
+                    format!(
+                        "POST /{mountpoint} HTTP/1.1\r\nHost: {endpoint}\r\nNtrip-Version: Ntrip/2.0\r\nAuthorization: {authorization}\r\nContent-Type: gnss/data\r\nUser-Agent: RCaster-cluster-soak\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
-                .as_bytes(),
-            )
-            .await?;
-        let head = timeout(Duration::from_secs(10), read_head(&mut stream))
-            .await
-            .map_err(|_| format!("source {mountpoint} response timeout"))??;
-        expect_success(head).map_err(|error| format!("source {mountpoint}: {error}"))?;
+                .await?;
+            let head = timeout(Duration::from_secs(10), read_head(&mut stream))
+                .await
+                .map_err(|_| format!("source {mountpoint} response timeout"))??;
+            match expect_success(head.clone()) {
+                Ok(()) => {
+                    connected = Some(stream);
+                    break;
+                }
+                Err(error) => last_error = format!("{error}: {}", String::from_utf8_lossy(&head)),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let mut stream = connected
+            .ok_or_else(|| format!("source {mountpoint} to {endpoint} failed: {last_error}"))?;
         stream
             .write_all(&rtcm3_chunk(1024))
             .await

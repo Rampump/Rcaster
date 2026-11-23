@@ -676,6 +676,28 @@ This changed the release hash from `8b10ad7f…` to `8e29de8b…`; the new binar
 was revalidated with 318 passing tests, Clippy, a 60-second cross-region relay
 smoke, and another full-quorum loss/recovery drill before the final soak.
 
+### Final 72-Hour Acceptance Run
+
+The final local soak units `rcaster-final-soak-72h.service` started on all four
+nodes between 02:25:21 and 02:25:24 CST on 2026-11-24. The 101, 134, and 139
+nodes run 10 sources and 100 subscribers; the smaller 43 edge node runs 5
+sources and 50 subscribers. All four units are active with zero restarts and
+empty stderr.
+
+The cross-region unit `rcaster-final-cluster-soak-72h.service` started on 101
+at 02:29:15 CST with 10 sources and 50 subscribers distributed over all four
+TLS endpoints. Twenty seconds after start it was active with zero restarts,
+empty stderr, 10 cluster sources, and 60 total sessions (10 sources plus 50
+subscribers). Its expected completion is 2026-11-27 02:29:15 CST. Source-connect
+setup in the soak helper now retries transient 503/connection failures 20 times
+at 500 ms intervals; this changes only the test helper, not the production
+Caster binary.
+
+Final result files are `/tmp/rcaster-final-soak-72h.json` on each node and
+`/tmp/rcaster-final-cluster-soak-72h.json` on 101. They remain empty until the
+processes exit normally after 259,200 seconds. No further production code or
+node configuration changes are part of this acceptance window.
+
 ### Watch Health and Silent-Stall Recovery
 
 `ConfigWatcher` previously set its healthy flag before the asynchronous
