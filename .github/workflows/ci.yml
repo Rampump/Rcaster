@@ -33,23 +33,6 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    services:
-      etcd:
-        image: quay.io/coreos/etcd:v3.5.21
-        env:
-          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
-          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
-          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
-          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://127.0.0.1:2380
-          ETCD_INITIAL_CLUSTER: default=http://127.0.0.1:2380
-          ETCD_INITIAL_CLUSTER_STATE: new
-        ports:
-          - 2379:2379
-        options: >-
-          --health-cmd "etcdctl endpoint health"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 30
     env:
       RCASTER_ETCD_ENDPOINT: http://127.0.0.1:2379
       CARGO_INCREMENTAL: "0"
@@ -63,6 +46,31 @@ jobs:
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install etcd
+        run: |
+          curl -fsSL \
+            https://github.com/etcd-io/etcd/releases/download/v3.5.21/etcd-v3.5.21-linux-amd64.tar.gz \
+            -o /tmp/etcd.tar.gz
+          tar -xzf /tmp/etcd.tar.gz -C /tmp
+
+      - name: Start etcd
+        run: |
+          nohup /tmp/etcd-v3.5.21-linux-amd64/etcd \
+            --data-dir /tmp/etcd-data \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 \
+            --listen-peer-urls http://127.0.0.1:2380 \
+            --initial-advertise-peer-urls http://127.0.0.1:2380 \
+            --initial-cluster default=http://127.0.0.1:2380 \
+            --initial-cluster-state new \
+            >/tmp/etcd.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:2379/health && exit 0
+            sleep 1
+          done
+          cat /tmp/etcd.log
+          exit 1
 
       - name: Verify systemd service unit
         run: |
@@ -100,13 +108,6 @@ jobs:
 
       - name: Verify cross-node soak client framing
         run: cargo test -p rcaster-service --example cluster_soak --locked
-
-      - name: Download etcd binary for TLS reload test
-        run: |
-          curl -fsSL \
-            https://github.com/etcd-io/etcd/releases/download/v3.5.21/etcd-v3.5.21-linux-amd64.tar.gz \
-            -o /tmp/etcd.tar.gz
-          tar -xzf /tmp/etcd.tar.gz -C /tmp
 
       - name: Verify etcd client credential rotation
         env:
