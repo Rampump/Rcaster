@@ -765,9 +765,9 @@ CSRF and API-token management remained 403.
 
 The 04:24 window was stopped at 20:09:11–13 CST after about 15 hours 45 minutes
 and retained as a development pre-run. The new 72-hour acceptance window
-started on all four local units and the cross-region unit at
-2026-11-24 20:12:42 CST and is expected to finish at
-2026-11-27 20:12:42 CST. Startup verification showed zero restarts, empty
+started on all four local units and the cross-region unit between
+2026-11-24 20:12:42 and 20:12:45 CST and is expected to finish by
+2026-11-27 20:12:45 CST. Startup verification showed zero restarts, empty
 stderr, four ready Casters, 10 cluster sources, 60 sessions, and
 `cluster_active_sources=10` on every node.
 
