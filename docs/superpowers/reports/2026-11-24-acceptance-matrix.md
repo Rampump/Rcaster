@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`9e5a150` (committed locally, not pushed or deployed)
+`5f66852` (committed locally, not pushed or deployed)
 
 ## Status
 
