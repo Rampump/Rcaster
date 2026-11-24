@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use rcaster_core::{
-    protocol::{DataProfile, ProtocolDemux},
+    protocol::{DataProfile, GeoPosition, ProtocolDemux},
     str_record::StrRecord,
 };
 use rcaster_service::hub::{
-    HIGH_CRC_WARNING, HealthThresholds, HubError, HubLimits, MountpointHub, NO_CORRECTION_WARNING,
+    BASE_POSITION_JUMP_WARNING, HIGH_CRC_WARNING, HealthThresholds, HubError, HubLimits,
+    MountpointHub, NO_CORRECTION_WARNING, STATION_ID_CHANGED_WARNING,
 };
 
 #[tokio::test]
@@ -172,6 +173,8 @@ fn source_health_uses_configured_crc_threshold() {
             stale_after: std::time::Duration::from_secs(10),
             max_crc_ratio: 0.4,
             max_source_bitrate_bps: 2_000_000,
+            station_id_change_alert: true,
+            base_position_jump_m: 100.0,
         },
     )
     .expect("hub");
@@ -195,10 +198,64 @@ fn source_health_uses_configured_crc_threshold() {
         stale_after: std::time::Duration::from_secs(10),
         max_crc_ratio: 0.75,
         max_source_bitrate_bps: 2_000_000,
+        station_id_change_alert: true,
+        base_position_jump_m: 100.0,
     });
     assert_eq!(
         hub.source_health("C63").expect("health").warning_codes & HIGH_CRC_WARNING,
         0
+    );
+}
+
+#[test]
+fn source_health_warns_when_station_id_changes() {
+    let hub = MountpointHub::new(16).expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1001),
+            position: Some(position(30.0, 120.0)),
+            ..DataProfile::default()
+        })
+        .expect("first station profile");
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1002),
+            position: Some(position(30.0, 120.0)),
+            ..DataProfile::default()
+        })
+        .expect("second station profile");
+
+    assert_eq!(
+        hub.source_health("C63").expect("health").warning_codes & STATION_ID_CHANGED_WARNING,
+        STATION_ID_CHANGED_WARNING
+    );
+}
+
+#[test]
+fn source_health_warns_when_base_position_jumps() {
+    let hub = MountpointHub::new(16).expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1001),
+            position: Some(position(30.0, 120.0)),
+            ..DataProfile::default()
+        })
+        .expect("first position");
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1001),
+            position: Some(position(30.01, 120.01)),
+            ..DataProfile::default()
+        })
+        .expect("jumped position");
+
+    assert_eq!(
+        hub.source_health("C63").expect("health").warning_codes & BASE_POSITION_JUMP_WARNING,
+        BASE_POSITION_JUMP_WARNING
     );
 }
 
@@ -210,6 +267,8 @@ fn source_bitrate_limit_rejects_excess_data() {
             stale_after: std::time::Duration::from_secs(10),
             max_crc_ratio: 0.1,
             max_source_bitrate_bps: 8,
+            station_id_change_alert: true,
+            base_position_jump_m: 100.0,
         },
     )
     .expect("hub");
@@ -332,6 +391,14 @@ fn activate(source: &rcaster_service::hub::SourceLease) {
             &DataProfile::default(),
         ))
         .expect("activate source");
+}
+
+fn position(latitude: f64, longitude: f64) -> GeoPosition {
+    GeoPosition {
+        latitude_e7: (latitude * 1e7).round() as i32,
+        longitude_e7: (longitude * 1e7).round() as i32,
+        height_cm: 0,
+    }
 }
 
 fn synthetic_rtcm3(message_number: u16) -> Vec<u8> {

@@ -26,6 +26,10 @@ pub struct CasterConfig {
 pub struct SourceHealthConfig {
     pub observation_timeout_s: u64,
     pub crc_error_ratio_max: f64,
+    #[serde(default = "default_true")]
+    pub station_id_change_alert: bool,
+    #[serde(default = "default_base_position_jump_m")]
+    pub base_position_jump_m: f64,
 }
 
 impl Default for SourceHealthConfig {
@@ -33,6 +37,8 @@ impl Default for SourceHealthConfig {
         Self {
             observation_timeout_s: 10,
             crc_error_ratio_max: 0.1,
+            station_id_change_alert: true,
+            base_position_jump_m: 100.0,
         }
     }
 }
@@ -452,6 +458,8 @@ fn decode_config(value: &[u8]) -> Result<CasterConfig, ConfigError> {
     }
     if config.source_health.observation_timeout_s == 0
         || !(0.0..=1.0).contains(&config.source_health.crc_error_ratio_max)
+        || !config.source_health.base_position_jump_m.is_finite()
+        || config.source_health.base_position_jump_m <= 0.0
         || config.limits.max_source_bitrate_bps == 0
         || config.limits.max_sources == 0
         || config.limits.max_validating_sources == 0
@@ -465,6 +473,14 @@ fn decode_config(value: &[u8]) -> Result<CasterConfig, ConfigError> {
 
 fn default_max_validating_sources() -> usize {
     64
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_base_position_jump_m() -> f64 {
+    100.0
 }
 
 #[cfg(test)]

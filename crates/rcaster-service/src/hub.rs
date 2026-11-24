@@ -7,7 +7,7 @@ use std::{
 
 use rcaster_core::ntrip::validate_mountpoint;
 use rcaster_core::{
-    protocol::{DataFormat, DataProfile, ProtocolDemux},
+    protocol::{DataFormat, DataProfile, GeoPosition, ProtocolDemux},
     str_record::StrRecord,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,8 @@ pub struct HealthThresholds {
     pub stale_after: Duration,
     pub max_crc_ratio: f64,
     pub max_source_bitrate_bps: u64,
+    pub station_id_change_alert: bool,
+    pub base_position_jump_m: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +52,8 @@ impl Default for HealthThresholds {
             stale_after: Duration::from_secs(10),
             max_crc_ratio: 0.1,
             max_source_bitrate_bps: 2_000_000,
+            station_id_change_alert: true,
+            base_position_jump_m: 100.0,
         }
     }
 }
@@ -74,6 +78,8 @@ struct SourceState {
     station_frame: Option<Arc<[u8]>>,
     history: VecDeque<StreamHistoryPoint>,
     validating: bool,
+    station_id_changed: bool,
+    base_position_jump: bool,
 }
 
 pub struct SourceLease {
@@ -207,6 +213,8 @@ impl MountpointHub {
                 station_frame: None,
                 history,
                 validating,
+                station_id_changed: false,
+                base_position_jump: false,
             },
         );
         Ok(SourceLease {
@@ -328,6 +336,29 @@ impl MountpointHub {
 
     pub fn metrics(&self) -> HubMetrics {
         let sources = self.inner.sources();
+        let mut rtcm3_sources = 0;
+        let mut rtcm2_sources = 0;
+        let mut binex_sources = 0;
+        let mut cmr_sources = 0;
+        let mut nmea_sources = 0;
+        let mut unknown_sources = 0;
+        for source in sources
+            .values()
+            .filter(|source| source.str_record.is_some())
+        {
+            match source
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.primary_format)
+            {
+                Some(DataFormat::Rtcm3) => rtcm3_sources += 1,
+                Some(DataFormat::Rtcm2) => rtcm2_sources += 1,
+                Some(DataFormat::Binex) => binex_sources += 1,
+                Some(DataFormat::Cmr) => cmr_sources += 1,
+                Some(DataFormat::Nmea) => nmea_sources += 1,
+                None => unknown_sources += 1,
+            }
+        }
         HubMetrics {
             active_sources: sources
                 .values()
@@ -358,6 +389,12 @@ impl MountpointHub {
                 .filter_map(|source| source.profile.as_ref())
                 .map(|profile| profile.crc_errors)
                 .sum(),
+            rtcm3_sources,
+            rtcm2_sources,
+            binex_sources,
+            cmr_sources,
+            nmea_sources,
+            unknown_sources,
         }
     }
 
@@ -520,6 +557,25 @@ impl SourceLease {
             .get_mut(&self.mountpoint)
             .filter(|source| source.id == self.id)
             .ok_or(HubError::SourceClosed)?;
+        let thresholds = *self
+            .inner
+            .health
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(previous) = &source.profile {
+            if thresholds.station_id_change_alert
+                && previous.station_id.is_some()
+                && profile.station_id.is_some()
+                && previous.station_id != profile.station_id
+            {
+                source.station_id_changed = true;
+            }
+            if let (Some(previous), Some(current)) = (previous.position, profile.position)
+                && distance_m(previous, current) > thresholds.base_position_jump_m
+            {
+                source.base_position_jump = true;
+            }
+        }
         source.profile = Some(profile);
         Ok(())
     }
@@ -552,12 +608,20 @@ pub struct HubMetrics {
     pub bytes: u64,
     pub valid_frames: u64,
     pub crc_errors: u64,
+    pub rtcm3_sources: usize,
+    pub rtcm2_sources: usize,
+    pub binex_sources: usize,
+    pub cmr_sources: usize,
+    pub nmea_sources: usize,
+    pub unknown_sources: usize,
 }
 
 pub const NO_DATA_WARNING: u8 = 1;
 pub const HIGH_CRC_WARNING: u8 = 2;
 pub const NO_CORRECTION_WARNING: u8 = 4;
 pub const HIGH_BITRATE_WARNING: u8 = 8;
+pub const STATION_ID_CHANGED_WARNING: u8 = 16;
+pub const BASE_POSITION_JUMP_WARNING: u8 = 32;
 
 fn compute_source_health(source: &mut SourceState, thresholds: HealthThresholds) -> SourceHealth {
     compute_source_health_at(source, thresholds, Instant::now())
@@ -605,6 +669,12 @@ fn compute_source_health_at(
     {
         warning_codes |= NO_CORRECTION_WARNING;
     }
+    if source.station_id_changed {
+        warning_codes |= STATION_ID_CHANGED_WARNING;
+    }
+    if source.base_position_jump {
+        warning_codes |= BASE_POSITION_JUMP_WARNING;
+    }
     SourceHealth {
         packets: source.packets,
         bytes: source.bytes,
@@ -615,6 +685,18 @@ fn compute_source_health_at(
             .last_correction
             .map(|last| now.duration_since(last).as_secs()),
     }
+}
+
+fn distance_m(left: GeoPosition, right: GeoPosition) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let lat1 = f64::from(left.latitude_e7) / 1e7 * std::f64::consts::PI / 180.0;
+    let lat2 = f64::from(right.latitude_e7) / 1e7 * std::f64::consts::PI / 180.0;
+    let dlat = lat2 - lat1;
+    let dlon = (f64::from(right.longitude_e7) - f64::from(left.longitude_e7)) / 1e7
+        * std::f64::consts::PI
+        / 180.0;
+    let value = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * value.sqrt().asin()
 }
 
 impl Drop for SourceLease {

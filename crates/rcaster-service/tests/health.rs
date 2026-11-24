@@ -66,6 +66,12 @@ async fn live_is_independent_and_ready_reflects_state() {
         bytes: 1024,
         valid_frames: 9,
         crc_errors: 2,
+        rtcm3_sources: 2,
+        rtcm2_sources: 1,
+        binex_sources: 0,
+        cmr_sources: 0,
+        nmea_sources: 0,
+        unknown_sources: 0,
     });
     state.set_sessions(4);
     state.set_config_generation(7);
@@ -79,6 +85,11 @@ async fn live_is_independent_and_ready_reflects_state() {
         AdmissionViolation::FormatNotAllowed(DataFormat::Nmea),
         AdmissionViolation::ExpectedFormatMismatch(DataFormat::Nmea),
         AdmissionViolation::MissingCorrectionData,
+        AdmissionViolation::NoObservationOrSsr,
+        AdmissionViolation::MixedCorrectionFormats,
+        AdmissionViolation::CrcThresholdExceeded,
+        AdmissionViolation::BasePositionMissing,
+        AdmissionViolation::MsmRequiredMissing,
         AdmissionViolation::MsmVersionNotAllowed(7),
         AdmissionViolation::UnknownDataRatioExceeded,
     ]);
@@ -99,6 +110,8 @@ async fn live_is_independent_and_ready_reflects_state() {
     assert!(metrics.contains("rcaster_source_bytes_total 1024"));
     assert!(metrics.contains("rcaster_source_valid_frames_total 9"));
     assert!(metrics.contains("rcaster_source_crc_errors_total 2"));
+    assert!(metrics.contains("rcaster_sources_by_format{format=\"rtcm3\"} 2"));
+    assert!(metrics.contains("rcaster_sources_by_format{format=\"rtcm2\"} 1"));
     assert!(metrics.contains("rcaster_config_generation 7"));
     assert!(metrics.contains("rcaster_auth_failure_fallback_total 3"));
     assert!(metrics.contains("rcaster_process_resident_memory_bytes 123456"));
@@ -112,6 +125,11 @@ async fn live_is_independent_and_ready_reflects_state() {
     assert!(metrics.contains("result=\"rejected\"} 2"));
     assert!(metrics.contains("reason=\"no_valid_frames\"} 1"));
     assert!(metrics.contains("reason=\"format_not_allowed\"} 1"));
+    assert!(metrics.contains("reason=\"no_observation_or_ssr\"} 1"));
+    assert!(metrics.contains("reason=\"mixed_correction_formats\"} 1"));
+    assert!(metrics.contains("reason=\"crc_threshold_exceeded\"} 1"));
+    assert!(metrics.contains("reason=\"base_position_missing\"} 1"));
+    assert!(metrics.contains("reason=\"msm_required_missing\"} 1"));
     assert!(metrics.contains("reason=\"expected_format_mismatch\"} 1"));
     assert!(metrics.contains("reason=\"missing_correction_data\"} 1"));
     assert!(metrics.contains("reason=\"msm_version_not_allowed\"} 1"));

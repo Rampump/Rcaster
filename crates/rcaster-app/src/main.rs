@@ -218,6 +218,8 @@ async fn serve(args: &[String]) -> AppResult<()> {
             stale_after: Duration::from_millis(config.source_stale_after_ms),
             max_crc_ratio: config.source_max_crc_ratio,
             max_source_bitrate_bps: config.source_max_bitrate_bps,
+            station_id_change_alert: config.source_health.station_id_change_alert,
+            base_position_jump_m: config.source_health.base_position_jump_m,
         },
     )?);
     hub.set_limits(HubLimits {
@@ -311,6 +313,8 @@ async fn serve(args: &[String]) -> AppResult<()> {
                     ),
                     max_crc_ratio: snapshot.config.source_health.crc_error_ratio_max,
                     max_source_bitrate_bps: snapshot.config.limits.max_source_bitrate_bps,
+                    station_id_change_alert: snapshot.config.source_health.station_id_change_alert,
+                    base_position_jump_m: snapshot.config.source_health.base_position_jump_m,
                 });
                 sampling_hub.set_limits(HubLimits {
                     max_sources: snapshot.config.limits.max_sources,

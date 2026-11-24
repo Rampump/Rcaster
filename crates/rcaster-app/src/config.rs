@@ -80,6 +80,8 @@ pub struct StandaloneConfig {
     pub source_max_crc_ratio: f64,
     #[serde(default = "default_source_max_bitrate_bps")]
     pub source_max_bitrate_bps: u64,
+    #[serde(default)]
+    pub source_health: SourceHealthPolicyFile,
     #[serde(default = "default_max_sources")]
     pub max_sources: usize,
     #[serde(default = "default_max_validating_sources")]
@@ -131,6 +133,23 @@ pub struct PublicMapTilesConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ProxyProtocolConfigFile {
     pub trusted_l4_cidrs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct SourceHealthPolicyFile {
+    #[serde(default = "default_true")]
+    pub station_id_change_alert: bool,
+    #[serde(default = "default_base_position_jump_m")]
+    pub base_position_jump_m: f64,
+}
+
+impl Default for SourceHealthPolicyFile {
+    fn default() -> Self {
+        Self {
+            station_id_change_alert: true,
+            base_position_jump_m: 100.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -462,6 +481,8 @@ impl StandaloneConfig {
             || self.source_stale_after_ms == 0
             || !(0.0..=1.0).contains(&self.source_max_crc_ratio)
             || self.source_max_bitrate_bps == 0
+            || !self.source_health.base_position_jump_m.is_finite()
+            || self.source_health.base_position_jump_m <= 0.0
             || self.max_sources == 0
             || self.max_validating_sources == 0
             || self.validation_buffer_max_bytes == 0
@@ -777,6 +798,10 @@ fn default_source_max_crc_ratio() -> f64 {
 
 fn default_source_max_bitrate_bps() -> u64 {
     2_000_000
+}
+
+fn default_base_position_jump_m() -> f64 {
+    100.0
 }
 
 fn default_max_sources() -> usize {

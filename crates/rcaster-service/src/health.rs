@@ -32,6 +32,11 @@ pub struct HealthState {
     source_rejected_format: AtomicU64,
     source_rejected_expected_format: AtomicU64,
     source_rejected_missing_correction: AtomicU64,
+    source_rejected_no_observation: AtomicU64,
+    source_rejected_mixed_formats: AtomicU64,
+    source_rejected_crc_ratio: AtomicU64,
+    source_rejected_base_position: AtomicU64,
+    source_rejected_msm_missing: AtomicU64,
     source_rejected_msm_version: AtomicU64,
     source_rejected_unknown_ratio: AtomicU64,
     auth_failure_fallback: AtomicU64,
@@ -39,6 +44,12 @@ pub struct HealthState {
     source_bytes: AtomicU64,
     source_valid_frames: AtomicU64,
     source_crc_errors: AtomicU64,
+    sources_rtcm3: AtomicUsize,
+    sources_rtcm2: AtomicUsize,
+    sources_binex: AtomicUsize,
+    sources_cmr: AtomicUsize,
+    sources_nmea: AtomicUsize,
+    sources_unknown: AtomicUsize,
     process_rss_bytes: AtomicU64,
     process_open_fds: AtomicU64,
     process_usage_available: AtomicBool,
@@ -87,6 +98,18 @@ impl HealthState {
             .store(metrics.valid_frames, Ordering::Release);
         self.source_crc_errors
             .store(metrics.crc_errors, Ordering::Release);
+        self.sources_rtcm3
+            .store(metrics.rtcm3_sources, Ordering::Release);
+        self.sources_rtcm2
+            .store(metrics.rtcm2_sources, Ordering::Release);
+        self.sources_binex
+            .store(metrics.binex_sources, Ordering::Release);
+        self.sources_cmr
+            .store(metrics.cmr_sources, Ordering::Release);
+        self.sources_nmea
+            .store(metrics.nmea_sources, Ordering::Release);
+        self.sources_unknown
+            .store(metrics.unknown_sources, Ordering::Release);
     }
 
     pub fn set_sessions(&self, sessions: usize) {
@@ -146,6 +169,26 @@ impl HealthState {
         }
         if violations.contains(&AdmissionViolation::MissingCorrectionData) {
             self.source_rejected_missing_correction
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if violations.contains(&AdmissionViolation::NoObservationOrSsr) {
+            self.source_rejected_no_observation
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if violations.contains(&AdmissionViolation::MixedCorrectionFormats) {
+            self.source_rejected_mixed_formats
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if violations.contains(&AdmissionViolation::CrcThresholdExceeded) {
+            self.source_rejected_crc_ratio
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if violations.contains(&AdmissionViolation::BasePositionMissing) {
+            self.source_rejected_base_position
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if violations.contains(&AdmissionViolation::MsmRequiredMissing) {
+            self.source_rejected_msm_missing
                 .fetch_add(1, Ordering::Relaxed);
         }
         if violations
@@ -218,6 +261,23 @@ impl HealthState {
         metrics.push_str(&format!(
             "rcaster_source_rejections_total{{reason=\"expected_format_mismatch\"}} {}\n",
             self.source_rejected_expected_format.load(Ordering::Relaxed)
+        ));
+        metrics.push_str(&format!(
+            "rcaster_source_rejections_total{{reason=\"no_observation_or_ssr\"}} {}\nrcaster_source_rejections_total{{reason=\"mixed_correction_formats\"}} {}\nrcaster_source_rejections_total{{reason=\"crc_threshold_exceeded\"}} {}\nrcaster_source_rejections_total{{reason=\"base_position_missing\"}} {}\nrcaster_source_rejections_total{{reason=\"msm_required_missing\"}} {}\n",
+            self.source_rejected_no_observation.load(Ordering::Relaxed),
+            self.source_rejected_mixed_formats.load(Ordering::Relaxed),
+            self.source_rejected_crc_ratio.load(Ordering::Relaxed),
+            self.source_rejected_base_position.load(Ordering::Relaxed),
+            self.source_rejected_msm_missing.load(Ordering::Relaxed),
+        ));
+        metrics.push_str(&format!(
+            "# HELP rcaster_sources_by_format Active local sources by primary format.\n# TYPE rcaster_sources_by_format gauge\nrcaster_sources_by_format{{format=\"rtcm3\"}} {}\nrcaster_sources_by_format{{format=\"rtcm2\"}} {}\nrcaster_sources_by_format{{format=\"binex\"}} {}\nrcaster_sources_by_format{{format=\"cmr\"}} {}\nrcaster_sources_by_format{{format=\"nmea\"}} {}\nrcaster_sources_by_format{{format=\"unknown\"}} {}\n",
+            self.sources_rtcm3.load(Ordering::Acquire),
+            self.sources_rtcm2.load(Ordering::Acquire),
+            self.sources_binex.load(Ordering::Acquire),
+            self.sources_cmr.load(Ordering::Acquire),
+            self.sources_nmea.load(Ordering::Acquire),
+            self.sources_unknown.load(Ordering::Acquire),
         ));
         metrics.push_str(&format!(
             "# HELP rcaster_auth_failure_fallback_total Shared authentication limiter failures that fell back to node-local protection.\n# TYPE rcaster_auth_failure_fallback_total counter\nrcaster_auth_failure_fallback_total {}\n",
