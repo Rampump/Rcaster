@@ -559,6 +559,8 @@ git commit -m "fix: add source health warnings and metrics"
 
 ### Task 5: NEAR Spatial Index and Limits
 
+**Status:** Spatial index and revision-based cache implemented locally; remaining GGA/query limit configuration is still open.
+
 **Files:**
 - Modify: `crates/rcaster-service/src/near.rs`
 - Modify: `crates/rcaster-service/src/ntrip_server.rs`

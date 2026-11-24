@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
     fmt,
-    sync::{Arc, Mutex, MutexGuard, RwLock},
+    sync::{
+        Arc, Mutex, MutexGuard, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -63,6 +66,7 @@ struct HubInner {
     health: RwLock<HealthThresholds>,
     limits: RwLock<HubLimits>,
     history_seed: Mutex<HashMap<String, Vec<StreamHistoryPoint>>>,
+    source_revision: AtomicUsize,
 }
 
 struct SourceState {
@@ -119,6 +123,7 @@ impl MountpointHub {
                 health: RwLock::new(health),
                 limits: RwLock::new(HubLimits::default()),
                 history_seed: Mutex::new(HashMap::new()),
+                source_revision: AtomicUsize::new(0),
             }),
             buffer_events,
         })
@@ -217,6 +222,7 @@ impl MountpointHub {
                 base_position_jump: false,
             },
         );
+        self.inner.source_revision.fetch_add(1, Ordering::AcqRel);
         Ok(SourceLease {
             inner: Arc::clone(&self.inner),
             mountpoint,
@@ -258,6 +264,10 @@ impl MountpointHub {
             .collect::<Vec<_>>();
         sources.sort();
         sources
+    }
+
+    pub fn source_revision(&self) -> usize {
+        self.inner.source_revision.load(Ordering::Acquire)
     }
 
     pub fn sourcetable_records(&self) -> Vec<StrRecord> {
@@ -517,6 +527,7 @@ impl SourceLease {
             .ok_or(HubError::SourceClosed)?;
         source.str_record = Some(record);
         source.validating = false;
+        self.inner.source_revision.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -543,6 +554,7 @@ impl SourceLease {
         {
             let history = source.history.iter().copied().collect();
             sources.remove(&self.mountpoint);
+            self.inner.source_revision.fetch_add(1, Ordering::AcqRel);
             self.inner
                 .history_seed
                 .lock()

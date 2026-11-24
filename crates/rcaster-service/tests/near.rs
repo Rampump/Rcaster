@@ -4,7 +4,7 @@ use rcaster_core::{
     protocol::{DataFormat, GeoPosition},
     str_record::StrRecord,
 };
-use rcaster_service::near::{NearConfig, NearGga, NearSelector, NearSource};
+use rcaster_service::near::{NearConfig, NearGga, NearIndex, NearSelector, NearSource};
 
 fn position(latitude: f64, longitude: f64) -> GeoPosition {
     GeoPosition {
@@ -71,6 +71,23 @@ fn builds_candidate_from_rtcm3_str_position() {
     assert_eq!(candidate.format, DataFormat::Rtcm3);
     assert_eq!(candidate.position.latitude_e7, 312_000_000);
     assert_eq!(candidate.position.longitude_e7, 1_214_000_000);
+}
+
+#[test]
+fn spatial_index_matches_full_scan() {
+    let candidates = vec![
+        source("A", 30.0, 120.0),
+        source("B", 31.0, 121.0),
+        source("C", 30.8, 120.8),
+    ];
+    let index = NearIndex::new(&candidates);
+
+    assert_eq!(
+        index
+            .nearest(position(30.85, 120.85), 100_000.0)
+            .map(|source| source.mountpoint.as_str()),
+        Some("C")
+    );
 }
 
 #[test]

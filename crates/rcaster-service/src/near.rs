@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 use rcaster_core::{
     protocol::{DataFormat, GeoPosition},
@@ -74,6 +77,85 @@ impl NearSource {
     }
 }
 
+pub struct NearIndex {
+    sources: Vec<NearSource>,
+    cells: BTreeMap<(i32, i32), Vec<usize>>,
+}
+
+impl NearIndex {
+    const CELL_DEGREES: f64 = 1.0;
+
+    pub fn new(sources: &[NearSource]) -> Self {
+        let mut cells = BTreeMap::<(i32, i32), Vec<usize>>::new();
+        for (index, source) in sources.iter().enumerate() {
+            cells
+                .entry(Self::cell(source.position))
+                .or_default()
+                .push(index);
+        }
+        Self {
+            sources: sources.to_vec(),
+            cells,
+        }
+    }
+
+    pub fn get(&self, mountpoint: &str) -> Option<&NearSource> {
+        self.sources
+            .iter()
+            .find(|source| source.mountpoint == mountpoint)
+    }
+
+    pub fn nearest(&self, position: GeoPosition, max_distance_m: f64) -> Option<&NearSource> {
+        self.nearest_excluding(position, max_distance_m, None)
+    }
+
+    pub fn nearest_excluding(
+        &self,
+        position: GeoPosition,
+        max_distance_m: f64,
+        excluded: Option<&str>,
+    ) -> Option<&NearSource> {
+        let latitude_span = (max_distance_m / 111_320.0).ceil() as i32 + 1;
+        let longitude_scale = (position.latitude_e7 as f64 / 1e7)
+            .to_radians()
+            .cos()
+            .abs()
+            .max(0.01);
+        let longitude_span = (max_distance_m / (111_320.0 * longitude_scale)).ceil() as i32 + 1;
+        let (center_lat, center_lon) = Self::cell(position);
+        let mut nearest = None::<(&NearSource, f64)>;
+        for latitude in (center_lat - latitude_span)..=(center_lat + latitude_span) {
+            for longitude in (center_lon - longitude_span)..=(center_lon + longitude_span) {
+                let Some(indices) = self.cells.get(&(latitude, longitude)) else {
+                    continue;
+                };
+                for index in indices {
+                    let source = &self.sources[*index];
+                    if source.format != DataFormat::Rtcm3
+                        || !source.usable_correction
+                        || excluded == Some(source.mountpoint.as_str())
+                    {
+                        continue;
+                    }
+                    let distance = distance_m(position, source.position);
+                    if distance <= max_distance_m
+                        && nearest.is_none_or(|(_, current)| distance < current)
+                    {
+                        nearest = Some((source, distance));
+                    }
+                }
+            }
+        }
+        nearest.map(|(source, _)| source)
+    }
+
+    fn cell(position: GeoPosition) -> (i32, i32) {
+        let latitude = (position.latitude_e7 as f64 / 1e7 / Self::CELL_DEGREES).floor() as i32;
+        let longitude = (position.longitude_e7 as f64 / 1e7 / Self::CELL_DEGREES).floor() as i32;
+        (latitude, longitude)
+    }
+}
+
 pub struct NearSelector {
     config: NearConfig,
     current: Option<String>,
@@ -120,45 +202,55 @@ impl NearSelector {
         candidates: &[NearSource],
         now: Instant,
     ) -> Option<String> {
+        self.update_indexed(gga, &NearIndex::new(candidates), now)
+    }
+
+    pub fn update_indexed(
+        &mut self,
+        gga: &NearGga,
+        candidates: &NearIndex,
+        now: Instant,
+    ) -> Option<String> {
         let valid_gga =
             matches!(gga.fix_quality, 1 | 2 | 4 | 5) && gga.hdop <= self.config.max_hdop;
-        let usable = candidates
-            .iter()
-            .filter(|source| {
-                source.format == DataFormat::Rtcm3
-                    && source.usable_correction
-                    && source.mountpoint != self.current.as_deref().unwrap_or_default()
-            })
-            .filter_map(|source| {
-                let distance = distance_m(gga.position, source.position);
-                (distance <= self.config.max_distance_m).then_some((source, distance))
-            })
-            .collect::<Vec<_>>();
         let Some(current_name) = self.current.clone() else {
             if !valid_gga {
                 return None;
             }
-            return choose(&usable).map(|(source, _)| {
-                self.current = Some(source.mountpoint.clone());
-                source.mountpoint.clone()
-            });
+            return candidates
+                .nearest(gga.position, self.config.max_distance_m)
+                .map(|source| {
+                    self.current = Some(source.mountpoint.clone());
+                    source.mountpoint.clone()
+                });
         };
-        let Some(current) = candidates.iter().find(|source| {
+        let Some(current) = candidates.get(&current_name).filter(|source| {
             source.mountpoint == current_name
                 && source.format == DataFormat::Rtcm3
                 && source.usable_correction
         }) else {
             self.observation = None;
-            return choose(&usable).map(|(source, _)| {
-                self.current = Some(source.mountpoint.clone());
-                source.mountpoint.clone()
-            });
+            return candidates
+                .nearest_excluding(
+                    gga.position,
+                    self.config.max_distance_m,
+                    Some(&current_name),
+                )
+                .map(|source| {
+                    self.current = Some(source.mountpoint.clone());
+                    source.mountpoint.clone()
+                });
         };
         if !valid_gga {
             return None;
         }
         let current_distance = distance_m(gga.position, current.position);
-        let (nearest, nearest_distance) = choose(&usable)?;
+        let nearest = candidates.nearest_excluding(
+            gga.position,
+            self.config.max_distance_m,
+            Some(&current_name),
+        )?;
+        let nearest_distance = distance_m(gga.position, nearest.position);
         let uncertainty = f64::from(gga.hdop) * self.config.hdop_m_per_unit;
         let guard = self
             .config
@@ -193,13 +285,6 @@ impl NearSelector {
             }
         }
     }
-}
-
-fn choose<'a>(candidates: &[(&'a NearSource, f64)]) -> Option<(&'a NearSource, f64)> {
-    candidates
-        .iter()
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .copied()
 }
 
 fn distance_m(left: GeoPosition, right: GeoPosition) -> f64 {

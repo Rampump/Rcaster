@@ -32,7 +32,7 @@ use crate::{
     connections::{ConnectionCancel, ConnectionController},
     health::HealthState,
     hub::{HubError, MountpointHub, SourceLease},
-    near::{NearConfig, NearGga, NearSelector, NearSource},
+    near::{NearConfig, NearGga, NearIndex, NearSelector, NearSource},
     ntrip_io::{ReadHeadError, read_request_head},
     proxy_protocol::{ProxyProtocolConfig, resolve_client_ip},
     relay::RelayManager,
@@ -1455,6 +1455,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut selector = NearSelector::new(near.selector);
+    let mut indexed_revision = hub.source_revision();
+    let mut near_index = NearIndex::new(&near_candidates(&hub, &config).await);
     let mut receiver = None;
     let mut demux = None;
     let mut pending = Vec::new();
@@ -1470,6 +1472,7 @@ where
             &mut demux,
             &hub,
             &config,
+            &near_index,
             gga,
             &mut no_source_deadline,
             near.no_source_timeout,
@@ -1480,6 +1483,10 @@ where
 
     let mut read_buffer = [0_u8; 4096];
     loop {
+        if hub.source_revision() != indexed_revision {
+            near_index = NearIndex::new(&near_candidates(&hub, &config).await);
+            indexed_revision = hub.source_revision();
+        }
         while let Some(frame) = pending_output.pop_front() {
             stream.write_all(&frame).await?;
         }
@@ -1501,6 +1508,7 @@ where
                             &mut demux,
                             &hub,
                             &config,
+                            &near_index,
                             gga,
                             &mut no_source_deadline,
                             near.no_source_timeout,
@@ -1542,6 +1550,7 @@ where
                     &mut demux,
                     &hub,
                     &config,
+                    &near_index,
                     gga,
                     &mut no_source_deadline,
                     near.no_source_timeout,
@@ -1563,13 +1572,14 @@ async fn switch_near_source(
     demux: &mut Option<ProtocolDemux>,
     hub: &Arc<MountpointHub>,
     config: &NtripServerConfig,
+    candidates: &NearIndex,
     gga: NearGga,
     no_source_deadline: &mut Instant,
     no_source_timeout: Duration,
     pending_output: &mut std::collections::VecDeque<Arc<[u8]>>,
 ) {
-    let candidates = near_candidates(hub, config).await;
-    let Some(mountpoint) = selector.update(&gga, &candidates, std::time::Instant::now()) else {
+    let Some(mountpoint) = selector.update_indexed(&gga, candidates, std::time::Instant::now())
+    else {
         return;
     };
     if let Ok(next) = subscribe_source(hub, config, &mountpoint).await {
