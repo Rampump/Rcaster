@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""Browser-level standalone admin/public acceptance test.
+
+The test runs Caster, an NTRIP source, Chromium and the browser assertions
+inside one WSL Linux network namespace. It never contacts the soak cluster.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+from websockets.sync.client import connect
+
+
+ROOT = Path(__file__).resolve().parents[2]
+BINARY = ROOT / "target/release/rcaster"
+CAPTURE = ROOT / "target/com3-rtcm3-capture.bin"
+OUTPUT = ROOT / "tools/web-e2e/runs" / datetime.now().strftime("%Y%m%d-%H%M%S")
+sys.path.insert(0, str(ROOT / "tools/near-e2e"))
+import rtcm  # noqa: E402
+
+
+def free_ports(count: int) -> list[int]:
+    sockets: list[socket.socket] = []
+    try:
+        for _ in range(count):
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            sockets.append(listener)
+        return [listener.getsockname()[1] for listener in sockets]
+    finally:
+        for listener in sockets:
+            listener.close()
+
+
+def request(url: str, method: str = "GET") -> urllib.response.addinfourl:
+    context = ssl._create_unverified_context()
+    return urllib.request.urlopen(
+        urllib.request.Request(url, method=method),
+        timeout=3,
+        context=context,
+    )
+
+
+def request_mtls(
+    url: str,
+    ca_certificate: Path,
+    certificate: Path,
+    private_key: Path,
+    authorization: str | None = None,
+) -> urllib.response.addinfourl:
+    context = ssl.create_default_context(cafile=str(ca_certificate))
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.load_cert_chain(str(certificate), str(private_key))
+    headers = {}
+    if authorization:
+        headers["Authorization"] = authorization
+    return urllib.request.urlopen(
+        urllib.request.Request(url, headers=headers),
+        timeout=5,
+        context=context,
+    )
+
+
+def wait_http(url: str, timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with request(url) as response:
+                if response.status < 500:
+                    return
+        except Exception:
+            pass
+        time.sleep(0.1)
+    raise RuntimeError(f"timed out waiting for {url}")
+
+
+class Cdp:
+    def __init__(self, websocket_url: str):
+        self.websocket = connect(websocket_url, max_size=None)
+        self.next_id = 1
+        self.events: list[dict] = []
+        self.send("Page.enable")
+        self.send("Runtime.enable")
+        self.send("Network.enable")
+        self.send("Log.enable")
+
+    def send(self, method: str, params: dict | None = None) -> dict:
+        request_id = self.next_id
+        self.next_id += 1
+        self.websocket.send(
+            json.dumps(
+                {
+                    "id": request_id,
+                    "method": method,
+                    "params": params or {},
+                }
+            )
+        )
+        while True:
+            message = json.loads(self.websocket.recv())
+            if message.get("id") == request_id:
+                if "error" in message:
+                    raise RuntimeError(json.dumps(message["error"]))
+                return message.get("result", {})
+            self.events.append(message)
+
+    def evaluate(self, expression: str):
+        result = self.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "awaitPromise": True,
+                "returnByValue": True,
+                "userGesture": True,
+            },
+        )
+        if "exceptionDetails" in result:
+            details = result["exceptionDetails"]
+            raise RuntimeError(
+                details.get("exception", {}).get("description", details.get("text"))
+            )
+        return result.get("result", {}).get("value")
+
+    def wait_for(self, expression: str, timeout: float = 20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.evaluate(f"Boolean({expression})"):
+                return
+            time.sleep(0.1)
+        raise RuntimeError(f"timed out waiting for {expression}")
+
+    def navigate(self, url: str) -> None:
+        self.send("Page.navigate", {"url": url})
+        self.wait_for("document.readyState === 'complete'")
+
+    def close(self) -> None:
+        self.websocket.close()
+
+
+def new_page(debug_port: int, url: str) -> Cdp:
+    with request(
+        f"http://127.0.0.1:{debug_port}/json/new?about%3Ablank", method="PUT"
+    ) as response:
+        target = json.loads(response.read())
+    page = Cdp(target["webSocketDebuggerUrl"])
+    page.navigate(url)
+    return page
+
+
+def browser_problems(page: Cdp) -> tuple[list[str], list[str]]:
+    console_errors: list[str] = []
+    network_errors: list[str] = []
+    for event in page.events:
+        method = event.get("method")
+        params = event.get("params", {})
+        if method == "Runtime.exceptionThrown":
+            console_errors.append(params.get("exceptionDetails", {}).get("text", "exception"))
+        elif method == "Runtime.consoleAPICalled" and params.get("type") == "error":
+            message = " ".join(
+                str(argument.get("value", argument.get("description", "")))
+                for argument in params.get("args", [])
+            )
+            if not message.startswith("Failed to load resource:"):
+                console_errors.append(message)
+        elif method == "Log.entryAdded" and params.get("entry", {}).get("level") == "error":
+            entry = params["entry"]
+            if not expected_resource_error(entry.get("url", ""), 0):
+                console_errors.append(entry.get("text", "log error"))
+        elif method == "Network.loadingFailed" and not params.get("canceled"):
+            network_errors.append(params.get("errorText", "network failure"))
+        elif method == "Network.responseReceived":
+            response = params.get("response", {})
+            if response.get("status", 0) >= 400:
+                url = response.get("url", "")
+                if not expected_resource_error(url, response["status"]):
+                    network_errors.append(f"{response['status']} {url}")
+    return console_errors, network_errors
+
+
+def expected_resource_error(url: str, status: int) -> bool:
+    return (
+        url.endswith("/favicon.ico")
+        or url.endswith("/admin/v1/auth/session") and status in (0, 401)
+        or url.endswith("/admin/v1/config/revisions?limit=20")
+        and status in (0, 503)
+        or url.endswith("/admin/v1/operations/missing")
+    )
+
+
+class LocalSource:
+    def __init__(self, port: int, payload: bytes):
+        self.payload = payload
+        self.stop = threading.Event()
+        self.error: str | None = None
+        self.socket = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.socket.sendall(
+            b"SOURCE upload /C63\r\n"
+            b"Source-Agent: RCaster-browser-e2e/1.0\r\n\r\n"
+        )
+        header = bytearray()
+        while b"\r\n\r\n" not in header:
+            chunk = self.socket.recv(1024)
+            if not chunk:
+                break
+            header.extend(chunk)
+        if not bytes(header).startswith(b"ICY 200 OK"):
+            raise RuntimeError(f"source rejected: {bytes(header)!r}")
+        self.thread = threading.Thread(target=self.run, name="browser-e2e-source")
+        self.thread.start()
+
+    def run(self) -> None:
+        try:
+            while not self.stop.is_set():
+                self.socket.sendall(self.payload)
+                self.stop.wait(0.5)
+        except OSError:
+            self.error = "source socket closed"
+
+    def close(self) -> None:
+        self.stop.set()
+        self.socket.close()
+        self.thread.join(timeout=3)
+
+
+def hash_password(password: str) -> str:
+    result = subprocess.run(
+        [str(BINARY), "hash-password"],
+        input=f"{password}\n",
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def write_accounts(path: Path) -> None:
+    now = "2026-11-25T00:00:00Z"
+    accounts = {
+        "users": [
+            {
+                "schema_version": 1,
+                "mod_revision": 1,
+                "user_id": "owner-id",
+                "username": "owner",
+                "password_hash": hash_password("secret"),
+                "auth_version": 1,
+                "enabled": True,
+                "ntrip_enabled": True,
+                "web_enabled": True,
+                "role": "user",
+                "created_at": now,
+                "updated_at": now,
+            },
+            {
+                "schema_version": 1,
+                "mod_revision": 1,
+                "user_id": "browser-admin",
+                "username": "browser-admin",
+                "password_hash": hash_password("admin-secret"),
+                "auth_version": 1,
+                "enabled": True,
+                "ntrip_enabled": False,
+                "web_enabled": True,
+                "role": "admin",
+                "created_at": now,
+                "updated_at": now,
+            },
+        ],
+        "mountpoints": [
+            {
+                "schema_version": 1,
+                "mod_revision": 1,
+                "mountpoint": "C63",
+                "owner_user_id": "owner-id",
+                "enabled": True,
+                "ntrip1_upload_password_hash": hash_password("upload"),
+                "advertise": True,
+                "region": "browser-test",
+                "latitude": 31.2,
+                "longitude": 121.4,
+                "coverage_radius_m": 25000.0,
+                "created_at": now,
+                "updated_at": now,
+            }
+        ],
+    }
+    path.write_text(json.dumps(accounts), encoding="utf-8")
+
+
+def run_test(temp: Path, clustered: bool) -> dict:
+    temp.mkdir(parents=True, exist_ok=True)
+    ports = free_ports(8 if clustered else 5)
+    clear_port, public_port, admin_port, health_port, debug_port = ports[:5]
+    etcd_client_port, etcd_peer_port, tls_port = (
+        ports[5:] if clustered else (None, None, None)
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(temp / "server.key"),
+            "-out",
+            str(temp / "server.crt"),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    os.chmod(temp / "server.key", 0o600)
+    if clustered:
+        (temp / "client.ext").write_text(
+            "basicConstraints=CA:FALSE\nextendedKeyUsage=clientAuth\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(temp / "client.key"),
+                "-out",
+                str(temp / "client.csr"),
+                "-subj",
+                "/CN=rcaster-browser-client",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "openssl",
+                "x509",
+                "-req",
+                "-in",
+                str(temp / "client.csr"),
+                "-CA",
+                str(temp / "server.crt"),
+                "-CAkey",
+                str(temp / "server.key"),
+                "-CAcreateserial",
+                "-out",
+                str(temp / "client.crt"),
+                "-days",
+                "1",
+                "-extfile",
+                str(temp / "client.ext"),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    write_accounts(temp / "accounts.json")
+    subprocess.run(
+        [
+            str(BINARY),
+            "import-accounts",
+            "--database",
+            str(temp / "accounts.redb"),
+            "--input",
+            str(temp / "accounts.json"),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    config = {
+        "bind": f"127.0.0.1:{clear_port}",
+        "public_bind": f"127.0.0.1:{public_port}",
+        "admin_bind": f"127.0.0.1:{admin_port}",
+        "health_bind": f"127.0.0.1:{health_port}",
+        "account_db": "accounts.redb",
+        "tls_certificate": "server.crt",
+        "tls_private_key": "server.key",
+        "client_auth_require_tls": False,
+        "source_auth_require_tls": False,
+        "head_timeout_ms": 5000,
+    }
+    if clustered:
+        config["tls_bind"] = f"127.0.0.1:{tls_port}"
+        config["cluster"] = {
+            "etcd_endpoints": [f"http://127.0.0.1:{etcd_client_port}"],
+            "cluster_id": "browser-e2e",
+            "caster_id": "browser-caster",
+            "runtime_epoch": f"epoch-{time.time_ns()}",
+            "relay_endpoint": "127.0.0.1:1",
+            "coordinator_tls": {
+                "ca_certificate": "server.crt",
+                "certificate": "server.crt",
+                "private_key": "server.key",
+                "server_name": "localhost",
+                "service_token": "browser-e2e",
+            },
+        }
+    (temp / "caster.json").write_text(json.dumps(config), encoding="utf-8")
+
+    result: dict = {
+        "mode": "clustered" if clustered else "standalone",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "checks": {},
+        "console_errors": [],
+        "network_errors": [],
+    }
+    etcd = None
+    if clustered:
+        (temp / "etcd-data").mkdir()
+        etcd = subprocess.Popen(
+            [
+                "/usr/bin/etcd",
+                "--name",
+                "browser",
+                "--data-dir",
+                str(temp / "etcd-data"),
+                "--listen-client-urls",
+                f"http://127.0.0.1:{etcd_client_port}",
+                "--advertise-client-urls",
+                f"http://127.0.0.1:{etcd_client_port}",
+                "--listen-peer-urls",
+                f"http://127.0.0.1:{etcd_peer_port}",
+                "--initial-advertise-peer-urls",
+                f"http://127.0.0.1:{etcd_peer_port}",
+                "--initial-cluster",
+                f"browser=http://127.0.0.1:{etcd_peer_port}",
+                "--initial-cluster-token",
+                f"browser-{time.time_ns()}",
+                "--initial-cluster-state",
+                "new",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        wait_http(f"http://127.0.0.1:{etcd_client_port}/health")
+        subprocess.run(
+            [
+                "/usr/bin/etcdctl",
+                "--endpoints",
+                f"http://127.0.0.1:{etcd_client_port}",
+                "put",
+                "/rcaster/browser-e2e/config/caster",
+                '{"schema_version":1,"generation":1}',
+            ],
+            check=True,
+            capture_output=True,
+        )
+    caster_log = (temp / "caster.log").open("w+", encoding="utf-8")
+    caster = subprocess.Popen(
+        [str(BINARY), "serve", "--config", str(temp / "caster.json")],
+        cwd=temp,
+        stdout=caster_log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    source = None
+    chrome = None
+    admin = None
+    public = None
+    try:
+        wait_http(f"http://127.0.0.1:{health_port}/health/live")
+        wait_http(f"https://127.0.0.1:{public_port}/")
+        source_payload = rtcm.payload_for_station(
+            rtcm.first_epoch(CAPTURE.read_bytes()),
+            63,
+            31.2,
+            121.4,
+        )
+        source = LocalSource(clear_port, source_payload)
+
+        profile = temp / "chrome"
+        profile.mkdir()
+        chrome_home = temp / "home"
+        chrome_home.mkdir()
+        chrome = subprocess.Popen(
+            [
+                shutil.which("chromium") or "/usr/bin/chromium",
+                "--headless=new",
+                "--disable-gpu",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-default-apps",
+                "--disable-sync",
+                "--ignore-certificate-errors",
+                "--no-first-run",
+                "--no-sandbox",
+                "--password-store=basic",
+                f"--remote-debugging-port={debug_port}",
+                f"--user-data-dir={profile}",
+                "about:blank",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ, "HOME": str(chrome_home)},
+        )
+        wait_http(f"http://127.0.0.1:{debug_port}/json/version")
+
+        if clustered:
+            with request_mtls(
+                f"https://127.0.0.1:{admin_port}/admin/",
+                temp / "server.crt",
+                temp / "client.crt",
+                temp / "client.key",
+            ) as response:
+                admin_page = response.read().decode("utf-8")
+            assert "RCaster Admin" in admin_page
+            with request_mtls(
+                f"https://127.0.0.1:{admin_port}/admin/v1/config/status",
+                temp / "server.crt",
+                temp / "client.crt",
+                temp / "client.key",
+                "Bearer browser-e2e",
+            ) as response:
+                config_status = json.loads(response.read())
+            assert config_status["available"] is True
+            assert config_status["generation"] == 1
+            result["checks"]["cluster_mtls_admin_config"] = config_status
+        else:
+            admin = new_page(debug_port, f"https://127.0.0.1:{admin_port}/admin/")
+            admin.wait_for("document.querySelector('#username')")
+            admin.evaluate(
+                "(() => {"
+                "document.getElementById('username').value='browser-admin';"
+                "document.getElementById('password').value='admin-secret';"
+                "return login();"
+                "})()"
+            )
+            admin.wait_for("!document.getElementById('account').hidden")
+            result["checks"]["admin_login"] = admin.evaluate(
+                "document.getElementById('account-name').textContent"
+            )
+            admin.evaluate("loadSources()")
+            admin.wait_for(
+                "document.getElementById('sources').textContent.includes('C63')"
+            )
+            result["checks"]["admin_source_filter"] = admin.evaluate(
+                "document.getElementById('sources').textContent"
+            )
+            admin.evaluate("showSourceHealth('C63')")
+            admin.wait_for(
+                "document.getElementById('source-health')"
+                ".textContent.includes('\"packets\"')"
+            )
+            result["checks"]["source_health"] = admin.evaluate(
+                "(() => {"
+                "const value=JSON.parse(document.getElementById('source-health').textContent);"
+                "return {health:value.health,position_available:"
+                "value.profile.position_available,valid_frames:value.profile.valid_frames,"
+                "message_numbers:value.profile.message_numbers};"
+                "})()"
+            )
+            admin.evaluate("showSourceHistory('C63')")
+            admin.wait_for(
+                "document.getElementById('source-health')"
+                ".textContent.includes('\"points\"')"
+            )
+            admin.evaluate("loadOperationalViews()")
+            admin.wait_for(
+                "document.getElementById('config-status')"
+                ".textContent.includes('\"available\"')"
+                " && document.querySelector('#config-revisions')"
+                ".textContent.includes('Config history unavailable')"
+            )
+            admin.evaluate(
+                "(() => {"
+                "document.getElementById('operation-id').value='missing';"
+                "return loadOperation();"
+                "})()"
+            )
+            admin.wait_for(
+                "document.getElementById('operation').textContent.includes('UNAVAILABLE')"
+            )
+            result["checks"]["admin_health_history_config_operation"] = True
+            if source.error:
+                result["checks"]["source_error"] = source.error
+
+        public = new_page(debug_port, f"https://127.0.0.1:{public_port}/")
+        public.wait_for(
+            "document.getElementById('mounts').textContent.includes('C63')"
+        )
+        result["checks"]["public_map_bbox"] = public.evaluate("mapBbox()")
+        public.evaluate("refreshMap()")
+        result["checks"]["public_map_data"] = public.evaluate(
+            "({features:(mapData?.features||[]).length,"
+            "sample:(mapData?.features||[])[0]?.properties||null})"
+        )
+        public.wait_for("document.querySelectorAll('#map circle').length > 0")
+        result["checks"]["public_directory_map"] = public.evaluate(
+            "({mounts:document.getElementById('mounts').textContent,"
+            "map_points:document.querySelectorAll('#map circle').length})"
+        )
+        result["checks"]["public_login_result"] = public.evaluate(
+            "(() => {"
+            "document.getElementById('username').value='owner';"
+            "document.getElementById('password').value='secret';"
+            "return login().then(() => ({"
+            "status:document.getElementById('status').textContent,csrf:Boolean(csrf)"
+            "}));"
+            "})()"
+        )
+        public.wait_for(
+            "document.getElementById('status')"
+            ".textContent.includes('Signed in as owner')"
+        )
+        public.evaluate("document.querySelector('#mounts button').click(); true")
+        public.wait_for(
+            "document.getElementById('monitor')"
+            ".textContent.includes('monitor_snapshot')",
+            timeout=25,
+        )
+        result["checks"]["public_login_ticket_websocket"] = public.evaluate(
+            "(() => {const value=JSON.parse("
+            "document.getElementById('monitor').textContent);"
+            "return {type:value.type,mountpoint:value.mountpoint,"
+            "satellite_count:value.snapshot.profile.satellite_count,"
+            "msm_observation_count:value.snapshot.profile.msm_observation_count};"
+            "})()"
+        )
+        with request(f"http://127.0.0.1:{health_port}/metrics") as response:
+            metrics_text = response.read().decode("utf-8")
+        required_metrics = [
+            "rcaster_parser_framing_errors_total",
+            "rcaster_parser_resynchronizations_total",
+            "rcaster_parser_dropped_bytes_total",
+            "rcaster_parser_max_pending_bytes",
+            "rcaster_relay_slow_consumers_total",
+            "rcaster_etcd_admission_latency_seconds",
+            "rcaster_etcd_lease_remaining_seconds",
+            "rcaster_etcd_watch_lag_revisions",
+            "rcaster_etcd_watch_recoveries_total",
+            "rcaster_near_query_latency_seconds",
+        ]
+        missing_metrics = [
+            name for name in required_metrics if name not in metrics_text
+        ]
+        if missing_metrics:
+            raise RuntimeError(f"missing runtime metrics: {missing_metrics}")
+        result["checks"]["runtime_metrics"] = required_metrics
+
+        for page in (admin, public):
+            if page is None:
+                continue
+            console_errors, network_errors = browser_problems(page)
+            result["console_errors"].extend(console_errors)
+            result["network_errors"].extend(network_errors)
+        if result["console_errors"] or result["network_errors"]:
+            raise RuntimeError(
+                "browser errors: "
+                + json.dumps(
+                    {
+                        "console": result["console_errors"],
+                        "network": result["network_errors"],
+                    }
+                )
+            )
+        result["pass"] = True
+    except Exception as error:
+        result["pass"] = False
+        result["error"] = f"{type(error).__name__}: {error}"
+        for name, page in (("admin", admin), ("public", public)):
+            if page is not None:
+                try:
+                    result[f"{name}_state"] = page.evaluate(
+                        "({url:location.href,title:document.title,"
+                        "body:document.body?.innerText.slice(0,1000)||''})"
+                    )
+                except Exception:
+                    pass
+    finally:
+        for page in (admin, public):
+            if page is not None:
+                page.close()
+        if source is not None:
+            source.close()
+        for process in (chrome, caster, etcd):
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=5)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        caster_log.flush()
+        caster_log.seek(0)
+        result["caster_log"] = caster_log.read()
+        caster_log.close()
+        result["finished_at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+def main() -> int:
+    if not BINARY.exists():
+        raise SystemExit(f"release binary missing: {BINARY}")
+    if not CAPTURE.exists():
+        raise SystemExit(f"capture missing: {CAPTURE}")
+    if shutil.which("chromium") is None:
+        raise SystemExit("chromium is required in WSL")
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    temp = Path(tempfile.mkdtemp(prefix="rcaster-web-e2e."))
+    results: dict[str, dict] = {}
+    try:
+        for mode, clustered in (("standalone", False), ("clustered", True)):
+            try:
+                results[mode] = run_test(temp / mode, clustered)
+            except Exception as error:
+                results[mode] = {
+                    "mode": mode,
+                    "pass": False,
+                    "error": f"{type(error).__name__}: {error}",
+                    "checks": {},
+                    "console_errors": [],
+                    "network_errors": [],
+                }
+    except Exception as error:
+        results["harness"] = {"pass": False, "error": str(error)}
+    finally:
+        if temp.name.startswith("rcaster-web-e2e.") and temp.parent == Path("/tmp"):
+            shutil.rmtree(temp, ignore_errors=True)
+    result = {
+        "pass": bool(results) and all(item.get("pass") for item in results.values()),
+        "modes": results,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (OUTPUT / "result.json").write_text(
+        json.dumps(result, indent=2),
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {"output": str(OUTPUT), **result},
+            indent=2,
+        )
+    )
+    return 0 if result.get("pass") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -80,6 +80,7 @@ struct HubInner {
     station_id_changes: AtomicU64,
     base_position_jumps: AtomicU64,
     backlog_kicks: AtomicU64,
+    relay_slow_consumers: AtomicU64,
 }
 
 struct SourceState {
@@ -150,6 +151,7 @@ impl MountpointHub {
                 station_id_changes: AtomicU64::new(0),
                 base_position_jumps: AtomicU64::new(0),
                 backlog_kicks: AtomicU64::new(0),
+                relay_slow_consumers: AtomicU64::new(0),
             }),
             buffer_events,
         })
@@ -365,6 +367,12 @@ impl MountpointHub {
         self.inner.backlog_kicks.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_relay_slow_consumer(&self) {
+        self.inner
+            .relay_slow_consumers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn source_history(&self, mountpoint: &str, limit: usize) -> Vec<StreamHistoryPoint> {
         self.inner
             .sources()
@@ -471,6 +479,27 @@ impl MountpointHub {
                 .filter_map(|source| source.profile.as_ref())
                 .map(|profile| profile.crc_errors)
                 .sum(),
+            parser_framing_errors: sources
+                .values()
+                .filter_map(|source| source.profile.as_ref())
+                .map(|profile| profile.parser_framing_errors)
+                .sum(),
+            parser_resynchronizations: sources
+                .values()
+                .filter_map(|source| source.profile.as_ref())
+                .map(|profile| profile.parser_resynchronizations)
+                .sum(),
+            parser_dropped_bytes: sources
+                .values()
+                .filter_map(|source| source.profile.as_ref())
+                .map(|profile| profile.parser_dropped_bytes)
+                .sum(),
+            parser_max_pending_bytes: sources
+                .values()
+                .filter_map(|source| source.profile.as_ref())
+                .map(|profile| profile.parser_max_pending_bytes)
+                .max()
+                .unwrap_or_default(),
             rtcm3_sources,
             rtcm2_sources,
             binex_sources,
@@ -488,6 +517,7 @@ impl MountpointHub {
             station_id_changes: self.inner.station_id_changes.load(Ordering::Relaxed),
             base_position_jumps: self.inner.base_position_jumps.load(Ordering::Relaxed),
             backlog_kicks: self.inner.backlog_kicks.load(Ordering::Relaxed),
+            relay_slow_consumers: self.inner.relay_slow_consumers.load(Ordering::Relaxed),
         }
     }
 
@@ -618,6 +648,20 @@ impl SourceLease {
         Ok(())
     }
 
+    pub fn refresh_str_record(&self, record: StrRecord) -> Result<bool, HubError> {
+        let mut sources = self.inner.sources();
+        let source = sources
+            .get_mut(&self.mountpoint)
+            .filter(|source| source.id == self.id)
+            .ok_or(HubError::SourceClosed)?;
+        if source.str_record.as_ref() == Some(&record) {
+            return Ok(false);
+        }
+        source.str_record = Some(record);
+        self.inner.source_revision.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
+
     pub fn is_active(&self) -> bool {
         self.inner
             .sources()
@@ -745,6 +789,11 @@ pub struct HubMetrics {
     pub station_id_changes: u64,
     pub base_position_jumps: u64,
     pub backlog_kicks: u64,
+    pub parser_framing_errors: u64,
+    pub parser_resynchronizations: u64,
+    pub parser_dropped_bytes: u64,
+    pub parser_max_pending_bytes: u64,
+    pub relay_slow_consumers: u64,
 }
 
 pub const NO_DATA_WARNING: u8 = 1;

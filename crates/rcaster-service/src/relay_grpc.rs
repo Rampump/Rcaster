@@ -199,6 +199,7 @@ impl RelayService for RelayGrpcService {
             .hub
             .subscribe(&request.mountpoint)
             .map_err(|_| Status::not_found("source is not active"))?;
+        let hub = Arc::clone(&self.hub);
         let (sender, output) = mpsc::channel(64);
         tokio::spawn(async move {
             let _permit = permit;
@@ -216,6 +217,7 @@ impl RelayService for RelayGrpcService {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        hub.record_relay_slow_consumer();
                         let _ = sender
                             .send(Err(Status::data_loss("relay subscriber lagged")))
                             .await;

@@ -14,6 +14,7 @@ pub mod coordinator_admission;
 pub mod coordinator_grpc;
 pub mod coordinator_mtls_server;
 pub mod etcd_reload;
+mod etcd_watch_metrics;
 pub mod health;
 pub mod history_store;
 pub mod hub;

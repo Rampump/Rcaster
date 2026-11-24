@@ -660,7 +660,11 @@ where
             .await;
     }
     let bbox = if path == "/api/v1/public/map/stations" {
-        match query.get("bbox").copied().map(parse_map_bbox).transpose() {
+        match query
+            .get("bbox")
+            .map(|value| parse_map_bbox(value))
+            .transpose()
+        {
             Ok(bbox) => bbox,
             Err(message) => {
                 return stream
@@ -1053,14 +1057,17 @@ fn apply_configured_position(
     }
 }
 
-fn mountpoints(records: &BTreeMap<String, PublicRecord>, query: &BTreeMap<&str, &str>) -> Value {
+fn mountpoints(
+    records: &BTreeMap<String, PublicRecord>,
+    query: &BTreeMap<String, String>,
+) -> Value {
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, 500);
-    let cursor = query.get("cursor").copied();
-    let region = query.get("region").copied();
+    let cursor = query.get("cursor").map(String::as_str);
+    let region = query.get("region").map(String::as_str);
     let filtered = records
         .values()
         .filter(|record| cursor.is_none_or(|cursor| record.record.mountpoint.as_str() > cursor))
@@ -1137,11 +1144,51 @@ fn parse_map_bbox(value: &str) -> Result<MapBbox, &'static str> {
     Ok((*min_lon, *min_lat, *max_lon, *max_lat))
 }
 
-fn parse_query(query: &str) -> BTreeMap<&str, &str> {
+fn parse_query(query: &str) -> BTreeMap<String, String> {
     query
         .split('&')
         .filter_map(|part| part.split_once('='))
+        .map(|(name, value)| (percent_decode(name), percent_decode(value)))
         .collect()
+}
+
+fn percent_decode(value: &str) -> String {
+    let input = value.as_bytes();
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        match input[index] {
+            b'+' => {
+                output.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < input.len() => {
+                if let (Some(high), Some(low)) =
+                    (hex_value(input[index + 1]), hex_value(input[index + 2]))
+                {
+                    output.push((high << 4) | low);
+                    index += 3;
+                } else {
+                    output.push(input[index]);
+                    index += 1;
+                }
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn header<'a>(headers: &'a [&'a str], name: &str) -> Option<&'a str> {
@@ -1322,7 +1369,7 @@ const PUBLIC_HTML: &str = r#"<!doctype html>
 <section><h2>Station map</h2><div id="map-shell"><div id="tile-layer" aria-hidden="true"></div><svg id="map" viewBox="0 0 1000 360" role="img" aria-label="Station map"></svg><div id="map-attribution"></div></div></section>
 </main><script>
 let csrf='',socket=null,chartTimer=null,currentMount='',mapData=null,tileConfig=null,tileLoaded=false,mapRefreshTimer=null,mapRequest=0;const status=document.getElementById('status');
-const mapCamera={centerX:.5,centerY:.5,zoom:3,initialized:true};
+const mapCamera={centerX:.5,centerY:.5,zoom:3,initialized:false};
 async function api(path,options={}){const method=options.method||'GET';const headers={'Content-Type':'application/json',...(options.headers||{})};if(method!=='GET')headers['X-CSRF-Token']=csrf;const r=await fetch(path,{...options,headers});if(!r.ok)throw new Error(await r.text());return r.status===204?null:r.json();}
 function row(cells,action){const tr=document.createElement('tr');for(const value of cells){const td=document.createElement('td');td.textContent=value??'';tr.append(td)}if(action){const td=document.createElement('td');td.append(action);tr.append(td)}return tr}
 async function load(){try{const data=await api('/api/v1/mountpoints?limit=200');document.getElementById('mounts').replaceChildren(...data.mountpoints.map(m=>{const button=document.createElement('button');button.textContent='Monitor';button.onclick=()=>monitor(m.mountpoint);return row([m.mountpoint,m.format,m.region],button)}));if(!tileLoaded){const mapConfig=await api('/api/v1/public/map/config');tileConfig=mapConfig.tiles||null;tileLoaded=true}await refreshMap()}catch(e){status.textContent=String(e)}}

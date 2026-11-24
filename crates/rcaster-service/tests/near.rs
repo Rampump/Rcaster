@@ -425,7 +425,7 @@ fn offline_snapshot_matches_full_scan_and_stationary_arrival_switches() {
 }
 
 #[test]
-fn moving_gga_crossing_is_a_known_gap_without_switches() {
+fn moving_gga_crossing_switches_after_progress_toward_target() {
     let a = position(30.0, 120.0);
     let b = position(30.018, 120.0);
     let candidates = vec![
@@ -452,27 +452,24 @@ fn moving_gga_crossing_is_a_known_gap_without_switches() {
         Some("A")
     );
 
-    let mut switches = 0;
+    let mut switched_at = None;
     for second in 1..=300 {
         let latitude = 30.0 + 8.0 * second as f64 / 111_320.0;
         if latitude > 30.018 + 0.002 {
             break;
         }
-        if selector
-            .update_indexed(
-                &gga(latitude, 120.0, 0.9),
-                &index,
-                start + Duration::from_secs(second),
-            )
-            .is_some()
-        {
-            switches += 1;
+        if let Some(source) = selector.update_indexed(
+            &gga(latitude, 120.0, 0.9),
+            &index,
+            start + Duration::from_secs(second),
+        ) {
+            assert_eq!(source, "B");
+            assert!(switched_at.replace(second).is_none());
         }
     }
-    assert_eq!(
-        switches, 0,
-        "known gap resolved: update expected mobile switches"
-    );
+    let switched_at = switched_at.expect("moving client switched source");
+    assert!(switched_at >= 3, "switch occurred before observation");
+    assert!(switched_at <= 140, "switch took {switched_at} seconds");
 }
 
 fn load_offline_snapshot() -> Vec<NearSource> {

@@ -12,6 +12,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 
 use crate::{
     ETCD_WATCH_IDLE_TIMEOUT,
+    etcd_watch_metrics::{EtcdWatchMetrics, WatchLane},
     source_claim::{ClaimError, SourceRoute, decode_source_route},
 };
 
@@ -23,14 +24,20 @@ pub struct SourceWatcher {
 }
 
 impl SourceWatcher {
-    pub async fn start(mut client: Client, cluster_id: &str) -> Result<Self, ClaimError> {
+    pub(crate) async fn start_with_metrics(
+        mut client: Client,
+        cluster_id: &str,
+        metrics: Arc<EtcdWatchMetrics>,
+    ) -> Result<Self, ClaimError> {
         let prefix = source_prefix(cluster_id)?;
         let (loaded, revision) = load_sources(&mut client, &prefix).await?;
+        metrics.observe(WatchLane::Sources, revision, []);
         let sources = Arc::new(RwLock::new(loaded));
         let healthy = Arc::new(AtomicBool::new(false));
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_sources = Arc::clone(&sources);
         let task_healthy = Arc::clone(&healthy);
+        let task_metrics = Arc::clone(&metrics);
         let task = tokio::spawn(async move {
             run_source_watch(
                 client,
@@ -38,6 +45,7 @@ impl SourceWatcher {
                 revision + 1,
                 task_sources,
                 task_healthy,
+                task_metrics,
                 &mut stop_rx,
             )
             .await;
@@ -90,6 +98,7 @@ async fn run_source_watch(
     mut start_revision: i64,
     sources: Arc<RwLock<BTreeMap<String, (i64, SourceRoute)>>>,
     healthy: Arc<AtomicBool>,
+    metrics: Arc<EtcdWatchMetrics>,
     stop: &mut oneshot::Receiver<()>,
 ) {
     loop {
@@ -108,6 +117,7 @@ async fn run_source_watch(
                 start_revision = start_revision.max(revision + 1);
             }
             Err(_) => {
+                metrics.record_recovery(WatchLane::Sources);
                 healthy.store(false, Ordering::Release);
                 if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
                     return;
@@ -129,6 +139,7 @@ async fn run_source_watch(
             ) => result,
         };
         let Ok(mut stream) = stream else {
+            metrics.record_recovery(WatchLane::Sources);
             healthy.store(false, Ordering::Release);
             if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
                 return;
@@ -143,9 +154,23 @@ async fn run_source_watch(
                 response = tokio::time::timeout(ETCD_WATCH_IDLE_TIMEOUT, stream.message()) => response,
             };
             let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                metrics.record_recovery(WatchLane::Sources);
                 break;
             };
+            let response_revision = response
+                .header()
+                .map(|header| header.revision())
+                .unwrap_or(start_revision);
+            metrics.observe(
+                WatchLane::Sources,
+                response_revision,
+                response
+                    .events()
+                    .iter()
+                    .filter_map(|event| event.kv().map(|value| value.mod_revision())),
+            );
             if response.canceled() {
+                metrics.record_recovery(WatchLane::Sources);
                 break;
             }
             for event in response.events() {

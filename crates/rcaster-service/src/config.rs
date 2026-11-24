@@ -10,7 +10,10 @@ use etcd_client::{Client, Compare, CompareOp, EventType, GetOptions, Txn, TxnOp,
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
 
-use crate::ETCD_WATCH_IDLE_TIMEOUT;
+use crate::{
+    ETCD_WATCH_IDLE_TIMEOUT,
+    etcd_watch_metrics::{EtcdWatchMetrics, WatchLane},
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CasterConfig {
@@ -294,7 +297,15 @@ pub async fn load_config_snapshot(
 }
 
 impl ConfigWatcher {
-    pub async fn start(mut client: Client, cluster_id: &str) -> Result<Self, ConfigError> {
+    pub async fn start(client: Client, cluster_id: &str) -> Result<Self, ConfigError> {
+        Self::start_with_metrics(client, cluster_id, Arc::new(EtcdWatchMetrics::default())).await
+    }
+
+    pub(crate) async fn start_with_metrics(
+        mut client: Client,
+        cluster_id: &str,
+        metrics: Arc<EtcdWatchMetrics>,
+    ) -> Result<Self, ConfigError> {
         let snapshot = load_config_snapshot(&mut client, cluster_id).await?;
         let snapshot = Arc::new(RwLock::new(snapshot));
         let healthy = Arc::new(AtomicBool::new(false));
@@ -303,6 +314,7 @@ impl ConfigWatcher {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_snapshot = Arc::clone(&snapshot);
         let task_healthy = Arc::clone(&healthy);
+        let task_metrics = Arc::clone(&metrics);
         let task = tokio::spawn(async move {
             run_config_watch(
                 client,
@@ -310,6 +322,7 @@ impl ConfigWatcher {
                 key,
                 task_snapshot,
                 task_healthy,
+                task_metrics,
                 &mut stop_rx,
             )
             .await;
@@ -360,6 +373,7 @@ async fn run_config_watch(
     key: String,
     snapshot: Arc<RwLock<ConfigSnapshot>>,
     healthy: Arc<AtomicBool>,
+    metrics: Arc<EtcdWatchMetrics>,
     stop: &mut oneshot::Receiver<()>,
 ) {
     loop {
@@ -370,6 +384,7 @@ async fn run_config_watch(
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(_) => {
+                metrics.record_recovery(WatchLane::Config);
                 healthy.store(false, Ordering::Release);
                 if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
                     return;
@@ -398,6 +413,7 @@ async fn run_config_watch(
             ) => result,
         };
         let Ok(mut stream) = stream else {
+            metrics.record_recovery(WatchLane::Config);
             healthy.store(false, Ordering::Release);
             if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
                 return;
@@ -412,9 +428,21 @@ async fn run_config_watch(
                 response = tokio::time::timeout(ETCD_WATCH_IDLE_TIMEOUT, stream.message()) => response,
             };
             let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                metrics.record_recovery(WatchLane::Config);
                 break;
             };
+            if let Some(header) = response.header() {
+                metrics.observe(
+                    WatchLane::Config,
+                    header.revision(),
+                    response
+                        .events()
+                        .iter()
+                        .filter_map(|event| event.kv().map(|value| value.mod_revision())),
+                );
+            }
             if response.canceled() {
+                metrics.record_recovery(WatchLane::Config);
                 healthy.store(false, Ordering::Release);
                 break;
             }

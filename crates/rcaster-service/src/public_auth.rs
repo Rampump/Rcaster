@@ -116,14 +116,19 @@ pub async fn login(
         created_at: now,
         expires_at,
     };
-    let lease_id = directory.etcd_lease(PUBLIC_SESSION_TTL_S).await?;
-    directory
-        .etcd_put(
-            &session_key(directory, &session_id)?,
-            serde_json::to_vec(&session).map_err(|_| PublicAuthError::Unavailable)?,
-            Some(lease_id),
-        )
-        .await?;
+    let encoded = serde_json::to_vec(&session).map_err(|_| PublicAuthError::Unavailable)?;
+    if directory.is_clustered() {
+        let lease_id = directory.etcd_lease(PUBLIC_SESSION_TTL_S).await?;
+        directory
+            .etcd_put(
+                &session_key(directory, &session_id)?,
+                encoded,
+                Some(lease_id),
+            )
+            .await?;
+    } else {
+        directory.local_public_session_put(&session_id, encoded, expires_at);
+    }
     Ok(IssuedPublicSession {
         identity: PublicIdentity {
             user_id: user.user_id,
@@ -142,11 +147,17 @@ pub async fn authenticate(
     cookie: &str,
 ) -> Result<PublicIdentity, PublicAuthError> {
     let (session_id, secret) = split_token(cookie).ok_or(PublicAuthError::Invalid)?;
-    let stored = directory
-        .etcd_get(&session_key(directory, session_id)?)
-        .await?
-        .ok_or(PublicAuthError::Invalid)?
-        .0;
+    let stored = if directory.is_clustered() {
+        directory
+            .etcd_get(&session_key(directory, session_id)?)
+            .await?
+            .ok_or(PublicAuthError::Invalid)?
+            .0
+    } else {
+        directory
+            .local_public_session_get(session_id)
+            .ok_or(PublicAuthError::Invalid)?
+    };
     let session: PublicSession =
         serde_json::from_slice(&stored).map_err(|_| PublicAuthError::Invalid)?;
     if session.schema_version != 1 || session.expires_at <= unix_time() {
@@ -167,9 +178,13 @@ pub async fn logout(
     directory: &AccountDirectory,
     identity: &PublicIdentity,
 ) -> Result<(), PublicAuthError> {
-    directory
-        .etcd_delete(&session_key(directory, &identity.session_id)?)
-        .await?;
+    if directory.is_clustered() {
+        directory
+            .etcd_delete(&session_key(directory, &identity.session_id)?)
+            .await?;
+    } else {
+        directory.local_public_session_delete(&identity.session_id);
+    }
     Ok(())
 }
 
@@ -198,14 +213,15 @@ pub async fn issue_ticket(
         created_at: now,
         expires_at: now.saturating_add(MONITOR_TICKET_TTL_S as u64),
     };
-    let lease_id = directory.etcd_lease(MONITOR_TICKET_TTL_S).await?;
-    directory
-        .etcd_put(
-            &ticket_key(directory, &ticket_id)?,
-            serde_json::to_vec(&ticket).map_err(|_| PublicAuthError::Unavailable)?,
-            Some(lease_id),
-        )
-        .await?;
+    let encoded = serde_json::to_vec(&ticket).map_err(|_| PublicAuthError::Unavailable)?;
+    if directory.is_clustered() {
+        let lease_id = directory.etcd_lease(MONITOR_TICKET_TTL_S).await?;
+        directory
+            .etcd_put(&ticket_key(directory, &ticket_id)?, encoded, Some(lease_id))
+            .await?;
+    } else {
+        directory.local_monitor_ticket_put(&ticket_id, encoded, ticket.expires_at);
+    }
     Ok(format!("{ticket_id}.{secret}"))
 }
 
@@ -216,11 +232,21 @@ pub async fn consume_ticket(
     client_ip: &str,
 ) -> Result<(PublicIdentity, Option<u64>), PublicAuthError> {
     let (ticket_id, secret) = split_token(ticket).ok_or(PublicAuthError::Invalid)?;
-    let key = ticket_key(directory, ticket_id)?;
-    let (stored, revision) = directory
-        .etcd_get(&key)
-        .await?
-        .ok_or(PublicAuthError::Invalid)?;
+    let (stored, revision) = if directory.is_clustered() {
+        let key = ticket_key(directory, ticket_id)?;
+        let (stored, revision) = directory
+            .etcd_get(&key)
+            .await?
+            .ok_or(PublicAuthError::Invalid)?;
+        (stored, Some((key, revision)))
+    } else {
+        (
+            directory
+                .local_monitor_ticket_take(ticket_id)
+                .ok_or(PublicAuthError::Invalid)?,
+            None,
+        )
+    };
     let ticket: MonitorTicket =
         serde_json::from_slice(&stored).map_err(|_| PublicAuthError::Invalid)?;
     if ticket.schema_version != 1
@@ -231,7 +257,9 @@ pub async fn consume_ticket(
         return Err(PublicAuthError::Invalid);
     }
     verify_secret(ticket.token_hash.clone(), secret.to_owned()).await?;
-    if !directory.etcd_delete_if_revision(&key, revision).await? {
+    if let Some((key, revision)) = revision
+        && !directory.etcd_delete_if_revision(&key, revision).await?
+    {
         return Err(PublicAuthError::Invalid);
     }
     let user = current_user(directory, &ticket.user_id, ticket.auth_version).await?;

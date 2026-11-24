@@ -4,4 +4,5 @@
 /rcaster-src*.tgz.sha256
 /test.etcd/
 /tools/near-e2e/runs/
+/tools/web-e2e/runs/
 __pycache__/

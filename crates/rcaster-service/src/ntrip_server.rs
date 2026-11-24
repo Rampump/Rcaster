@@ -893,7 +893,15 @@ where
                 );
             }
             send_data_success(&mut stream, version).await?;
-            forward_source_body(&mut stream, &source, &_permit, request.body(), buffered).await
+            forward_source_body(
+                &mut stream,
+                &source,
+                &_permit,
+                request.body(),
+                buffered,
+                configured_mountpoint.as_ref(),
+            )
+            .await
         }
     };
     let cancellation = async {
@@ -1405,6 +1413,7 @@ async fn forward_source_body<S>(
     permit: &SessionHold,
     framing: BodyFraming,
     buffered: Vec<u8>,
+    configured_mountpoint: Option<&Mountpoint>,
 ) -> io::Result<()>
 where
     S: AsyncRead + Unpin,
@@ -1413,13 +1422,32 @@ where
     match framing {
         BodyFraming::Stream => {
             permit.ensure_source_publishing().await?;
-            publish_analyzed(source, buffered, &mut demux)?;
-            forward_stream(stream, source, permit, &mut demux).await
+            publish_analyzed(source, permit, buffered, &mut demux, configured_mountpoint).await?;
+            forward_stream(stream, source, permit, &mut demux, configured_mountpoint).await
         }
         BodyFraming::ContentLength(length) => {
-            forward_fixed(stream, source, permit, length, buffered, &mut demux).await
+            forward_fixed(
+                stream,
+                source,
+                permit,
+                length,
+                buffered,
+                &mut demux,
+                configured_mountpoint,
+            )
+            .await
         }
-        BodyFraming::Chunked => forward_chunked(stream, source, permit, buffered, &mut demux).await,
+        BodyFraming::Chunked => {
+            forward_chunked(
+                stream,
+                source,
+                permit,
+                buffered,
+                &mut demux,
+                configured_mountpoint,
+            )
+            .await
+        }
     }
 }
 
@@ -1443,6 +1471,7 @@ async fn forward_stream<S>(
     source: &SourceLease,
     permit: &SessionHold,
     demux: &mut ProtocolDemux,
+    configured_mountpoint: Option<&Mountpoint>,
 ) -> io::Result<()>
 where
     S: AsyncRead + Unpin,
@@ -1454,7 +1483,14 @@ where
             return Ok(());
         }
         permit.ensure_source_publishing().await?;
-        publish_analyzed(source, buffer[..read].to_vec(), demux)?;
+        publish_analyzed(
+            source,
+            permit,
+            buffer[..read].to_vec(),
+            demux,
+            configured_mountpoint,
+        )
+        .await?;
     }
 }
 
@@ -1465,6 +1501,7 @@ async fn forward_fixed<S>(
     length: u64,
     mut buffered: Vec<u8>,
     demux: &mut ProtocolDemux,
+    configured_mountpoint: Option<&Mountpoint>,
 ) -> io::Result<()>
 where
     S: AsyncRead + Unpin,
@@ -1473,7 +1510,14 @@ where
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Content-Length is too large"))?;
     let take = remaining.min(buffered.len());
     permit.ensure_source_publishing().await?;
-    publish_analyzed(source, buffered.drain(..take).collect(), demux)?;
+    publish_analyzed(
+        source,
+        permit,
+        buffered.drain(..take).collect(),
+        demux,
+        configured_mountpoint,
+    )
+    .await?;
     remaining -= take;
     if !buffered.is_empty() {
         return Err(io::Error::new(
@@ -1493,7 +1537,14 @@ where
             ));
         }
         permit.ensure_source_publishing().await?;
-        publish_analyzed(source, buffer[..read].to_vec(), demux)?;
+        publish_analyzed(
+            source,
+            permit,
+            buffer[..read].to_vec(),
+            demux,
+            configured_mountpoint,
+        )
+        .await?;
         remaining -= read;
     }
     Ok(())
@@ -1505,6 +1556,7 @@ async fn forward_chunked<S>(
     permit: &SessionHold,
     buffered: Vec<u8>,
     demux: &mut ProtocolDemux,
+    configured_mountpoint: Option<&Mountpoint>,
 ) -> io::Result<()>
 where
     S: AsyncRead + Unpin,
@@ -1516,7 +1568,14 @@ where
             .decode(&buffered, &mut decoded)
             .map_err(invalid_chunk)?;
         permit.ensure_source_publishing().await?;
-        publish_analyzed(source, std::mem::take(&mut decoded), demux)?;
+        publish_analyzed(
+            source,
+            permit,
+            std::mem::take(&mut decoded),
+            demux,
+            configured_mountpoint,
+        )
+        .await?;
     }
 
     let mut buffer = vec![0_u8; SOURCE_READ_BYTES];
@@ -1532,7 +1591,14 @@ where
             .decode(&buffer[..read], &mut decoded)
             .map_err(invalid_chunk)?;
         permit.ensure_source_publishing().await?;
-        publish_analyzed(source, std::mem::take(&mut decoded), demux)?;
+        publish_analyzed(
+            source,
+            permit,
+            std::mem::take(&mut decoded),
+            demux,
+            configured_mountpoint,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1616,10 +1682,12 @@ where
     let mut pending_output = std::collections::VecDeque::new();
     let mut no_source_deadline = Instant::now() + near.no_source_timeout;
     let mut last_query = None;
+    let mut last_gga = None;
 
     if let Some(gga) = initial_gga.and_then(parse_near_gga_header)
         && accept_near_gga(&mut selector, &gga, config.metrics.as_ref())
     {
+        last_gga = Some(gga.clone());
         last_query = Some((std::time::Instant::now(), gga.position));
         if let Some(query_permit) = near.query_limiter.try_acquire() {
             if let Some(metrics) = &config.metrics {
@@ -1654,6 +1722,7 @@ where
             stream.write_all(&frame).await?;
         }
         if let Some(source) = receiver.as_mut() {
+            let mut source_closed = false;
             tokio::select! {
                 read = stream.read(&mut read_buffer) => {
                     let read = read?;
@@ -1664,6 +1733,7 @@ where
                         if !accept_near_gga(&mut selector, &gga, config.metrics.as_ref()) {
                             continue;
                         }
+                        last_gga = Some(gga.clone());
                         if !selector.should_query(last_query, &gga, std::time::Instant::now()) {
                             continue;
                         }
@@ -1695,17 +1765,50 @@ where
                 packet = source.recv() => {
                     match packet {
                         Ok(packet) => {
-                            let demux = demux.get_or_insert_with(ProtocolDemux::new);
-                            for frame in demux.push(&packet)
+                            let packet_demux = demux.get_or_insert_with(ProtocolDemux::new);
+                            for frame in packet_demux.push(&packet)
                                 .into_iter()
                                 .filter(|frame| frame.format == DataFormat::Rtcm3)
                             {
                                 stream.write_all(&frame.bytes).await?;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_))
-                        | Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            source_closed = true;
+                        }
                     }
+                }
+            }
+            if source_closed {
+                receiver = None;
+                demux = None;
+                pending_output.clear();
+                no_source_deadline = Instant::now() + near.no_source_timeout;
+                near_index = NearIndex::new(&near_candidates(&hub, &config).await);
+                indexed_revision = hub.source_revision();
+                if let Some(gga) = last_gga.clone()
+                    && let Some(query_permit) = near.query_limiter.try_acquire()
+                {
+                    if let Some(metrics) = &config.metrics {
+                        metrics.near_query();
+                    }
+                    switch_near_source(
+                        &mut selector,
+                        &mut receiver,
+                        &mut demux,
+                        &hub,
+                        &config,
+                        &near_index,
+                        gga,
+                        &mut no_source_deadline,
+                        near.no_source_timeout,
+                        &mut pending_output,
+                        query_permit,
+                    )
+                    .await;
+                } else if let Some(metrics) = &config.metrics {
+                    metrics.near_query_limited();
                 }
             }
         } else {
@@ -1719,6 +1822,7 @@ where
                 if !accept_near_gga(&mut selector, &gga, config.metrics.as_ref()) {
                     continue;
                 }
+                last_gga = Some(gga.clone());
                 if !selector.should_query(last_query, &gga, std::time::Instant::now()) {
                     continue;
                 }
@@ -1756,6 +1860,40 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn switch_near_source(
+    selector: &mut NearSelector,
+    receiver: &mut Option<tokio::sync::broadcast::Receiver<Arc<[u8]>>>,
+    demux: &mut Option<ProtocolDemux>,
+    hub: &Arc<MountpointHub>,
+    config: &NtripServerConfig,
+    candidates: &NearIndex,
+    gga: NearGga,
+    no_source_deadline: &mut Instant,
+    no_source_timeout: Duration,
+    pending_output: &mut std::collections::VecDeque<Arc<[u8]>>,
+    query_permit: crate::near::NearQueryPermit,
+) {
+    let started = Instant::now();
+    switch_near_source_inner(
+        selector,
+        receiver,
+        demux,
+        hub,
+        config,
+        candidates,
+        gga,
+        no_source_deadline,
+        no_source_timeout,
+        pending_output,
+        query_permit,
+    )
+    .await;
+    if let Some(metrics) = &config.metrics {
+        metrics.near_query_latency(started.elapsed());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn switch_near_source_inner(
     selector: &mut NearSelector,
     receiver: &mut Option<tokio::sync::broadcast::Receiver<Arc<[u8]>>>,
     demux: &mut Option<ProtocolDemux>,
@@ -2010,17 +2148,27 @@ fn publish_correction(source: &SourceLease, packet: Vec<u8>) -> io::Result<()> {
         .map_err(invalid_hub)
 }
 
-fn publish_analyzed(
+async fn publish_analyzed(
     source: &SourceLease,
+    permit: &SessionHold,
     packet: Vec<u8>,
     demux: &mut ProtocolDemux,
+    configured_mountpoint: Option<&Mountpoint>,
 ) -> io::Result<()> {
     if packet.is_empty() {
         return Ok(());
     }
     source
         .publish_analyzed(Arc::from(packet), demux)
-        .map_err(invalid_hub)
+        .map_err(invalid_hub)?;
+    let record = record_from_profile(source.mountpoint(), demux.profile(), configured_mountpoint);
+    if source
+        .refresh_str_record(record.clone())
+        .map_err(invalid_hub)?
+    {
+        permit.refresh_source_str(&record, None).await?;
+    }
+    Ok(())
 }
 
 fn connection_id() -> String {

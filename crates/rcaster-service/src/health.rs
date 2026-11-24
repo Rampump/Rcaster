@@ -64,18 +64,28 @@ pub struct HealthState {
     station_id_changes: AtomicU64,
     base_position_jumps: AtomicU64,
     backlog_kicks: AtomicU64,
+    parser_framing_errors: AtomicU64,
+    parser_resynchronizations: AtomicU64,
+    parser_dropped_bytes: AtomicU64,
+    parser_max_pending_bytes: AtomicU64,
+    relay_slow_consumers: AtomicU64,
     public_monitor_viewers: AtomicUsize,
     monitor_busy: AtomicU64,
     monitor_start_limited: AtomicU64,
     relay_starting: AtomicUsize,
     relay_failures: AtomicU64,
     relay_idle_closes: AtomicU64,
+    runtime_admission_latency_micros: AtomicU64,
+    runtime_lease_remaining_seconds: AtomicI64,
+    runtime_watch_lag_revisions: AtomicI64,
+    runtime_watch_recoveries: AtomicU64,
     near_queries: AtomicU64,
     near_queries_limited: AtomicU64,
     near_gga_rate_limited: AtomicU64,
     near_gga_jump_rejected: AtomicU64,
     near_gga_invalid: AtomicU64,
     near_switches: AtomicU64,
+    near_query_duration_micros: AtomicU64,
     process_rss_bytes: AtomicU64,
     process_open_fds: AtomicU64,
     process_usage_available: AtomicBool,
@@ -160,6 +170,16 @@ impl HealthState {
             .store(metrics.base_position_jumps, Ordering::Release);
         self.backlog_kicks
             .store(metrics.backlog_kicks, Ordering::Release);
+        self.parser_framing_errors
+            .store(metrics.parser_framing_errors, Ordering::Release);
+        self.parser_resynchronizations
+            .store(metrics.parser_resynchronizations, Ordering::Release);
+        self.parser_dropped_bytes
+            .store(metrics.parser_dropped_bytes, Ordering::Release);
+        self.parser_max_pending_bytes
+            .store(metrics.parser_max_pending_bytes, Ordering::Release);
+        self.relay_slow_consumers
+            .store(metrics.relay_slow_consumers, Ordering::Release);
     }
 
     pub fn set_sessions(&self, sessions: usize) {
@@ -188,6 +208,23 @@ impl HealthState {
         self.relay_starting.store(starting, Ordering::Release);
         self.relay_failures.store(failures, Ordering::Release);
         self.relay_idle_closes.store(idle_closes, Ordering::Release);
+    }
+
+    pub fn set_runtime_metrics(
+        &self,
+        admission_latency_micros: u64,
+        lease_remaining_seconds: i64,
+        watch_lag_revisions: i64,
+        watch_recoveries: u64,
+    ) {
+        self.runtime_admission_latency_micros
+            .store(admission_latency_micros, Ordering::Release);
+        self.runtime_lease_remaining_seconds
+            .store(lease_remaining_seconds, Ordering::Release);
+        self.runtime_watch_lag_revisions
+            .store(watch_lag_revisions, Ordering::Release);
+        self.runtime_watch_recoveries
+            .store(watch_recoveries, Ordering::Release);
     }
 
     pub fn set_tls_certificate_expiry(&self, expires_at: Option<i64>) {
@@ -298,6 +335,13 @@ impl HealthState {
 
     pub fn near_switched(&self) {
         self.near_switches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_query_latency(&self, elapsed: Duration) {
+        self.near_query_duration_micros.fetch_add(
+            elapsed.as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn source_rejected(&self) {
@@ -450,6 +494,14 @@ impl HealthState {
             self.backlog_kicks.load(Ordering::Relaxed),
         ));
         metrics.push_str(&format!(
+            "# HELP rcaster_parser_framing_errors_total Malformed frames rejected by stream parsers.\n# TYPE rcaster_parser_framing_errors_total counter\nrcaster_parser_framing_errors_total {}\n# HELP rcaster_parser_resynchronizations_total Parser resynchronizations after discarded bytes.\n# TYPE rcaster_parser_resynchronizations_total counter\nrcaster_parser_resynchronizations_total {}\n# HELP rcaster_parser_dropped_bytes_total Bytes discarded from parser queues because of capacity bounds.\n# TYPE rcaster_parser_dropped_bytes_total counter\nrcaster_parser_dropped_bytes_total {}\n# HELP rcaster_parser_max_pending_bytes Largest bounded parser queue observed by an active source.\n# TYPE rcaster_parser_max_pending_bytes gauge\nrcaster_parser_max_pending_bytes {}\n# HELP rcaster_relay_slow_consumers_total Relay streams disconnected after a subscriber lagged.\n# TYPE rcaster_relay_slow_consumers_total counter\nrcaster_relay_slow_consumers_total {}\n",
+            self.parser_framing_errors.load(Ordering::Relaxed),
+            self.parser_resynchronizations.load(Ordering::Relaxed),
+            self.parser_dropped_bytes.load(Ordering::Relaxed),
+            self.parser_max_pending_bytes.load(Ordering::Relaxed),
+            self.relay_slow_consumers.load(Ordering::Relaxed),
+        ));
+        metrics.push_str(&format!(
             "# HELP rcaster_public_monitor_viewers Active public monitor WebSocket viewers.\n# TYPE rcaster_public_monitor_viewers gauge\nrcaster_public_monitor_viewers {}\n# HELP rcaster_monitor_busy_total Monitor starts rejected by WebSocket or viewer limits.\n# TYPE rcaster_monitor_busy_total counter\nrcaster_monitor_busy_total {}\n# HELP rcaster_monitor_start_limited_total Monitor ticket requests rejected by the per-user start limit.\n# TYPE rcaster_monitor_start_limited_total counter\nrcaster_monitor_start_limited_total {}\n# HELP rcaster_relay_starting Active shared upstream relays still starting.\n# TYPE rcaster_relay_starting gauge\nrcaster_relay_starting {}\n# HELP rcaster_relay_failures_total Shared upstream relay start failures.\n# TYPE rcaster_relay_failures_total counter\nrcaster_relay_failures_total {}\n# HELP rcaster_relay_idle_closes_total Shared upstream relays closed after becoming idle.\n# TYPE rcaster_relay_idle_closes_total counter\nrcaster_relay_idle_closes_total {}\n",
             self.public_monitor_viewers.load(Ordering::Acquire),
             self.monitor_busy.load(Ordering::Relaxed),
@@ -457,6 +509,13 @@ impl HealthState {
             self.relay_starting.load(Ordering::Acquire),
             self.relay_failures.load(Ordering::Relaxed),
             self.relay_idle_closes.load(Ordering::Relaxed),
+        ));
+        metrics.push_str(&format!(
+            "# HELP rcaster_etcd_admission_latency_seconds Last cluster admission round-trip latency.\n# TYPE rcaster_etcd_admission_latency_seconds gauge\nrcaster_etcd_admission_latency_seconds {:.6}\n# HELP rcaster_etcd_lease_remaining_seconds Remaining Caster lease time from the latest keepalive.\n# TYPE rcaster_etcd_lease_remaining_seconds gauge\nrcaster_etcd_lease_remaining_seconds {}\n# HELP rcaster_etcd_watch_lag_revisions Watch revision gap between the most advanced and least advanced active watches.\n# TYPE rcaster_etcd_watch_lag_revisions gauge\nrcaster_etcd_watch_lag_revisions {}\n# HELP rcaster_etcd_watch_recoveries_total etcd watches reconnected or reloaded after interruption.\n# TYPE rcaster_etcd_watch_recoveries_total counter\nrcaster_etcd_watch_recoveries_total {}\n",
+            self.runtime_admission_latency_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.runtime_lease_remaining_seconds.load(Ordering::Relaxed),
+            self.runtime_watch_lag_revisions.load(Ordering::Relaxed),
+            self.runtime_watch_recoveries.load(Ordering::Relaxed),
         ));
         metrics.push_str(&format!(
             "# HELP rcaster_auth_failure_fallback_total Shared authentication limiter failures that fell back to node-local protection.\n# TYPE rcaster_auth_failure_fallback_total counter\nrcaster_auth_failure_fallback_total {}\n",
@@ -470,6 +529,17 @@ impl HealthState {
             self.near_gga_jump_rejected.load(Ordering::Relaxed),
             self.near_gga_invalid.load(Ordering::Relaxed),
             self.near_switches.load(Ordering::Relaxed),
+        ));
+        let near_queries = self.near_queries.load(Ordering::Relaxed);
+        let near_query_latency = if near_queries == 0 {
+            0.0
+        } else {
+            self.near_query_duration_micros.load(Ordering::Relaxed) as f64
+                / near_queries as f64
+                / 1_000_000.0
+        };
+        metrics.push_str(&format!(
+            "# HELP rcaster_near_query_latency_seconds Mean NEAR selection query latency.\n# TYPE rcaster_near_query_latency_seconds gauge\nrcaster_near_query_latency_seconds {near_query_latency:.6}\n"
         ));
         let process_available = self.process_usage_available.load(Ordering::Acquire);
         metrics.push_str(&format!(

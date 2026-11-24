@@ -14,7 +14,11 @@ use etcd_client::{
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
 
-use crate::{ETCD_WATCH_IDLE_TIMEOUT, session_limit::IpNetwork};
+use crate::{
+    ETCD_WATCH_IDLE_TIMEOUT,
+    etcd_watch_metrics::{EtcdWatchMetrics, WatchLane},
+    session_limit::IpNetwork,
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BlacklistRule {
@@ -79,16 +83,34 @@ impl BlacklistSnapshot {
 }
 
 impl BlacklistWatcher {
-    pub async fn start(mut client: Client, cluster_id: &str) -> Result<Self, BlacklistError> {
+    pub async fn start(client: Client, cluster_id: &str) -> Result<Self, BlacklistError> {
+        Self::start_with_metrics(client, cluster_id, Arc::new(EtcdWatchMetrics::default())).await
+    }
+
+    pub(crate) async fn start_with_metrics(
+        mut client: Client,
+        cluster_id: &str,
+        metrics: Arc<EtcdWatchMetrics>,
+    ) -> Result<Self, BlacklistError> {
         let loaded = load_snapshot(&mut client, cluster_id).await?;
+        metrics.observe(WatchLane::Blacklist, loaded.revision, []);
         let snapshot = Arc::new(RwLock::new(loaded.snapshot));
         let healthy = Arc::new(AtomicBool::new(false));
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_snapshot = Arc::clone(&snapshot);
         let task_healthy = Arc::clone(&healthy);
+        let task_metrics = Arc::clone(&metrics);
         let cluster = cluster_id.to_owned();
         let task = tokio::spawn(async move {
-            run_watch(client, cluster, task_snapshot, task_healthy, &mut stop_rx).await;
+            run_watch(
+                client,
+                cluster,
+                task_snapshot,
+                task_healthy,
+                task_metrics,
+                &mut stop_rx,
+            )
+            .await;
         });
         Ok(Self {
             snapshot,
@@ -135,6 +157,7 @@ async fn run_watch(
     cluster: String,
     snapshot: Arc<RwLock<BlacklistSnapshot>>,
     healthy: Arc<AtomicBool>,
+    metrics: Arc<EtcdWatchMetrics>,
     stop: &mut oneshot::Receiver<()>,
 ) {
     loop {
@@ -150,6 +173,7 @@ async fn run_watch(
                 loaded.revision + 1
             }
             Err(_) => {
+                metrics.record_recovery(WatchLane::Blacklist);
                 healthy.store(false, Ordering::Release);
                 if stop_or_sleep(stop, std::time::Duration::from_millis(250)).await {
                     return;
@@ -170,6 +194,7 @@ async fn run_watch(
             ) => result,
         };
         let Ok(mut stream) = watcher else {
+            metrics.record_recovery(WatchLane::Blacklist);
             healthy.store(false, Ordering::Release);
             continue;
         };
@@ -180,9 +205,21 @@ async fn run_watch(
                 response = tokio::time::timeout(ETCD_WATCH_IDLE_TIMEOUT, stream.message()) => response,
             };
             let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                metrics.record_recovery(WatchLane::Blacklist);
                 break;
             };
+            if let Some(header) = response.header() {
+                metrics.observe(
+                    WatchLane::Blacklist,
+                    header.revision(),
+                    response
+                        .events()
+                        .iter()
+                        .filter_map(|event| event.kv().map(|value| value.mod_revision())),
+                );
+            }
             if response.canceled() {
+                metrics.record_recovery(WatchLane::Blacklist);
                 healthy.store(false, Ordering::Release);
                 break;
             }

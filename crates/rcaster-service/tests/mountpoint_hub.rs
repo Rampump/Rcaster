@@ -169,6 +169,35 @@ fn hub_metrics_aggregate_sources_subscribers_and_integrity() {
     assert_eq!(metrics.bytes, 3);
     assert_eq!(metrics.valid_frames, 2);
     assert_eq!(metrics.crc_errors, 1);
+    assert_eq!(metrics.parser_framing_errors, 0);
+    assert_eq!(metrics.parser_resynchronizations, 0);
+    assert_eq!(metrics.parser_dropped_bytes, 0);
+    assert_eq!(metrics.parser_max_pending_bytes, 0);
+    assert_eq!(metrics.relay_slow_consumers, 0);
+}
+
+#[test]
+fn hub_metrics_include_parser_and_relay_slow_consumer_counters() {
+    let hub = MountpointHub::new(16).expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            parser_framing_errors: 2,
+            parser_resynchronizations: 3,
+            parser_dropped_bytes: 4,
+            parser_max_pending_bytes: 5,
+            ..DataProfile::default()
+        })
+        .expect("profile");
+    hub.record_relay_slow_consumer();
+
+    let metrics = hub.metrics();
+    assert_eq!(metrics.parser_framing_errors, 2);
+    assert_eq!(metrics.parser_resynchronizations, 3);
+    assert_eq!(metrics.parser_dropped_bytes, 4);
+    assert_eq!(metrics.parser_max_pending_bytes, 5);
+    assert_eq!(metrics.relay_slow_consumers, 1);
 }
 
 #[test]

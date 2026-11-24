@@ -18,6 +18,7 @@ use crate::{
     ETCD_WATCH_IDLE_TIMEOUT,
     account_store::{AccountStore, StoreError},
     blacklist::{BlacklistError, BlacklistRule},
+    etcd_watch_metrics::{EtcdWatchMetrics, WatchLane},
 };
 
 #[derive(Clone)]
@@ -29,6 +30,9 @@ pub struct AccountDirectory {
     store: Option<Arc<Mutex<AccountStore>>>,
     blacklist: Arc<RwLock<Vec<BlacklistRule>>>,
     local_admin_sessions: Arc<std::sync::Mutex<HashMap<String, LocalAdminSession>>>,
+    local_public_sessions: Arc<std::sync::Mutex<HashMap<String, LocalAdminSession>>>,
+    local_monitor_tickets: Arc<std::sync::Mutex<HashMap<String, LocalAdminSession>>>,
+    watch_metrics: Arc<EtcdWatchMetrics>,
 }
 
 #[derive(Clone)]
@@ -116,6 +120,9 @@ impl AccountDirectory {
             store: None,
             blacklist: Arc::new(RwLock::new(Vec::new())),
             local_admin_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            local_public_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            local_monitor_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            watch_metrics: Arc::new(EtcdWatchMetrics::default()),
         }
     }
 
@@ -132,6 +139,9 @@ impl AccountDirectory {
             store: Some(Arc::new(Mutex::new(store))),
             blacklist: Arc::new(RwLock::new(blacklist)),
             local_admin_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            local_public_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            local_monitor_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            watch_metrics: Arc::new(EtcdWatchMetrics::default()),
         })
     }
 
@@ -194,6 +204,76 @@ impl AccountDirectory {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
+    }
+
+    pub(crate) fn local_public_session_put(
+        &self,
+        session_id: &str,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        self.local_public_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.to_owned(),
+                LocalAdminSession { value, expires_at },
+            );
+    }
+
+    pub(crate) fn local_public_session_get(&self, session_id: &str) -> Option<Vec<u8>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut sessions = self
+            .local_public_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions
+            .get(session_id)
+            .is_some_and(|session| session.expires_at <= now)
+        {
+            sessions.remove(session_id);
+        }
+        sessions
+            .get(session_id)
+            .map(|session| session.value.clone())
+    }
+
+    pub(crate) fn local_public_session_delete(&self, session_id: &str) {
+        self.local_public_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
+    pub(crate) fn local_monitor_ticket_put(
+        &self,
+        ticket_id: &str,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        self.local_monitor_tickets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                ticket_id.to_owned(),
+                LocalAdminSession { value, expires_at },
+            );
+    }
+
+    pub(crate) fn local_monitor_ticket_take(&self, ticket_id: &str) -> Option<Vec<u8>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut tickets = self
+            .local_monitor_tickets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tickets.retain(|_, ticket| ticket.expires_at > now);
+        tickets.remove(ticket_id).map(|ticket| ticket.value)
     }
 
     pub fn blacklist_rules(&self) -> Vec<BlacklistRule> {
@@ -685,9 +765,24 @@ impl AccountDirectory {
 
 impl AccountWatcher {
     pub async fn start(
+        client: Client,
+        cluster_id: &str,
+        seed: AccountSnapshot,
+    ) -> Result<Self, AccountDirectoryError> {
+        Self::start_with_metrics(
+            client,
+            cluster_id,
+            seed,
+            Arc::new(EtcdWatchMetrics::default()),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_metrics(
         mut client: Client,
         cluster_id: &str,
         seed: AccountSnapshot,
+        watch_metrics: Arc<EtcdWatchMetrics>,
     ) -> Result<Self, AccountDirectoryError> {
         validate_cluster(cluster_id)?;
         seed_if_empty(&mut client, cluster_id, &seed).await?;
@@ -700,6 +795,9 @@ impl AccountWatcher {
             store: None,
             blacklist: Arc::new(RwLock::new(Vec::new())),
             local_admin_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            local_public_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            local_monitor_tickets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            watch_metrics,
         };
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_directory = directory.clone();
@@ -743,6 +841,7 @@ async fn run_account_watch(
         let (snapshot, revision) = match loaded {
             Ok(loaded) => loaded,
             Err(_) => {
+                directory.watch_metrics.record_recovery(WatchLane::Accounts);
                 directory.healthy.store(false, Ordering::Release);
                 if stop_or_sleep(stop).await {
                     return;
@@ -751,6 +850,9 @@ async fn run_account_watch(
             }
         };
         replace_snapshot(&directory.snapshot, &snapshot);
+        directory
+            .watch_metrics
+            .observe(WatchLane::Accounts, revision, []);
         let initial_revision = revision;
         let stream = tokio::select! {
             _ = &mut *stop => return,
@@ -765,6 +867,7 @@ async fn run_account_watch(
             ) => stream,
         };
         let Ok(mut stream) = stream else {
+            directory.watch_metrics.record_recovery(WatchLane::Accounts);
             directory.healthy.store(false, Ordering::Release);
             if stop_or_sleep(stop).await {
                 return;
@@ -779,6 +882,7 @@ async fn run_account_watch(
                 response = tokio::time::timeout(ETCD_WATCH_IDLE_TIMEOUT, stream.message()) => response,
             };
             let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                directory.watch_metrics.record_recovery(WatchLane::Accounts);
                 directory.healthy.store(false, Ordering::Release);
                 let reconnect = tokio::select! {
                     _ = &mut *stop => return,
@@ -798,11 +902,22 @@ async fn run_account_watch(
                         directory.healthy.store(true, Ordering::Release);
                         continue;
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        directory.watch_metrics.record_recovery(WatchLane::Accounts);
+                        break;
+                    }
                 }
             };
             if let Some(header) = response.header() {
                 watch_revision = watch_revision.max(header.revision());
+                directory.watch_metrics.observe(
+                    WatchLane::Accounts,
+                    header.revision(),
+                    response
+                        .events()
+                        .iter()
+                        .filter_map(|event| event.kv().map(|value| value.mod_revision())),
+                );
             }
             if response.canceled() {
                 break;

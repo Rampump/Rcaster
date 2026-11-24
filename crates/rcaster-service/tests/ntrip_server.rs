@@ -18,7 +18,7 @@ use rcaster_service::{
     source_admission::SourceAdmissionConfig,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
 };
@@ -326,6 +326,16 @@ async fn source_upload_is_fanned_out_to_tcp_subscriber() {
         .await
         .expect("subscriber packet");
     assert_eq!(received, packet);
+    let record = hub
+        .sourcetable_records()
+        .into_iter()
+        .find(|record| record.mountpoint == "C63")
+        .expect("source record");
+    assert!(
+        record.format.starts_with("RTCM 3"),
+        "standalone source record must refresh after parsing: {}",
+        record.format
+    );
     for _ in 0..100 {
         if hub
             .source_profile("C63")
@@ -448,6 +458,143 @@ async fn near_switch_sends_cached_station_position_from_new_source() {
     shutdown_tx.send(()).expect("shutdown");
     server.await.expect("server join").expect("NTRIP server");
     drop((source_a, source_b));
+}
+
+#[tokio::test]
+async fn near_fails_over_when_active_source_disconnects() {
+    let hub = Arc::new(MountpointHub::new(64).expect("hub"));
+    let source_a = activate_at(&hub, "A", 0.002);
+    let source_b = activate_at(&hub, "B", 0.0);
+    let near = rcaster_service::ntrip_server::NearServerConfig {
+        mountpoint: "AUTO_NEAR".to_owned(),
+        selector: rcaster_service::near::NearConfig {
+            observe_time: Duration::ZERO,
+            min_recompute_interval: Duration::ZERO,
+            min_recompute_distance_m: 0.0,
+            gga_max_jump_speed_mps: 1_000_000_000.0,
+            ..rcaster_service::near::NearConfig::default()
+        },
+        query_limiter: Arc::new(
+            rcaster_service::near::NearQueryLimiter::new(10_000, 8).expect("NEAR query limiter"),
+        ),
+        no_source_timeout: Duration::from_secs(5),
+        advertise: true,
+    };
+    let (address, shutdown_tx, server) =
+        start_test_server_for_existing_hub(Arc::clone(&hub), Some(near)).await;
+
+    let mut client = TcpStream::connect(address).await.expect("near connect");
+    client
+        .write_all(
+            format!(
+                "GET /AUTO_NEAR HTTP/1.1\r\nNtrip-Version: Ntrip/2.0\r\nNtrip-GGA: {}\r\n\r\n",
+                nmea_gga(0.002, 0.0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("near request");
+    assert!(
+        read_http_head(&mut client)
+            .await
+            .starts_with(b"HTTP/1.1 200 OK\r\n")
+    );
+
+    let frame_a = synthetic_rtcm3(1074);
+    source_a
+        .publish_frame(Arc::from(frame_a.clone()), DataFormat::Rtcm3, Some(1074))
+        .expect("publish source A");
+    let mut received = vec![0_u8; frame_a.len()];
+    client
+        .read_exact(&mut received)
+        .await
+        .expect("source A frame");
+    assert_eq!(received, frame_a);
+
+    drop(source_a);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while hub.active_sources() != vec!["B".to_owned()] {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("source A removed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let frame_b = synthetic_rtcm3(1075);
+    source_b
+        .publish_frame(Arc::from(frame_b.clone()), DataFormat::Rtcm3, Some(1075))
+        .expect("publish source B");
+    let mut received = vec![0_u8; frame_b.len()];
+    tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut received))
+        .await
+        .expect("same NEAR client remained connected")
+        .expect("source B frame");
+    assert_eq!(received, frame_b);
+
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("server join").expect("NTRIP server");
+}
+
+#[tokio::test]
+async fn near_without_alternative_closes_at_no_source_deadline_while_receiving_gga() {
+    let hub = Arc::new(MountpointHub::new(64).expect("hub"));
+    let source = activate_at(&hub, "A", 0.0);
+    let near = rcaster_service::ntrip_server::NearServerConfig {
+        mountpoint: "AUTO_NEAR".to_owned(),
+        selector: rcaster_service::near::NearConfig {
+            min_recompute_interval: Duration::ZERO,
+            min_recompute_distance_m: 0.0,
+            gga_max_input_per_second: 100,
+            ..rcaster_service::near::NearConfig::default()
+        },
+        query_limiter: Arc::new(
+            rcaster_service::near::NearQueryLimiter::new(10_000, 8).expect("NEAR query limiter"),
+        ),
+        no_source_timeout: Duration::from_secs(1),
+        advertise: true,
+    };
+    let (address, shutdown_tx, server) =
+        start_test_server_for_existing_hub(Arc::clone(&hub), Some(near)).await;
+    let client = TcpStream::connect(address).await.expect("near connect");
+    let (mut reader, mut writer) = client.into_split();
+    writer
+        .write_all(
+            format!(
+                "GET /AUTO_NEAR HTTP/1.1\r\nNtrip-Version: Ntrip/2.0\r\nNtrip-GGA: {}\r\n\r\n",
+                nmea_gga(0.0, 0.0)
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("near request");
+    assert!(
+        read_http_head_reader(&mut reader)
+            .await
+            .starts_with(b"HTTP/1.1 200 OK\r\n")
+    );
+
+    drop(source);
+    let writer_task = tokio::spawn(async move {
+        for _ in 0..20 {
+            if writer
+                .write_all(format!("{}\r\n", nmea_gga(0.0, 0.0)).as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    let mut buffer = [0_u8; 1];
+    let result = tokio::time::timeout(Duration::from_secs(3), reader.read(&mut buffer))
+        .await
+        .expect("no-source deadline");
+    assert!(matches!(result, Ok(0) | Err(_)), "connection stayed open");
+    writer_task.abort();
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("server join").expect("NTRIP server");
 }
 
 #[tokio::test]
@@ -1348,6 +1495,21 @@ async fn read_http_response(stream: &mut TcpStream) -> Vec<u8> {
         response.extend_from_slice(&body);
     }
     response
+}
+
+async fn read_http_head_reader<R>(stream: &mut R) -> Vec<u8>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 512];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut chunk).await.expect("socket response");
+        assert!(read > 0, "connection ended before response headers");
+        head.extend_from_slice(&chunk[..read]);
+        assert!(head.len() <= 8192, "response headers are too large");
+    }
+    head
 }
 
 fn windows_contains(haystack: &[u8], needle: &[u8]) -> bool {

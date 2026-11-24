@@ -267,6 +267,8 @@ struct Observation {
     target: String,
     started: Instant,
     position: GeoPosition,
+    previous_position: GeoPosition,
+    progress_toward_target_m: f64,
 }
 
 struct GgaWindow {
@@ -403,11 +405,19 @@ impl NearSelector {
         }
         match &mut self.observation {
             Some(observation) if observation.target == nearest.mountpoint => {
+                let previous_distance = distance_m(observation.previous_position, nearest.position);
+                let current_distance = distance_m(gga.position, nearest.position);
+                observation.progress_toward_target_m +=
+                    (previous_distance - current_distance).max(0.0);
+                observation.previous_position = gga.position;
                 if now.duration_since(observation.started) < self.config.observe_time {
                     return None;
                 }
-                if distance_m(observation.position, gga.position)
-                    > self.config.switch_position_threshold_m
+                let stationary = distance_m(observation.position, gga.position)
+                    <= self.config.switch_position_threshold_m;
+                if !stationary
+                    && observation.progress_toward_target_m
+                        < self.config.switch_position_threshold_m
                 {
                     self.observation = None;
                     return None;
@@ -421,6 +431,8 @@ impl NearSelector {
                     target: nearest.mountpoint.clone(),
                     started: now,
                     position: gga.position,
+                    previous_position: gga.position,
+                    progress_toward_target_m: 0.0,
                 });
                 None
             }

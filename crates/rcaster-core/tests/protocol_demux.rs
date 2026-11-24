@@ -409,6 +409,27 @@ fn deterministic_random_streams_keep_demux_memory_bounded() {
 }
 
 #[test]
+fn profile_tracks_framing_resync_and_pending_drops() {
+    let valid = decode_hex(RTCM3_1005);
+    let mut demux = ProtocolDemux::new();
+
+    let mut input = b"junk".to_vec();
+    input.extend_from_slice(&[0xD3, 0, 0]);
+    input.extend_from_slice(&valid);
+    let frames = demux.push(&input);
+    assert_eq!(frames.len(), 1);
+
+    let mut oversized = vec![b'$'];
+    oversized.extend_from_slice(&[0x40; 9000]);
+    assert!(demux.push(&oversized).is_empty());
+    let profile = demux.profile();
+    assert!(profile.parser_framing_errors >= 1);
+    assert!(profile.parser_resynchronizations >= 1);
+    assert!(profile.parser_dropped_bytes > 0);
+    assert!(profile.parser_max_pending_bytes <= 8192);
+}
+
+#[test]
 fn identifies_msm_version_as_correction_data() {
     let frame = synthetic_rtcm3(1074);
     let mut demux = ProtocolDemux::new();

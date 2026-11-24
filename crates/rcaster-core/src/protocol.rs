@@ -183,6 +183,10 @@ pub struct DataProfile {
     pub unknown_bytes: u64,
     pub valid_frames: u64,
     pub crc_errors: u64,
+    pub parser_framing_errors: u64,
+    pub parser_resynchronizations: u64,
+    pub parser_dropped_bytes: u64,
+    pub parser_max_pending_bytes: u64,
     pub correction_frames: u64,
     pub correction_formats: BTreeSet<DataFormat>,
     pub position_message_seen: bool,
@@ -237,10 +241,18 @@ impl ProtocolDemux {
                 0xD3 => match parse_rtcm3(&self.buffer) {
                     Rtcm3Parse::Incomplete => break,
                     Rtcm3Parse::Invalid => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(1);
                         self.remove_first();
                     }
                     Rtcm3Parse::CrcError => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.crc_errors = self.profile.crc_errors.saturating_add(1);
                         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(1);
                         self.remove_first();
@@ -265,6 +277,10 @@ impl ProtocolDemux {
                         .position(|byte| matches!(*byte, b'\n' | 0xD3 | 0x02 | 0xE2));
                     let Some(boundary) = boundary else {
                         if self.buffer.len() > 512 {
+                            self.profile.parser_dropped_bytes = self
+                                .profile
+                                .parser_dropped_bytes
+                                .saturating_add(self.buffer.len() as u64);
                             self.profile.unknown_bytes = self
                                 .profile
                                 .unknown_bytes
@@ -274,6 +290,8 @@ impl ProtocolDemux {
                         break;
                     };
                     if self.buffer[boundary] != b'\n' {
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.unknown_bytes =
                             self.profile.unknown_bytes.saturating_add(boundary as u64);
                         self.drain_prefix(boundary);
@@ -312,6 +330,8 @@ impl ProtocolDemux {
                             message_number: None,
                         });
                     } else {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
                         self.profile.unknown_bytes = self
                             .profile
                             .unknown_bytes
@@ -321,10 +341,18 @@ impl ProtocolDemux {
                 0x02 => match parse_cmr(&self.buffer) {
                     CmrParse::Incomplete => break,
                     CmrParse::Invalid => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(1);
                         self.remove_first();
                     }
                     CmrParse::ChecksumError => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.crc_errors = self.profile.crc_errors.saturating_add(1);
                         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(1);
                         self.remove_first();
@@ -345,10 +373,18 @@ impl ProtocolDemux {
                 0xE2 => match parse_binex(&self.buffer) {
                     BinexParse::Incomplete => break,
                     BinexParse::Invalid => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(1);
                         self.remove_first();
                     }
                     BinexParse::ChecksumError => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.crc_errors = self.profile.crc_errors.saturating_add(1);
                         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(1);
                         self.remove_first();
@@ -370,6 +406,10 @@ impl ProtocolDemux {
                             .iter()
                             .position(|byte| matches!(*byte, 0xD3 | 0x02 | 0xE2 | b'$'))
                             .unwrap_or(self.buffer.len());
+                        if skip > 0 {
+                            self.profile.parser_resynchronizations =
+                                self.profile.parser_resynchronizations.saturating_add(1);
+                        }
                         self.profile.unknown_bytes =
                             self.profile.unknown_bytes.saturating_add(skip as u64);
                         self.drain_prefix(skip);
@@ -380,10 +420,18 @@ impl ProtocolDemux {
                             .iter()
                             .position(|byte| matches!(*byte, 0xD3 | 0x02 | 0xE2 | b'$'))
                         {
+                            if boundary > 0 {
+                                self.profile.parser_resynchronizations =
+                                    self.profile.parser_resynchronizations.saturating_add(1);
+                            }
                             self.profile.unknown_bytes =
                                 self.profile.unknown_bytes.saturating_add(boundary as u64);
                             self.drain_prefix(boundary);
                         } else {
+                            if skip > 0 {
+                                self.profile.parser_resynchronizations =
+                                    self.profile.parser_resynchronizations.saturating_add(1);
+                            }
                             self.profile.unknown_bytes =
                                 self.profile.unknown_bytes.saturating_add(skip as u64);
                             self.drain_prefix(skip);
@@ -391,6 +439,10 @@ impl ProtocolDemux {
                         }
                     }
                     Rtcm2Parse::ParityError { skip } => {
+                        self.profile.parser_framing_errors =
+                            self.profile.parser_framing_errors.saturating_add(1);
+                        self.profile.parser_resynchronizations =
+                            self.profile.parser_resynchronizations.saturating_add(1);
                         self.profile.crc_errors = self.profile.crc_errors.saturating_add(1);
                         self.profile.unknown_bytes =
                             self.profile.unknown_bytes.saturating_add(skip as u64 + 1);
@@ -401,6 +453,10 @@ impl ProtocolDemux {
                         length,
                         message_number,
                     } => {
+                        if skip > 0 {
+                            self.profile.parser_resynchronizations =
+                                self.profile.parser_resynchronizations.saturating_add(1);
+                        }
                         self.profile.unknown_bytes =
                             self.profile.unknown_bytes.saturating_add(skip as u64);
                         self.drain_prefix(skip);
@@ -416,6 +472,10 @@ impl ProtocolDemux {
             }
         }
         self.trim_pending_tail();
+        self.profile.parser_max_pending_bytes = self
+            .profile
+            .parser_max_pending_bytes
+            .max(self.buffer.len() as u64);
         frames
     }
 
@@ -424,6 +484,10 @@ impl ProtocolDemux {
         if excess == 0 {
             return;
         }
+        self.profile.parser_dropped_bytes = self
+            .profile
+            .parser_dropped_bytes
+            .saturating_add(excess as u64);
         self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(excess as u64);
         self.drain_prefix(excess);
     }

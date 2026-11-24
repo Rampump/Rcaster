@@ -19,6 +19,7 @@ use rcaster_service::{
     coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
     hub::MountpointHub,
     public::{PublicMapTiles, PublicState, serve_public},
+    public_auth,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -26,6 +27,67 @@ use tokio::{
     sync::oneshot,
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+#[tokio::test]
+async fn standalone_public_sessions_and_tickets_use_local_state() {
+    let now = "2026-11-25T00:00:00Z";
+    let user = User {
+        schema_version: 1,
+        mod_revision: 1,
+        user_id: "owner-id".to_owned(),
+        username: "owner".to_owned(),
+        password_hash: hash_password("secret").expect("password hash"),
+        auth_version: 1,
+        enabled: true,
+        ntrip_enabled: true,
+        web_enabled: true,
+        role: UserRole::User,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
+    let mountpoint = Mountpoint {
+        schema_version: 1,
+        mod_revision: 1,
+        mountpoint: "C63".to_owned(),
+        owner_user_id: "owner-id".to_owned(),
+        enabled: true,
+        ntrip1_upload_password_hash: None,
+        advertise: true,
+        region: None,
+        latitude: None,
+        longitude: None,
+        coverage_radius_m: None,
+        str_fields: None,
+        source_expectation: None,
+        created_at: now.to_owned(),
+        updated_at: now.to_owned(),
+    };
+    let directory = AccountDirectory::static_snapshot(
+        AccountSnapshot::new([user], [mountpoint]).expect("account snapshot"),
+    );
+    let issued = public_auth::login(&directory, &Default::default(), "owner", "secret")
+        .await
+        .expect("standalone public login");
+    let identity = public_auth::authenticate(&directory, &issued.cookie_value)
+        .await
+        .expect("standalone public session");
+    assert_eq!(identity.username, "owner");
+
+    let ticket = public_auth::issue_ticket(&directory, &identity, "C63", "127.0.0.1", Some(1))
+        .await
+        .expect("standalone monitor ticket");
+    let consumed = public_auth::consume_ticket(&directory, &ticket, "C63", "127.0.0.1")
+        .await
+        .expect("consume standalone ticket");
+    assert_eq!(consumed.0.user_id, "owner-id");
+    assert_eq!(consumed.1, Some(1));
+    assert!(
+        public_auth::consume_ticket(&directory, &ticket, "C63", "127.0.0.1")
+            .await
+            .is_err(),
+        "monitor ticket must be single-use"
+    );
+}
 
 #[tokio::test]
 async fn public_directory_exposes_only_advertised_anonymous_fields() {
@@ -229,6 +291,12 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     )
     .await;
     assert!(viewport.contains("\"mountpoint\":\"C63\""));
+    let encoded_viewport = request(
+        address,
+        "/api/v1/public/map/stations?bbox=121.3%2C31.1%2C121.5%2C31.3",
+    )
+    .await;
+    assert!(encoded_viewport.contains("\"mountpoint\":\"C63\""));
     let outside = request(address, "/api/v1/public/map/stations?bbox=0,0,1,1").await;
     assert!(outside.contains("\"features\":[]"));
     assert!(

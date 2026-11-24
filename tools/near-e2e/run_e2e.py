@@ -896,9 +896,8 @@ def main() -> int:
         evidence_logs["L2-09-position-ttl"] = ttl_log
         harness.stop_sources()
 
-        drop_points = harness.start_sources(
-            find_cluster(harness.all_records, 2, 300, 20_000)
-        )
+        drop_records = find_cluster(harness.all_records, 2, 300, 20_000)
+        drop_points = harness.start_sources(drop_records)
         drop_a, drop_b = drop_points
         timer = threading.Timer(2.0, harness.sources[0].close)
         timer.start()
@@ -924,12 +923,36 @@ def main() -> int:
             },
         )
         add(
-            "L2-10b-active-disconnect-close",
+            "L2-10b-active-disconnect-keeps-client",
             True,
-            closed_event is not None and float(closed_event["t"]) <= 10.5,
-            closed_event or {"event": "connection remained open"},
+            closed_event is None,
+            {"closed": closed_event},
         )
-        evidence_logs["L2-10-active-disconnect"] = drop_log
+        evidence_logs["L2-10-active-disconnect-failover"] = drop_log
+        harness.stop_sources()
+
+        close_point = harness.start_sources([drop_records[0]])[0]
+        close_timer = threading.Timer(2.0, harness.sources[0].close)
+        close_timer.start()
+        close_log: list[dict] = []
+        collect_client(
+            harness.port,
+            lambda _t: (close_point.latitude, close_point.longitude, 0.9),
+            14.0,
+            close_log,
+        )
+        close_timer.join()
+        no_alternative_closed = next(
+            (item for item in close_log if item.get("event") == "closed"), None
+        )
+        add(
+            "L2-10c-active-disconnect-no-alternative-close",
+            True,
+            no_alternative_closed is not None
+            and float(no_alternative_closed["t"]) <= 12.5,
+            no_alternative_closed or {"event": "connection remained open"},
+        )
+        evidence_logs["L2-10-active-disconnect-no-alternative"] = close_log
         harness.stop_sources()
 
         concurrent_points = harness.start_sources(records)

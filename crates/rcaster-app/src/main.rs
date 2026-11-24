@@ -512,6 +512,16 @@ async fn serve(args: &[String]) -> AppResult<()> {
                         .update_version_status(monitor_health.is_ready())
                         .await;
                     monitor_health.set_auth_failure_fallback(runtime.auth_failure_fallback_total());
+                    if let Some(metrics) = runtime.runtime_metrics().await {
+                        monitor_health.set_runtime_metrics(
+                            metrics.admission_latency_micros,
+                            metrics.lease_remaining_seconds,
+                            metrics.watch_lag_revisions,
+                            metrics.watch_recoveries,
+                        );
+                    }
+                } else {
+                    monitor_health.set_runtime_metrics(0, 0, 0, 0);
                 }
                 let relays = match &monitor_relay {
                     Some(manager) => manager.active_count().await,

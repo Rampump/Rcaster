@@ -83,14 +83,22 @@ async fn live_is_independent_and_ready_reflects_state() {
         station_id_changes: 3,
         base_position_jumps: 4,
         backlog_kicks: 5,
+        parser_framing_errors: 6,
+        parser_resynchronizations: 7,
+        parser_dropped_bytes: 8,
+        parser_max_pending_bytes: 9,
+        relay_slow_consumers: 10,
     });
     state.set_public_monitor_viewers(6);
     state.monitor_busy();
     state.monitor_start_limited();
     state.set_relay_metrics(2, 3, 4);
+    state.set_runtime_metrics(25, 17, 4, 2);
     state.set_sessions(4);
     state.set_config_generation(7);
     state.set_auth_failure_fallback(3);
+    state.near_query();
+    state.near_query_latency(std::time::Duration::from_millis(25));
     state.set_process_usage(Some((123_456, 42)));
     state.set_dependency_health([true, true, false, true, false]);
     state.source_accepted();
@@ -136,14 +144,24 @@ async fn live_is_independent_and_ready_reflects_state() {
     assert!(metrics.contains("rcaster_source_station_id_changes_total 3"));
     assert!(metrics.contains("rcaster_source_position_jumps_total 4"));
     assert!(metrics.contains("rcaster_backlog_kicks_total 5"));
+    assert!(metrics.contains("rcaster_parser_framing_errors_total 6"));
+    assert!(metrics.contains("rcaster_parser_resynchronizations_total 7"));
+    assert!(metrics.contains("rcaster_parser_dropped_bytes_total 8"));
+    assert!(metrics.contains("rcaster_parser_max_pending_bytes 9"));
+    assert!(metrics.contains("rcaster_relay_slow_consumers_total 10"));
     assert!(metrics.contains("rcaster_public_monitor_viewers 6"));
     assert!(metrics.contains("rcaster_monitor_busy_total 1"));
     assert!(metrics.contains("rcaster_monitor_start_limited_total 1"));
     assert!(metrics.contains("rcaster_relay_starting 2"));
     assert!(metrics.contains("rcaster_relay_failures_total 3"));
     assert!(metrics.contains("rcaster_relay_idle_closes_total 4"));
+    assert!(metrics.contains("rcaster_etcd_admission_latency_seconds 0.000025"));
+    assert!(metrics.contains("rcaster_etcd_lease_remaining_seconds 17"));
+    assert!(metrics.contains("rcaster_etcd_watch_lag_revisions 4"));
+    assert!(metrics.contains("rcaster_etcd_watch_recoveries_total 2"));
     assert!(metrics.contains("rcaster_config_generation 7"));
     assert!(metrics.contains("rcaster_auth_failure_fallback_total 3"));
+    assert!(metrics.contains("rcaster_near_query_latency_seconds 0.025000"));
     assert!(metrics.contains("rcaster_process_resident_memory_bytes 123456"));
     assert!(metrics.contains("rcaster_process_open_fds 42"));
     assert!(metrics.contains("rcaster_node_clock_offset_seconds"));

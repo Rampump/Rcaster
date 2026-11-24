@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use etcd_client::{Client, Compare, CompareOp, DeleteOptions, GetOptions, PutOptions, Txn, TxnOp};
@@ -30,6 +30,7 @@ use crate::{
     config::ConfigWatcher,
     coordinator_admission::AdmissionCoordinator,
     coordinator_grpc::GrpcAdmissionClient,
+    etcd_watch_metrics::EtcdWatchMetrics,
     session_watch::SessionWatcher,
     source_claim::{
         ClaimError, SourceAdmissionSummary, SourceClaimRequest, SourceRoute,
@@ -53,11 +54,21 @@ pub struct ClusterRuntimeOptions {
     pub keep_alive: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeMetrics {
+    pub admission_latency_micros: u64,
+    pub lease_remaining_seconds: i64,
+    pub watch_lag_revisions: i64,
+    pub watch_recoveries: u64,
+}
+
 pub struct ClusterRuntime {
     client: Client,
     backend: AdmissionBackend,
     options: ClusterRuntimeOptions,
     lease_id: Arc<AtomicI64>,
+    lease_expires_unix_ms: Arc<AtomicI64>,
+    watch_metrics: Arc<EtcdWatchMetrics>,
     config: ConfigWatcher,
     blacklist: BlacklistWatcher,
     sources: SourceWatcher,
@@ -123,6 +134,7 @@ impl ClusterSourcePermit {
 pub struct SharedClusterRuntime {
     inner: Arc<Mutex<Option<ClusterRuntime>>>,
     auth_failure_fallback: Arc<AtomicU64>,
+    admission_latency_micros: Arc<AtomicU64>,
 }
 
 #[derive(Debug)]
@@ -153,19 +165,37 @@ impl ClusterRuntime {
         if !valid_options(&options) {
             return Err(ClusterRuntimeError::InvalidOptions);
         }
-        let config = ConfigWatcher::start(client.clone(), &options.cluster_id)
-            .await
-            .map_err(|error| ClusterRuntimeError::Admission(AdmissionError::Config(error)))?;
-        let blacklist = BlacklistWatcher::start(client.clone(), &options.cluster_id)
-            .await
-            .map_err(|error| ClusterRuntimeError::Blacklist(error.to_string()))?;
-        let sources = SourceWatcher::start(client.clone(), &options.cluster_id)
-            .await
-            .map_err(ClusterRuntimeError::Sources)?;
+        let watch_metrics = Arc::new(EtcdWatchMetrics::default());
+        let config = ConfigWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(|error| ClusterRuntimeError::Admission(AdmissionError::Config(error)))?;
+        let blacklist = BlacklistWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(|error| ClusterRuntimeError::Blacklist(error.to_string()))?;
+        let sources = SourceWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(ClusterRuntimeError::Sources)?;
         let session_watch = SessionWatcher::start(client.clone(), &options.cluster_id).await?;
-        let accounts = AccountWatcher::start(client.clone(), &options.cluster_id, account_seed)
-            .await
-            .map_err(ClusterRuntimeError::Accounts)?;
+        let accounts = AccountWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            account_seed,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(ClusterRuntimeError::Accounts)?;
         if !wait_for_watchers(&config, &blacklist, &sources, &accounts).await {
             config.shutdown().await;
             blacklist.shutdown().await;
@@ -179,6 +209,9 @@ impl ClusterRuntime {
             .await
             .map_err(AdmissionError::Etcd)?
             .id();
+        let lease_expires_unix_ms = Arc::new(AtomicI64::new(
+            unix_timestamp_ms() + options.lease_ttl_s.saturating_mul(1_000),
+        ));
         publish_version_status(&mut client, &options, lease_id, true, false).await?;
         let lease_id = Arc::new(AtomicI64::new(lease_id));
         let healthy = Arc::new(AtomicBool::new(true));
@@ -194,6 +227,7 @@ impl ClusterRuntime {
                 keepalive_client,
                 keepalive_lease_id,
                 keepalive_options,
+                Arc::clone(&lease_expires_unix_ms),
                 Arc::clone(&healthy),
                 Arc::clone(&version_healthy),
                 Arc::clone(&version_maintenance),
@@ -209,6 +243,8 @@ impl ClusterRuntime {
             backend: AdmissionBackend::Local(coordinator),
             options,
             lease_id: Arc::clone(&lease_id),
+            lease_expires_unix_ms,
+            watch_metrics,
             config,
             blacklist,
             sources,
@@ -271,19 +307,37 @@ impl ClusterRuntime {
         if !valid_options(&options) {
             return Err(ClusterRuntimeError::InvalidOptions);
         }
-        let config = ConfigWatcher::start(client.clone(), &options.cluster_id)
-            .await
-            .map_err(|error| ClusterRuntimeError::Admission(AdmissionError::Config(error)))?;
-        let blacklist = BlacklistWatcher::start(client.clone(), &options.cluster_id)
-            .await
-            .map_err(|error| ClusterRuntimeError::Blacklist(error.to_string()))?;
-        let sources = SourceWatcher::start(client.clone(), &options.cluster_id)
-            .await
-            .map_err(ClusterRuntimeError::Sources)?;
+        let watch_metrics = Arc::new(EtcdWatchMetrics::default());
+        let config = ConfigWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(|error| ClusterRuntimeError::Admission(AdmissionError::Config(error)))?;
+        let blacklist = BlacklistWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(|error| ClusterRuntimeError::Blacklist(error.to_string()))?;
+        let sources = SourceWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(ClusterRuntimeError::Sources)?;
         let session_watch = SessionWatcher::start(client.clone(), &options.cluster_id).await?;
-        let accounts = AccountWatcher::start(client.clone(), &options.cluster_id, account_seed)
-            .await
-            .map_err(ClusterRuntimeError::Accounts)?;
+        let accounts = AccountWatcher::start_with_metrics(
+            client.clone(),
+            &options.cluster_id,
+            account_seed,
+            Arc::clone(&watch_metrics),
+        )
+        .await
+        .map_err(ClusterRuntimeError::Accounts)?;
         if !wait_for_watchers(&config, &blacklist, &sources, &accounts).await {
             config.shutdown().await;
             blacklist.shutdown().await;
@@ -299,6 +353,9 @@ impl ClusterRuntime {
             .id();
         publish_version_status(&mut client, &options, lease_id, true, false).await?;
         let lease_id = Arc::new(AtomicI64::new(lease_id));
+        let lease_expires_unix_ms = Arc::new(AtomicI64::new(
+            unix_timestamp_ms() + options.lease_ttl_s.saturating_mul(1_000),
+        ));
         let backend = AdmissionBackend::Grpc(admission);
         let healthy = Arc::new(AtomicBool::new(true));
         let version_healthy = Arc::new(AtomicBool::new(true));
@@ -313,6 +370,7 @@ impl ClusterRuntime {
                 keepalive_client,
                 keepalive_lease_id,
                 keepalive_options,
+                Arc::clone(&lease_expires_unix_ms),
                 Arc::clone(&healthy),
                 Arc::clone(&version_healthy),
                 Arc::clone(&version_maintenance),
@@ -328,6 +386,8 @@ impl ClusterRuntime {
             backend,
             options,
             lease_id: Arc::clone(&lease_id),
+            lease_expires_unix_ms,
+            watch_metrics,
             config,
             blacklist,
             sources,
@@ -626,6 +686,21 @@ impl ClusterRuntime {
 
     pub fn lease_is_healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn metrics(&self, admission_latency_micros: u64) -> RuntimeMetrics {
+        let watch = self.watch_metrics.snapshot();
+        let remaining_ms = self
+            .lease_expires_unix_ms
+            .load(Ordering::Acquire)
+            .saturating_sub(unix_timestamp_ms())
+            .max(0);
+        RuntimeMetrics {
+            admission_latency_micros,
+            lease_remaining_seconds: remaining_ms / 1_000,
+            watch_lag_revisions: watch.lag_revisions,
+            watch_recoveries: watch.recoveries,
+        }
     }
 
     pub fn config_is_healthy(&self) -> bool {
@@ -1126,6 +1201,7 @@ impl SharedClusterRuntime {
                     .await?,
             ))),
             auth_failure_fallback: Arc::new(AtomicU64::new(0)),
+            admission_latency_micros: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1139,6 +1215,7 @@ impl SharedClusterRuntime {
                 ClusterRuntime::start_grpc(client, coordinator_endpoint, options).await?,
             ))),
             auth_failure_fallback: Arc::new(AtomicU64::new(0)),
+            admission_latency_micros: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1173,6 +1250,7 @@ impl SharedClusterRuntime {
                 .await?,
             ))),
             auth_failure_fallback: Arc::new(AtomicU64::new(0)),
+            admission_latency_micros: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -1184,7 +1262,9 @@ impl SharedClusterRuntime {
         max_sessions: usize,
         ip_max_sessions: Option<usize>,
     ) -> Result<ClientPermit, AdmissionError> {
-        self.inner
+        let started = Instant::now();
+        let result = self
+            .inner
             .lock()
             .await
             .as_mut()
@@ -1196,7 +1276,9 @@ impl SharedClusterRuntime {
                 max_sessions,
                 ip_max_sessions,
             )
-            .await
+            .await;
+        self.record_admission_latency(started);
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1213,7 +1295,9 @@ impl SharedClusterRuntime {
         user_mod_revision: u64,
         mountpoint_mod_revision: u64,
     ) -> Result<ClientPermit, AdmissionError> {
-        self.inner
+        let started = Instant::now();
+        let result = self
+            .inner
             .lock()
             .await
             .as_mut()
@@ -1230,7 +1314,9 @@ impl SharedClusterRuntime {
                 user_mod_revision,
                 mountpoint_mod_revision,
             )
-            .await
+            .await;
+        self.record_admission_latency(started);
+        result
     }
 
     pub async fn admit_source(
@@ -1240,13 +1326,17 @@ impl SharedClusterRuntime {
         connection_id: &str,
         max_sessions: usize,
     ) -> Result<ClusterSourcePermit, AdmissionError> {
-        self.inner
+        let started = Instant::now();
+        let result = self
+            .inner
             .lock()
             .await
             .as_mut()
             .ok_or(AdmissionError::CoordinatorUnavailable)?
             .admit_source(user_id, mountpoint, connection_id, max_sessions)
-            .await
+            .await;
+        self.record_admission_latency(started);
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1262,7 +1352,9 @@ impl SharedClusterRuntime {
         user_mod_revision: u64,
         mountpoint_mod_revision: u64,
     ) -> Result<ClusterSourcePermit, AdmissionError> {
-        self.inner
+        let started = Instant::now();
+        let result = self
+            .inner
             .lock()
             .await
             .as_mut()
@@ -1278,7 +1370,9 @@ impl SharedClusterRuntime {
                 user_mod_revision,
                 mountpoint_mod_revision,
             )
-            .await
+            .await;
+        self.record_admission_latency(started);
+        result
     }
 
     pub async fn release_client(&self, permit: &ClientPermit) -> Result<(), AdmissionError> {
@@ -1668,6 +1762,22 @@ impl SharedClusterRuntime {
         self.auth_failure_fallback.load(Ordering::Relaxed)
     }
 
+    fn record_admission_latency(&self, started: Instant) {
+        self.admission_latency_micros.store(
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub async fn runtime_metrics(&self) -> Option<RuntimeMetrics> {
+        let admission_latency_micros = self.admission_latency_micros.load(Ordering::Relaxed);
+        self.inner
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.metrics(admission_latency_micros))
+    }
+
     fn auth_failure_result<T>(
         &self,
         result: Result<T, AdmissionError>,
@@ -1890,11 +2000,20 @@ fn now_timestamp() -> String {
         .to_string()
 }
 
+fn unix_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn keep_lease_alive(
     client: Client,
     lease_id: Arc<AtomicI64>,
     options: ClusterRuntimeOptions,
+    lease_expires_unix_ms: Arc<AtomicI64>,
     healthy: Arc<AtomicBool>,
     version_healthy: Arc<AtomicBool>,
     version_maintenance: Arc<AtomicBool>,
@@ -1911,13 +2030,17 @@ async fn keep_lease_alive(
                 check_client.lease_keep_alive(current_lease).await.ok()?;
             keeper.keep_alive().await.ok()?;
             let response = stream.message().await.ok()??;
-            (response.ttl() > 0).then_some(())
+            (response.ttl() > 0).then_some(response.ttl())
         };
         let healthy_lease = tokio::select! {
             _ = &mut stop => return,
-            result = timeout(request_timeout, check) => result.ok().flatten().is_some(),
+            result = timeout(request_timeout, check) => result.ok().flatten(),
         };
-        if healthy_lease {
+        if let Some(ttl) = healthy_lease {
+            lease_expires_unix_ms.store(
+                unix_timestamp_ms() + ttl.saturating_mul(1_000),
+                Ordering::Release,
+            );
             set_lease_health(&healthy, &lease_health, true);
             tokio::select! {
                 _ = &mut stop => return,
@@ -1926,6 +2049,7 @@ async fn keep_lease_alive(
             continue;
         }
 
+        lease_expires_unix_ms.store(unix_timestamp_ms(), Ordering::Release);
         set_lease_health(&healthy, &lease_health, false);
         let mut grant_client = client.clone();
         let replacement = tokio::select! {
@@ -1954,6 +2078,10 @@ async fn keep_lease_alive(
         };
         if let Some(replacement) = replacement {
             lease_id.store(replacement, Ordering::Release);
+            lease_expires_unix_ms.store(
+                unix_timestamp_ms() + options.lease_ttl_s.saturating_mul(1_000),
+                Ordering::Release,
+            );
             set_lease_health(&healthy, &lease_health, true);
         }
         tokio::select! {
@@ -2001,6 +2129,7 @@ mod lease_tests {
             .expect("initial version status");
 
         let lease_id = Arc::new(AtomicI64::new(original));
+        let lease_expires_unix_ms = Arc::new(AtomicI64::new(unix_timestamp_ms()));
         let healthy = Arc::new(AtomicBool::new(true));
         let version_healthy = Arc::new(AtomicBool::new(true));
         let version_maintenance = Arc::new(AtomicBool::new(false));
@@ -2010,6 +2139,7 @@ mod lease_tests {
             client.clone(),
             Arc::clone(&lease_id),
             options.clone(),
+            lease_expires_unix_ms,
             Arc::clone(&healthy),
             Arc::clone(&version_healthy),
             Arc::clone(&version_maintenance),
