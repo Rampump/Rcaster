@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation commit:
-`8108912` (committed locally, not pushed or deployed)
+`18d795e` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -41,7 +41,7 @@ not be described as final production acceptance.
 | 18.10 Ownership and reconnect | Verified | Automated tests cover owner-only writes, runtime epoch changes, source generation fencing, lease expiry, stale cache replacement and old-connection rejection. | Repeat a post-window orphan-key and source/session count audit. |
 | 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download and slot switching. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
-| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. The admin dashboard was loaded through real mTLS and service-token authentication. | Public web is not exposed on this test deployment (`public_bind=null`); external DNS/LB, real tile service, large-map behavior and production monitor load remain unverified. |
+| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. The admin dashboard now exposes source filters, health/history charts, NEAR clients, maintenance, config apply/reload, versions, audit and operation/upgrade lookup. Inline JavaScript is parse-checked. | Public web is not exposed on this test deployment (`public_bind=null`); external DNS/LB, real tile service, large-map behavior and production monitor load remain unverified. |
 
 ## Local Design-Parity Remediation
 
@@ -81,6 +81,9 @@ Commit `8108912` closes the remaining code gaps tracked by
 - A temporary local four-Caster cluster completed 500 sources and 100
   cross-node relay subscribers for 30 seconds, with 16,872,000 source bytes and
   3,373,032 subscriber bytes. All temporary processes and data were cleaned up.
+- The management dashboard now covers the existing operational APIs rather than
+  only users, mountpoints and blacklist CRUD. Config application uses the same
+  source-health validation as cluster config loading.
 
 Local verification for this remediation:
 
@@ -89,7 +92,7 @@ Local verification for this remediation:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`:
   pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `512BE2B3C7BDA00AD9D7D746DCBDAAEC546BF1E449EB83A50411FC222CF8977F`.
+  `C822F31EBE2E57FEAAF34D3433BBC70E091BDE6F8F705A29C1D9F5C91030B78D`.
 
 None of this remediation was deployed, pushed, or connected to the four soak
 servers. The deployed soak candidate and its 72-hour evidence remain the frozen

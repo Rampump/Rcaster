@@ -803,6 +803,27 @@ git commit -m "docs: record design parity remediation"
 - [x] **Step 7: Re-run external protocol, relay, HAProxy and etcd tests**
 - [x] **Step 8: Run full local verification and commit without pushing**
 
+### Task 10: Management Operations Dashboard
+
+**Status:** Complete locally.
+
+**Files:**
+- Modify: `crates/rcaster-service/src/admin.rs`
+- Modify: `crates/rcaster-service/src/config.rs`
+- Test: `crates/rcaster-service/tests/admin_api.rs`
+
+**Interfaces:**
+- Consumes: existing management APIs for sources, health, history, NEAR, config,
+  versions, audit, operations and upgrades.
+- Produces: browser-accessible operational views and central config validation.
+
+- [x] **Step 1: Add source filters and richer source columns**
+- [x] **Step 2: Add source history chart and operational views**
+- [x] **Step 3: Add raw config apply/reload and operation/upgrade lookup**
+- [x] **Step 4: Keep service-token sessions read-only in the UI**
+- [x] **Step 5: Reuse shared source-health validation in the admin apply path**
+- [x] **Step 6: Parse-check inline JavaScript and run full local gates**
+
 ## Self-Review
 
 - Source admission, observe semantics, STR metadata, health, metrics, NEAR, admin filters, monitor generation and standalone blacklist each map to one task.
