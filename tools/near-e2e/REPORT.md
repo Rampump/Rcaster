@@ -33,39 +33,42 @@ Command:
 
 ```bash
 cargo test -p rcaster-service --test near \
-  offline_snapshot_matches_full_scan_and_motion_paths \
+  offline_snapshot_matches_full_scan_and_stationary_arrival_switches \
   --locked -- --ignored --nocapture
 ```
 
-Result: pass.
+Result: partial.
 
 - 200 deterministic random query points matched a full Haversine scan.
-- 10 synthetic motion paths switched once in order.
-- First switch was never earlier than the configured 3-second observation
-  window.
+- 10 synthetic paths switched once in order after reaching the destination and
+  remaining stationary through the observation window.
+- A separate 8 m/s continuous-crossing test records the current known gap:
+  switching never occurs while the client is moving because each >4 m GGA
+  resets the observation.
 
 ## L2a real NTRIP socket verification
 
 Evidence:
 
-- `tools/near-e2e/runs/20261125-010913/summary.json`
-- `tools/near-e2e/runs/20261125-010913/*.jsonl`
-- `tools/near-e2e/runs/20261125-010913/metrics.json`
-- `tools/near-e2e/runs/20261125-010913/metrics-clean.json`
-- `tools/near-e2e/runs/20261125-010913/str-table.txt`
+- `tools/near-e2e/runs/20261125-020131/summary.json`
+- `tools/near-e2e/runs/20261125-020131/*.jsonl`
+- `tools/near-e2e/runs/20261125-020131/metrics.json`
+- `tools/near-e2e/runs/20261125-020131/metrics-clean.json`
+- `tools/near-e2e/runs/20261125-020131/str-table.txt`
 
 | Case | Expected | Actual | Result |
 |---|---|---|---|
 | L2-01 static 20 | 20/20 selected and delivered | 20/20 | PASS |
 | L2-02 99/101 km | 99 km receives; 101 km receives no station | same | PASS |
 | L2-03 hysteresis | no switch under jitter | no switch | PASS |
-| L2-04 A->B | A then B, stable observation honored | A then B | PASS |
-| L2-05 A->B->C | ordered A, B, C | A, B, C | PASS |
+| L2-04 A->B, 1 s query cadence | A then B, first switch not before 3 s | A then B at 10.153 s | PASS |
+| L2-05 A->B->C, 1 s query cadence | ordered A, B, C | A, B at 10.088 s, C at 22.154 s | PASS |
 | L2-06 60 km jump | rejected, station stays A | rejected, station A | PASS |
 | L2-07 GGA burst | rate limiter increments, station unchanged | same | PASS |
 | L2-08 HDOP 2.6 | invalid, no switch | station A | PASS |
 | L2-09 position TTL | stale source excluded | no station after TTL | PASS |
-| L2-10 source disconnect | switch to next or close within 10 s | connection closed at 2.001 s | PASS |
+| L2-10a source disconnect failover | switch to second source | connection used first source, then closed | FAIL / KNOWN GAP |
+| L2-10b source disconnect close | close within 10 s if failover unavailable | closed at 2.001 s | PASS |
 | L2-11 20 clients | 20/20 independent selections | 20/20 | PASS |
 | STR coordinates | no uploaded `0,0` coordinate | 0 rows | PASS |
 | Cleanup | active sources 0, stderr 0 bytes | same | PASS |
@@ -85,43 +88,56 @@ No mountpoint coordinate override was required.
 
 Evidence:
 
-- `tools/near-e2e/runs/20261125-011201-l2b/summary.json`
-- `tools/near-e2e/runs/20261125-011201-l2b/l2b.jsonl`
-- `tools/near-e2e/runs/20261125-011201-l2b/metrics.json`
-- `tools/near-e2e/runs/20261125-011201-l2b/cleanup-metrics.json`
+- `tools/near-e2e/runs/20261125-020419-l2b/summary.json`
+- `tools/near-e2e/runs/20261125-020419-l2b/l2b.jsonl`
+- `tools/near-e2e/runs/20261125-020419-l2b/metrics.json`
+- `tools/near-e2e/runs/20261125-020419-l2b/cleanup-metrics.json`
 
 Result: pass.
 
 - Simultaneous local correction sources: 1,301
+- Non-station query samples: 15 neighbor midpoints, 15 midpoint ±50 m and
+  20 quarter-point interpolations
 - Distributed query samples: 50
 - Correct station/data matches: 50
 - Hit rate: 100%
 - Required threshold: 95%
 - Cleanup: `active_sources=0`, `stderr_bytes=0`
 
-Every sampled query received RTCM3 1005 from the expected source station ID.
+Every sampled query whose expected result was a station received the expected
+RTCM3 1005 station ID. Two sparse-region samples correctly returned no source.
 
 ## Notes and corrections found during validation
 
 - RTCM3 1005 ECEF fields must be encoded in 0.1 mm units. Writing meters
   produced plausible longitude but invalid latitude and was corrected before
   the passing runs.
-- The standalone admin listener currently requires cluster coordinator TLS.
-  This test therefore used the standalone NTRIP listener and health metrics
-  endpoint and did not require an admin API.
+- Standalone `admin_bind` originally required a nonexistent
+  `cluster.coordinator_tls`. The configuration validation, standalone admin
+  startup, login session handling and local source-list path were fixed and
+  covered by binary-level tests.
 - `validation_buffer_max_bytes` must cover
   `max_validating_sources * source_admission.max_bytes`; the harness sets an
   explicit 1 GiB bound.
-- For deterministic switch timing, the test sets
-  `min/max_recompute_interval_ms=1000`, while keeping the production 3-second
-  observation window and hysteresis rules.
+- The L2 switching evidence uses `min/max_recompute_interval_ms=1000`. Under
+  production defaults, a stationary client can wait for the 5-second maximum
+  recompute interval and then complete the 3-second observation window, so the
+  expected practical switch latency is roughly 5–10 seconds.
 
 ## Conclusion
 
-L1, L2a, and L2b all meet the requested local acceptance threshold. This proves
-the standalone data path:
+The local standalone data path passes for quasi-static and 1-second-query
+operation:
 
 `GGA input -> spatial selection -> source switch -> selected source RTCM data`
 
-It does not replace the separate dual-node relay case or the external Soak,
-CMR, DNS/LB, or rolling-upgrade acceptance tests.
+The following requested behavior is **not yet complete**:
+
+- Continuous moving-client switches while the client remains in motion.
+- NEAR failover to the next source when the currently served source
+  disconnects; current behavior closes the client connection.
+- Production-default 5–10 second switching latency as a stated guarantee.
+
+Therefore this evidence must be reported as **partial**, not complete NEAR
+acceptance. It also does not replace the separate dual-node relay case or the
+external Soak, CMR, DNS/LB, or rolling-upgrade acceptance tests.

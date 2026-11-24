@@ -92,8 +92,8 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 - [x] Emit disconnected and owner-changed events.
 - [x] Add source generation/connection IDs where a cluster source permit is
   available.
-- [ ] Emit health-alert transition events.
-- [ ] Add cursor pagination beyond the bounded recent-event limit.
+- [x] Emit health-alert and recovery transition events.
+- [x] Add cursor pagination beyond the bounded recent-event limit.
 
 ## Task 14: Browser-Level Web Verification
 

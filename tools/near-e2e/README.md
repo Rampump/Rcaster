@@ -30,12 +30,14 @@ records plus fetch metadata. It does not subscribe to a correction stream.
 
 ```bash
 cargo test -p rcaster-service --test near \
-  offline_snapshot_matches_full_scan_and_motion_paths \
+  offline_snapshot_matches_full_scan_and_stationary_arrival_switches \
   --locked -- --ignored --nocapture
 ```
 
 This checks 200 deterministic random queries against a full Haversine scan and
-10 synthetic motion paths with the production `NearIndex` and `NearSelector`.
+10 stationary-arrival paths with the production `NearIndex` and
+`NearSelector`. A separate normal test records the current moving-client
+switching gap; see `REPORT.md`.
 
 ## L2a real socket verification
 
@@ -81,8 +83,9 @@ python3 tools/near-e2e/run_l2b.py \
 
 This starts 1,301 local correction sources (the CRTK mountpoint named `NEAR`
 is excluded because it is the synthetic Caster mountpoint), then checks 50
-deterministically distributed query points. The required hit rate is at least
-95%; the current implementation is expected to match 50/50.
+neighbor midpoints, midpoint offsets and interpolated points rather than
+querying each station at its own coordinates. The required hit rate is at least
+95%; sparse points with no source within 100 km must also return no station.
 
 All generated run directories are ignored by Git. Temporary redb files,
 processes, sockets, and logs are removed unless `--keep` is used.

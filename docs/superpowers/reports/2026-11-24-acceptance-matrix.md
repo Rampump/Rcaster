@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-25 01:27 CST
+Status date: 2026-11-25 02:05 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`858da08` (committed locally, not pushed or deployed)
+`7a75fce` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -29,7 +29,7 @@ not be described as final production acceptance.
 
 | Design section | Current status | Authoritative evidence | Remaining proof |
 |---|---|---|---|
-| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The latest CRTK.NET run models 1,294 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. The committed offline snapshot adds a full standalone L2 test: 1,301 local sources, 11 real socket cases and 50/50 full-table sample matches. | More receiver models; real CMR/CMR+ capture; public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
+| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The latest CRTK.NET run models 1,294 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. The committed standalone L2 test proves quasi-static selection, 99/101 km boundaries, hysteresis, jump/rate/HDOP/TTL handling, ordered switching under a 1-second query cadence, cleanup, and 50/50 non-station full-table samples. | Continuous moving-client switching remains a known gap; source disconnect currently closes the connection instead of failing over. Production-default query cadence delays stationary switching by roughly 5–10 seconds. More receiver models, real CMR/CMR+ capture and browser-level UI E2E also remain. |
 | 18.2 Consistency and ownership | Verified | `source_fencing`, `user_admission`, `revision_admission`, `config_revision`, `cluster_runtime`, `blacklist_write`, `account_directory`, `connections` and `upgrade` integration tests cover races, stale revisions, generation/connection fencing, owner commands and cleanup. Live cluster ownership was checked at 3/2/3/2 across four nodes. | Re-run the same assertions after the 72-hour run exits to prove no orphan state remains. |
 | 18.3 Capacity | Verified | Target-node probes completed 10 sources/8,000 subscribers, 1 source/10,000 subscribers and 10,000 mountpoints. Coordinator spikes achieved about 1,000 admissions/s. A local four-Caster cluster with 500 sources and 100 cross-node relay subscribers ran 30 seconds: 16,872,000 source bytes and 3,373,032 subscriber bytes. | The frozen soak remains the long-duration stability run, not a capacity proof gap. |
 | 18.4 Stability | Pending | Pre-runs showed zero restarts and bounded RSS/FD. The current frozen candidate is running four local and one cross-region soak units. | Successful completion of all five 259,200-second runs, final RSS/FD curves, zero restart, empty stderr and clean post-run state. |
@@ -41,7 +41,7 @@ not be described as final production acceptance.
 | 18.10 Ownership and reconnect | Verified | Automated tests cover owner-only writes, runtime epoch changes, source generation fencing, lease expiry, stale cache replacement and old-connection rejection. | Repeat a post-window orphan-key and source/session count audit. |
 | 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download and slot switching. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
-| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. The admin dashboard now exposes source filters, health/history charts, NEAR clients, maintenance, config apply/reload, versions, audit and operation/upgrade lookup. Inline JavaScript is parse-checked. | Public web is not exposed on this test deployment (`public_bind=null`); external DNS/LB, real tile service, large-map behavior and production monitor load remain unverified. |
+| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` now uses top-level server TLS, supports local administrator login sessions and lists local sources; this is covered by a real binary TLS smoke. The admin dashboard exposes source filters, health/history charts, NEAR clients, maintenance, config apply/reload, versions, audit, Source events and operation/upgrade lookup. Inline JavaScript is parse-checked. | Public web is not exposed on this test deployment (`public_bind=null`); full browser-level UI E2E, external DNS/LB, real tile service, large-map behavior and production monitor load remain unverified. |
 
 ## Operational Completeness Follow-up
 
@@ -76,14 +76,17 @@ Final current-tree verification on 2026-11-25:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `F8294D435DB7059E0637360EC59CCB8D181C331A7C7948EF51E25729A543C8BC`.
+  `C20AA295035752875BC07D0AC4D90BB1040B58E4AE45C7391CCDA795245AB71E`.
 - The full ignored integration suite was rerun after the source lifecycle
   changes. One initial leader-failover attempt hit a temporary etcd startup
   race; the failing test then passed alone and the complete ignored suite
   passed on the next run.
 - NEAR validation report:
-  `tools/near-e2e/REPORT.md`. L1, all 11 L2a cases, cleanup checks and the
-  1,301-source / 50-query L2b sample pass.
+  `tools/near-e2e/REPORT.md`. L1 static/full-scan checks, L2a static/boundary/
+  hysteresis/ordered switch/rate/jump/HDOP/TTL/concurrency checks and the
+  1,301-source / 50 non-station-query L2b sample pass. Continuous moving-client
+  switching and source-disconnect failover are known gaps; the latter currently
+  closes the client after 2.001 seconds.
 
 ## Local Design-Parity Remediation
 
