@@ -395,6 +395,8 @@ git commit -m "fix: keep unknown sources visible in observe mode"
 
 ### Task 3: Mountpoint STR Metadata and Merge
 
+**Status:** Complete locally.
+
 **Files:**
 - Modify: `crates/rcaster-core/src/account.rs`
 - Modify: `crates/rcaster-core/src/str_record.rs`
