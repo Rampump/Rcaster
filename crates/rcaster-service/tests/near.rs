@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use rcaster_core::{
     protocol::{DataFormat, GeoPosition},
@@ -304,6 +307,221 @@ async fn live_crtk_sourcetable_models_near_candidates() {
         "CRTK.NET NEAR model: {} RTCM3 candidates, {checks} sampled queries matched brute force",
         candidates.len()
     );
+}
+
+#[test]
+#[ignore = "offline CRTK.NET snapshot and synthetic motion paths"]
+fn offline_snapshot_matches_full_scan_and_motion_paths() {
+    let candidates = load_offline_snapshot();
+    assert!(candidates.len() > 100, "offline snapshot is too small");
+    let index = NearIndex::new(&candidates);
+    let mut random = Lcg::new(0x5EED_C0DE_2026_1125);
+    for sample in 0..200 {
+        let anchor = &candidates[random.next_usize(candidates.len())];
+        let latitude =
+            f64::from(anchor.position.latitude_e7) / 1e7 + (random.next_f64() - 0.5) * 0.6;
+        let longitude =
+            f64::from(anchor.position.longitude_e7) / 1e7 + (random.next_f64() - 0.5) * 0.6;
+        let query = position(latitude, longitude);
+        let expected = brute_nearest_distance(&candidates, query, 100_000.0);
+        let actual = index.nearest(query, 100_000.0).map(|source| {
+            (
+                source.mountpoint.as_str(),
+                haversine_m(query, source.position),
+            )
+        });
+        match (expected, actual) {
+            (None, None) => {}
+            (Some((expected_name, expected_distance)), Some((actual_name, actual_distance))) => {
+                assert!(
+                    (expected_distance - actual_distance).abs() < 0.01,
+                    "sample {sample}: indexed distance differs from full scan"
+                );
+                if expected_name != actual_name {
+                    assert!(
+                        expected_distance + 0.01 >= actual_distance
+                            && actual_distance + 0.01 >= expected_distance,
+                        "sample {sample}: expected {expected_name}, got {actual_name}"
+                    );
+                }
+            }
+            (expected, actual) => panic!("sample {sample}: expected {expected:?}, got {actual:?}"),
+        }
+    }
+
+    for path in 0..10 {
+        let distance_m = 1_000.0 + path as f64 * 350.0;
+        let bearing = path as f64 * std::f64::consts::TAU / 10.0;
+        let a = position(30.0, 120.0);
+        let b = offset_position(a, distance_m, bearing);
+        let candidates = vec![
+            NearSource {
+                mountpoint: "A".to_owned(),
+                position: a,
+                format: DataFormat::Rtcm3,
+                usable_correction: true,
+            },
+            NearSource {
+                mountpoint: "B".to_owned(),
+                position: b,
+                format: DataFormat::Rtcm3,
+                usable_correction: true,
+            },
+        ];
+        let index = NearIndex::new(&candidates);
+        let mut selector = NearSelector::new(NearConfig::default());
+        let start = Instant::now();
+        assert_eq!(
+            selector
+                .update_indexed(&gga(30.0, 120.0, 0.9), &index, start)
+                .as_deref(),
+            Some("A")
+        );
+        let mut switches = Vec::new();
+        for step in 1..=24 {
+            let at = start + Duration::from_millis(250 * step);
+            let fraction = step as f64 / 24.0;
+            let query = interpolate_position(a, b, fraction);
+            if let Some(source) = selector.update_indexed(
+                &gga(
+                    f64::from(query.latitude_e7) / 1e7,
+                    f64::from(query.longitude_e7) / 1e7,
+                    0.9,
+                ),
+                &index,
+                at,
+            ) {
+                switches.push((source, at.duration_since(start)));
+            }
+        }
+        for stable in 1..=16 {
+            let at = start + Duration::from_millis(250 * (24 + stable));
+            if let Some(source) = selector.update_indexed(
+                &gga(
+                    f64::from(b.latitude_e7) / 1e7,
+                    f64::from(b.longitude_e7) / 1e7,
+                    0.9,
+                ),
+                &index,
+                at,
+            ) {
+                switches.push((source, at.duration_since(start)));
+            }
+        }
+        assert_eq!(
+            switches
+                .iter()
+                .map(|(source, _)| source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["B"],
+            "path {path}"
+        );
+        assert!(
+            switches[0].1 >= Duration::from_secs(3),
+            "path {path}: switched after {:?}",
+            switches[0].1
+        );
+    }
+}
+
+fn load_offline_snapshot() -> Vec<NearSource> {
+    let path = std::env::var_os("RCASTER_NEAR_E2E_SNAPSHOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tools/near-e2e/data/crtk-str-20261125.json")
+        });
+    let value: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+    )
+    .expect("parse CRTK snapshot");
+    let mut candidates = value["records"]
+        .as_array()
+        .expect("snapshot records")
+        .iter()
+        .filter_map(|record| {
+            NearSource::from_str_record(&StrRecord {
+                mountpoint: record["mountpoint"].as_str()?.to_owned(),
+                identifier: record["identifier"].as_str().unwrap_or_default().to_owned(),
+                format: record["format"].as_str()?.to_owned(),
+                format_details: String::new(),
+                carrier: String::new(),
+                navigation_system: String::new(),
+                network: record["network"].as_str().unwrap_or_default().to_owned(),
+                country: record["country"].as_str().unwrap_or_default().to_owned(),
+                latitude: record["latitude"].to_string(),
+                longitude: record["longitude"].to_string(),
+                nmea: String::new(),
+                solution: String::new(),
+                generator: String::new(),
+                compression: String::new(),
+                authentication: String::new(),
+                fee: String::new(),
+                bitrate: String::new(),
+                misc: String::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.mountpoint.cmp(&right.mountpoint));
+    candidates
+}
+
+fn brute_nearest_distance(
+    candidates: &[NearSource],
+    query: GeoPosition,
+    max_distance_m: f64,
+) -> Option<(&str, f64)> {
+    candidates
+        .iter()
+        .filter(|source| source.usable_correction && source.format == DataFormat::Rtcm3)
+        .filter_map(|source| {
+            let distance = haversine_m(query, source.position);
+            (distance <= max_distance_m).then_some((source.mountpoint.as_str(), distance))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+fn offset_position(origin: GeoPosition, distance_m: f64, bearing_radians: f64) -> GeoPosition {
+    let latitude = f64::from(origin.latitude_e7) / 1e7;
+    let longitude = f64::from(origin.longitude_e7) / 1e7;
+    let north = distance_m * bearing_radians.cos() / 111_320.0;
+    let east = distance_m * bearing_radians.sin() / (111_320.0 * latitude.to_radians().cos());
+    position(latitude + north, longitude + east)
+}
+
+fn interpolate_position(start: GeoPosition, end: GeoPosition, fraction: f64) -> GeoPosition {
+    let interpolate = |left: i32, right: i32| {
+        (f64::from(left) + (f64::from(right) - f64::from(left)) * fraction).round() as i32
+    };
+    GeoPosition {
+        latitude_e7: interpolate(start.latitude_e7, end.latitude_e7),
+        longitude_e7: interpolate(start.longitude_e7, end.longitude_e7),
+        height_cm: 0,
+    }
+}
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        (self.next_u64() % upper as u64) as usize
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / ((1_u64 << 53) as f64)
+    }
 }
 
 fn parse_crtk_str_source(line: &str) -> Option<NearSource> {
