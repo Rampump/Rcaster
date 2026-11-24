@@ -301,8 +301,12 @@ impl NearSelector {
             return true;
         };
         let elapsed = now.saturating_duration_since(last_time);
+        let observation_ready = self.observation.as_ref().is_some_and(|observation| {
+            now.saturating_duration_since(observation.started) >= self.config.observe_time
+        });
         elapsed >= self.config.min_recompute_interval
-            && (elapsed >= self.config.max_recompute_interval
+            && (observation_ready
+                || elapsed >= self.config.max_recompute_interval
                 || distance_m(last_position, gga.position) >= self.config.min_recompute_distance_m)
     }
 

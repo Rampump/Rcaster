@@ -209,6 +209,33 @@ fn query_rate_limits_until_movement_or_max_interval() {
 }
 
 #[test]
+fn completed_observation_triggers_a_stationary_query_before_max_interval() {
+    let mut selector = NearSelector::new(NearConfig {
+        observe_time: Duration::from_secs(3),
+        ..NearConfig::default()
+    });
+    let now = Instant::now();
+    let a = source("A", 0.0, 0.002);
+    let b = source("B", 0.0, 0.0);
+    assert_eq!(
+        selector
+            .update(&gga(0.0, 0.002, 0.9), &[a.clone(), b.clone()], now)
+            .as_deref(),
+        Some("A")
+    );
+    let observation_started = now + Duration::from_secs(1);
+    assert_eq!(
+        selector.update(&gga(0.0, 0.0, 0.9), &[a, b], observation_started),
+        None
+    );
+    assert!(selector.should_query(
+        Some((observation_started, position(0.0, 0.0))),
+        &gga(0.0, 0.0, 0.9),
+        observation_started + Duration::from_secs(3),
+    ));
+}
+
+#[test]
 fn global_query_limiter_enforces_rate_and_concurrency() {
     let limiter = NearQueryLimiter::new(1, 1).expect("query limiter");
     let now = Instant::now();
