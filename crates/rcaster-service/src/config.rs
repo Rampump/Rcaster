@@ -61,6 +61,20 @@ impl Default for SourceHealthConfig {
     }
 }
 
+impl SourceHealthConfig {
+    pub fn is_valid(&self) -> bool {
+        self.short_window_s > 0
+            && self.long_window_s >= self.short_window_s
+            && self.observation_timeout_s > 0
+            && (0.0..=1.0).contains(&self.valid_frame_ratio_min)
+            && (0.0..=1.0).contains(&self.crc_error_ratio_max)
+            && self.alert_clear_s > 0
+            && self.base_position_jump_m.is_finite()
+            && self.base_position_jump_m > 0.0
+            && self.action == "alert"
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CasterLimits {
     pub max_source_bitrate_bps: u64,
@@ -474,16 +488,7 @@ fn decode_config(value: &[u8]) -> Result<CasterConfig, ConfigError> {
     if config.schema_version != 1 {
         return Err(ConfigError::UnsupportedSchema(config.schema_version));
     }
-    if config.source_health.short_window_s == 0
-        || config.source_health.long_window_s == 0
-        || config.source_health.short_window_s > config.source_health.long_window_s
-        || config.source_health.observation_timeout_s == 0
-        || !(0.0..=1.0).contains(&config.source_health.valid_frame_ratio_min)
-        || !(0.0..=1.0).contains(&config.source_health.crc_error_ratio_max)
-        || config.source_health.alert_clear_s == 0
-        || !config.source_health.base_position_jump_m.is_finite()
-        || config.source_health.base_position_jump_m <= 0.0
-        || config.source_health.action != "alert"
+    if !config.source_health.is_valid()
         || config.limits.max_source_bitrate_bps == 0
         || config.limits.max_sources == 0
         || config.limits.max_validating_sources == 0

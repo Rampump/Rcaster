@@ -110,6 +110,17 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("monitorSource"));
     assert!(page.contains("clearCooldown"));
     assert!(page.contains("Source cooldowns"));
+    assert!(page.contains("loadSources"));
+    assert!(page.contains("showSourceHistory"));
+    assert!(page.contains("drawHistory"));
+    assert!(page.contains("saveConfig"));
+    assert!(page.contains("id=\"config-json\""));
+    assert!(page.contains("loadOperationalViews"));
+    assert!(page.contains("NEAR clients"));
+    assert!(page.contains("Config history unavailable"));
+    assert!(page.contains("loadOperation"));
+    assert!(page.contains("loadUpgrade"));
+    assert!(page.contains("Audit"));
     assert!(page.contains("admin/v1/auth/login"));
     assert!(page.contains("setInterval"));
 
@@ -1142,6 +1153,19 @@ async fn admin_writes_blacklist_with_revision_cas() {
     })
     .await
     .expect("audit write");
+    assert!(
+        request_raw(
+            address,
+            &pki,
+            "PUT",
+            "/admin/v1/config",
+            auth,
+            "",
+            r#"{"schema_version":1,"generation":2,"source_health":{"short_window_s":61,"long_window_s":60,"observation_timeout_s":12,"crc_error_ratio_max":0.2,"action":"disconnect"}}"#,
+        )
+        .await
+        .starts_with("HTTP/1.1 400 Bad Request")
+    );
     let config = request_raw(
         address,
         &pki,
