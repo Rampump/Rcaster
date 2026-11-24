@@ -1039,9 +1039,15 @@ async fn handle(
         }
         if method == "POST"
             && path.starts_with("/admin/v1/operations/")
-            && path.ends_with("/cancel")
+            && (path.ends_with("/cancel") || path.ends_with("/retry"))
         {
-            let operation_id = &path["/admin/v1/operations/".len()..path.len() - "/cancel".len()];
+            let control = if path.ends_with("/retry") {
+                "retry"
+            } else {
+                "cancel"
+            };
+            let suffix = format!("/{control}");
+            let operation_id = &path["/admin/v1/operations/".len()..path.len() - suffix.len()];
             let key = format!(
                 "/rcaster/{}/runtime/operations/{operation_id}",
                 state.cluster_id
@@ -1072,6 +1078,34 @@ async fn handle(
                     403,
                     json!({"code":"FORBIDDEN","message":"operation cancellation is not permitted"}),
                 ));
+            }
+            if control == "retry" {
+                let manager = OperationManager::new(
+                    runtime.clone(),
+                    state.accounts.clone(),
+                    state.cluster_id.clone(),
+                );
+                let result = manager.retry(operation_id).await;
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(&access),
+                    "operation.retry",
+                    operation_id,
+                    if result.is_ok() {
+                        "accepted"
+                    } else {
+                        "failure"
+                    },
+                    json!({"revision": revision}),
+                );
+                return Ok(match result {
+                    Ok(operation) => response(202, operation),
+                    Err((status, message)) => response(
+                        status,
+                        json!({"code":"OPERATION_CONFLICT","message":message}),
+                    ),
+                });
             }
             if matches!(
                 operation["status"].as_str(),

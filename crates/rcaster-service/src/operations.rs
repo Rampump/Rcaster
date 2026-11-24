@@ -205,15 +205,24 @@ impl OperationManager {
             updated_at: now,
         };
         self.put(&operation).await?;
-        let manager = Self {
-            runtime: self.runtime.clone(),
-            accounts: self.accounts.clone(),
-            cluster_id: self.cluster_id.clone(),
-        };
         let worker_operation = operation.clone();
-        tokio::spawn(async move {
-            manager.run(worker_operation).await;
-        });
+        self.spawn_run(worker_operation);
+        Ok(serde_json::to_value(operation).unwrap_or(Value::Null))
+    }
+
+    pub async fn retry(&self, operation_id: &str) -> Result<Value, (u16, String)> {
+        let mut operation = self.load(operation_id).await?;
+        if !matches!(operation.status.as_str(), "PARTIAL" | "FAILED") {
+            return Err((
+                409,
+                "only partially failed or failed operations can be retried".to_owned(),
+            ));
+        }
+        operation.status = "QUEUED".to_owned();
+        operation.results.clear();
+        operation.updated_at = unix_time();
+        self.put(&operation).await?;
+        self.spawn_run(operation.clone());
         Ok(serde_json::to_value(operation).unwrap_or(Value::Null))
     }
 
@@ -571,6 +580,17 @@ impl OperationManager {
         .to_owned();
         operation.updated_at = unix_time();
         let _ = self.put(&operation).await;
+    }
+
+    fn spawn_run(&self, operation: BatchOperation) {
+        let manager = Self {
+            runtime: self.runtime.clone(),
+            accounts: self.accounts.clone(),
+            cluster_id: self.cluster_id.clone(),
+        };
+        tokio::spawn(async move {
+            manager.run(operation).await;
+        });
     }
 
     async fn disable_user(&self, target: &TargetRevision) -> TargetResult {

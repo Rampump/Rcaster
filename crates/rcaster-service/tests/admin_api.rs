@@ -1225,6 +1225,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .await
         .contains("\"generation\":2")
     );
+    Box::pin(async {
     accounts
         .upsert_user(
             User {
@@ -1419,6 +1420,148 @@ async fn admin_writes_blacklist_with_revision_cas() {
     .expect("delete user completion");
     assert!(
         request(address, &pki, "/admin/v1/users/delete-user", auth)
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    accounts
+        .upsert_user(
+            User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "in-use-user".to_owned(),
+                username: "in-use-user".to_owned(),
+                password_hash: rcaster_service::account_auth::hash_password("in-use-secret")
+                    .expect("in-use password hash"),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: false,
+                web_enabled: false,
+                role: UserRole::User,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("in-use user");
+    accounts
+        .upsert_mountpoint(
+            Mountpoint {
+                schema_version: 1,
+                mod_revision: 1,
+                mountpoint: "INUSE".to_owned(),
+                owner_user_id: "in-use-user".to_owned(),
+                enabled: true,
+                ntrip1_upload_password_hash: None,
+                advertise: false,
+                region: None,
+                latitude: None,
+                longitude: None,
+                coverage_radius_m: None,
+                str_fields: None,
+                source_expectation: None,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("in-use mountpoint");
+    let in_use_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        r#"{"action":"users.delete","targets":["in-use-user"]}"#,
+    )
+    .await;
+    let in_use_preview_body = response_body(&in_use_preview);
+    let in_use_digest = in_use_preview_body["preview_digest"]
+        .as_str()
+        .expect("in-use delete digest");
+    let in_use_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"users.delete","targets":["in-use-user"],"preview_digest":"{in_use_digest}"}}"#
+        ),
+    )
+    .await;
+    let in_use_operation_id = response_body(&in_use_start)["operation_id"]
+        .as_str()
+        .expect("in-use operation ID")
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{in_use_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "FAILED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("in-use delete failure");
+    let current_mount = accounts
+        .snapshot()
+        .mountpoint("INUSE")
+        .cloned()
+        .expect("in-use mountpoint snapshot");
+    let current_revision = current_mount.mod_revision;
+    let mut detached = current_mount;
+    detached.owner_user_id = "admin-api".to_owned();
+    accounts
+        .upsert_mountpoint(detached, Some(current_revision))
+        .await
+        .expect("detach in-use mountpoint");
+    assert!(
+        request_raw(
+            address,
+            &pki,
+            "POST",
+            &format!("/admin/v1/operations/{in_use_operation_id}/retry"),
+            auth,
+            "",
+            "{}",
+        )
+        .await
+        .starts_with("HTTP/1.1 202 Accepted")
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{in_use_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "SUCCEEDED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("in-use delete retry");
+    assert!(
+        request(address, &pki, "/admin/v1/users/in-use-user", auth)
             .await
             .starts_with("HTTP/1.1 404")
     );
@@ -1645,6 +1788,8 @@ async fn admin_writes_blacklist_with_revision_cas() {
     let migrated =
         response_body(&request(address, &pki, "/admin/v1/mountpoints/BATCH", auth).await);
     assert_eq!(migrated["mountpoint"]["owner_user_id"], "new-owner");
+    })
+    .await;
     let preview = request_raw(
         address,
         &pki,
