@@ -110,7 +110,7 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 Evidence:
 
 - `tools/web-e2e/run_browser_e2e.py`
-- `tools/web-e2e/runs/20261125-032719/result.json`
+- `tools/web-e2e/runs/20261125-033259/result.json`
 - Standalone: real admin login/source/health/history/config and public
   login/ticket/WebSocket flows pass with no unexpected browser or network
   errors.
