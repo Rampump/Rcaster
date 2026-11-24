@@ -306,8 +306,12 @@ git commit -m "fix: enforce advanced source admission rules"
 - [x] **Step 6: Run `cargo test -p rcaster-service --test ntrip_cluster --locked`**
 
 The test is `uploaded_rtcm3_generates_active_etcd_str_record`.
+The same test accepts `RCASTER_SERIAL_CAPTURE=<path>` to replace synthetic
+RTCM3 with a temporary capture from the real local COM3 module.
 
 ### Task 2: Observe Unknown Streams and Deadline Semantics
+
+**Status:** Complete locally.
 
 **Files:**
 - Modify: `crates/rcaster-service/src/source_admission.rs`
@@ -319,7 +323,7 @@ The test is `uploaded_rtcm3_generates_active_etcd_str_record`.
 - Consumes: `AdmissionPolicy.mode`, `DataProfile.valid_frames`.
 - Produces: `SourceAdmissionWindow::finish` returns Accepted for an unknown stream in Observe mode.
 
-- [ ] **Step 1: Add a failing window test**
+- [x] **Step 1: Add a failing window test**
 
 ```rust
 #[test]
@@ -339,7 +343,7 @@ fn observe_accepts_unknown_stream_after_window_closes() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -349,7 +353,7 @@ cargo test -p rcaster-service --test source_admission_window observe_accepts_unk
 
 Expected: rejected with `NoValidFrames`.
 
-- [ ] **Step 3: Implement the Observe fallback**
+- [x] **Step 3: Implement the Observe fallback**
 
 In `SourceAdmissionWindow::finish`, convert `Pending` to:
 
@@ -361,7 +365,7 @@ AdmissionProgress::Accepted {
 
 only when the configured mode is Observe and no valid frame was seen. Keep Enforce as rejected.
 
-- [ ] **Step 4: Add a failing deadline test**
+- [x] **Step 4: Add a failing deadline test**
 
 ```rust
 #[tokio::test]
@@ -371,18 +375,18 @@ async fn source_deadline_uses_finish_in_observe_mode() {
 }
 ```
 
-- [ ] **Step 5: Implement deadline finish**
+- [x] **Step 5: Implement deadline finish**
 
 Replace `timeout_at(...).await.map_err(TimedOut)?` for the admission phase with a match that calls `admission.finish(source, permit).await` on timeout. Keep the post-admission `read_timeout` behavior unchanged.
 
-- [ ] **Step 6: Run admission and NTRIP tests**
+- [x] **Step 6: Run admission and NTRIP tests**
 
 ```powershell
 cargo test -p rcaster-service --test source_admission_window --locked
 cargo test -p rcaster-service --test ntrip_server --locked
 ```
 
-- [ ] **Step 7: Commit locally**
+- [x] **Step 7: Commit locally**
 
 ```powershell
 git add crates/rcaster-service/src/source_admission.rs crates/rcaster-service/src/ntrip_server.rs crates/rcaster-service/tests/source_admission_window.rs crates/rcaster-service/tests/ntrip_server.rs
