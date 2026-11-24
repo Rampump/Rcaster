@@ -773,6 +773,36 @@ git add docs/工作日记.md docs/superpowers/reports/2026-11-24-acceptance-matr
 git commit -m "docs: record design parity remediation"
 ```
 
+### Task 9: Runtime Hardening and Combined Capacity
+
+**Status:** Complete locally.
+
+**Files:**
+- Modify: `crates/rcaster-core/src/protocol.rs`
+- Modify: `crates/rcaster-core/tests/protocol_demux.rs`
+- Modify: `crates/rcaster-service/src/account_directory.rs`
+- Modify: `crates/rcaster-service/src/hub.rs`
+- Modify: `crates/rcaster-service/src/ntrip_server.rs`
+- Modify: `crates/rcaster-service/src/source_claim.rs`
+- Modify: `crates/rcaster-app/src/config.rs`
+- Test: `crates/rcaster-service/tests/account_directory.rs`
+- Test: `crates/rcaster-service/tests/mountpoint_hub.rs`
+- Test: `crates/rcaster-service/tests/ntrip_cluster.rs`
+
+**Interfaces:**
+- Consumes: raw protocol streams, source health windows, source profile updates.
+- Produces: bounded demux memory, complete source health policy, late STR refresh,
+  bounded account seeding and a verified 500-source/100-relay combination.
+
+- [x] **Step 1: Add bounded random protocol tests**
+- [x] **Step 2: Enforce the 8 KiB pending-buffer invariant**
+- [x] **Step 3: Add complete source health windows and clear semantics**
+- [x] **Step 4: Refresh late RTCM3 position/device fields in etcd**
+- [x] **Step 5: Batch large account seeds below the etcd transaction limit**
+- [x] **Step 6: Run local four-node 500-source/100-relay validation**
+- [x] **Step 7: Re-run external protocol, relay, HAProxy and etcd tests**
+- [x] **Step 8: Run full local verification and commit without pushing**
+
 ## Self-Review
 
 - Source admission, observe semantics, STR metadata, health, metrics, NEAR, admin filters, monitor generation and standalone blacklist each map to one task.
