@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use rcaster_core::{
+    account::{Mountpoint, MountpointStrConfig},
     protocol::{DataFormat, DataProfile, DeviceInfo, GeoPosition},
     str_record::StrRecord,
 };
@@ -65,5 +66,78 @@ fn non_rtcm3_formats_use_str_family_names() {
         };
 
         assert_eq!(StrRecord::from_profile("TEST", &profile).format, expected);
+    }
+}
+
+#[test]
+fn configured_mountpoint_fields_survive_when_profile_has_no_position_or_device() {
+    let mountpoint = mountpoint_with_str();
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Nmea),
+        valid_frames: 1,
+        ..DataProfile::default()
+    };
+
+    let record = StrRecord::from_profile_and_mountpoint("C63", &profile, &mountpoint);
+
+    assert_eq!(record.identifier, "Configured Farm");
+    assert_eq!(record.network, "RTK-NET");
+    assert_eq!(record.country, "CHN");
+    assert_eq!(record.carrier, "1");
+    assert_eq!(record.navigation_system, "GPS+GLO");
+    assert_eq!(record.latitude, "31.2000000");
+    assert_eq!(record.longitude, "121.4000000");
+    assert_eq!(record.misc, "nmea_only");
+}
+
+#[test]
+fn detected_position_overrides_configured_mountpoint_position() {
+    let mountpoint = mountpoint_with_str();
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Rtcm3),
+        valid_frames: 2,
+        message_numbers: BTreeSet::from([1005, 1074]),
+        position: Some(GeoPosition {
+            latitude_e7: 300_000_000,
+            longitude_e7: 1_200_000_000,
+            height_cm: 0,
+        }),
+        has_correction_data: true,
+        ..DataProfile::default()
+    };
+
+    let record = StrRecord::from_profile_and_mountpoint("C63", &profile, &mountpoint);
+
+    assert_eq!(record.latitude, "30.0000000");
+    assert_eq!(record.longitude, "120.0000000");
+    assert_eq!(record.format_details, "1005,1074");
+}
+
+fn mountpoint_with_str() -> Mountpoint {
+    Mountpoint {
+        schema_version: 1,
+        mod_revision: 1,
+        mountpoint: "C63".to_owned(),
+        owner_user_id: "owner-id".to_owned(),
+        enabled: true,
+        ntrip1_upload_password_hash: None,
+        advertise: true,
+        region: Some("east".to_owned()),
+        latitude: Some(31.2),
+        longitude: Some(121.4),
+        coverage_radius_m: Some(30_000.0),
+        str_fields: Some(MountpointStrConfig {
+            identifier: Some("Configured Farm".to_owned()),
+            format: Some("CONFIGURED".to_owned()),
+            formats: Some("1005,1006".to_owned()),
+            carrier: Some("1".to_owned()),
+            navigation_system: Some("GPS+GLO".to_owned()),
+            network: Some("RTK-NET".to_owned()),
+            country: Some("CHN".to_owned()),
+            solution: Some("1".to_owned()),
+        }),
+        source_expectation: None,
+        created_at: "2026-11-24T00:00:00Z".to_owned(),
+        updated_at: "2026-11-24T00:00:00Z".to_owned(),
     }
 }

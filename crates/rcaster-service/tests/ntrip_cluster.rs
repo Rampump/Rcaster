@@ -5,8 +5,12 @@ use std::{
 };
 
 use etcd_client::{Client, ConnectOptions, PutOptions, Txn, TxnOp};
-use rcaster_core::protocol::{AdmissionMode, AdmissionPolicy, DataFormat};
+use rcaster_core::{
+    account::{AccountSnapshot, Mountpoint, MountpointStrConfig, User, UserRole},
+    protocol::{AdmissionMode, AdmissionPolicy, DataFormat},
+};
 use rcaster_service::{
+    account_directory::AccountDirectory,
     admission::AdmissionError,
     auth::{
         AuthError, AuthorizedUser, ClientAuthorizer, ClientCredentials, SourceAuthorizer,
@@ -92,6 +96,52 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
     )
     .await
     .expect("runtime");
+    let configured_mountpoint = Mountpoint {
+        schema_version: 1,
+        mod_revision: 1,
+        mountpoint: "C66".to_owned(),
+        owner_user_id: "owner-id".to_owned(),
+        enabled: true,
+        ntrip1_upload_password_hash: None,
+        advertise: true,
+        region: Some("east".to_owned()),
+        latitude: Some(31.2),
+        longitude: Some(121.4),
+        coverage_radius_m: Some(30_000.0),
+        str_fields: Some(MountpointStrConfig {
+            identifier: Some("Configured Farm".to_owned()),
+            format: None,
+            formats: None,
+            carrier: Some("2".to_owned()),
+            navigation_system: Some("GPS".to_owned()),
+            network: Some("RTK-NET".to_owned()),
+            country: Some("CHN".to_owned()),
+            solution: Some("0".to_owned()),
+        }),
+        source_expectation: None,
+        created_at: "2026-11-24T00:00:00Z".to_owned(),
+        updated_at: "2026-11-24T00:00:00Z".to_owned(),
+    };
+    let accounts = AccountDirectory::static_snapshot(
+        AccountSnapshot::new(
+            [User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "owner-id".to_owned(),
+                username: "owner".to_owned(),
+                password_hash: "hash".to_owned(),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: true,
+                web_enabled: false,
+                role: UserRole::User,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            }],
+            [configured_mountpoint],
+        )
+        .expect("account snapshot"),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -123,7 +173,7 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
                 read_timeout: Duration::from_secs(2),
             }),
             near: None,
-            accounts: None,
+            accounts: Some(accounts),
             metrics: None,
             connections: None,
             proxy_protocol: None,
@@ -178,6 +228,8 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
     assert!(value["source_generation"].as_u64().unwrap_or_default() >= 1);
     assert_eq!(value["str"]["mountpoint"], "C66");
     assert_eq!(value["str"]["format"], "RTCM 3.3");
+    assert_eq!(value["str"]["network"], "RTK-NET");
+    assert_eq!(value["str"]["country"], "CHN");
     assert!(
         value["str"]["format_details"]
             .as_str()

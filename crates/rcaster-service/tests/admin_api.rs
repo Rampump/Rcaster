@@ -583,7 +583,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         "/admin/v1/mountpoints",
         "Bearer secret",
         "",
-        r#"{"mountpoint":"C64","owner_user_id":"editor-id","ntrip1_upload_password":"upload","source_expectation":{"formats":["rtcm3"],"msm_versions":[4]}}"#,
+        r#"{"mountpoint":"C64","owner_user_id":"editor-id","ntrip1_upload_password":"upload","latitude":31.2,"longitude":121.4,"coverage_radius_m":30000,"str_fields":{"identifier":"Farm 1","network":"RTK-NET","country":"CHN","carrier":"2","navigation_system":"GPS+GLO"},"source_expectation":{"formats":["rtcm3"],"msm_versions":[4]}}"#,
     )
     .await;
     assert!(created_mount.starts_with("HTTP/1.1 201 Created"));
@@ -671,7 +671,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         "/admin/v1/mountpoints/C64",
         "Bearer secret",
         &format!("If-Match: \"{mount_revision}\"\r\n"),
-        r#"{"region":"east","advertise":false,"enabled":false,"source_expectation":{"formats":["rtcm3"],"msm_versions":[4,7]}}"#,
+        r#"{"region":"east","advertise":false,"enabled":false,"latitude":31.3,"longitude":121.5,"coverage_radius_m":35000,"str_fields":{"identifier":"Farm 2","network":"RTK-NET","country":"CHN","carrier":"1","navigation_system":"GPS+GLO"}, "source_expectation":{"formats":["rtcm3"],"msm_versions":[4,7]}}"#,
     )
     .await;
     assert!(updated_mount.starts_with("HTTP/1.1 200 OK"));
@@ -690,14 +690,19 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .expect("C64 source commands");
     assert_eq!(commands.kvs().len(), 1);
     let mountpoint = request(address, &pki, "/admin/v1/mountpoints/C64", "Bearer secret").await;
-    assert!(mountpoint.contains("\"region\":\"east\""));
-    assert!(mountpoint.contains("\"advertise\":false"));
-    assert!(mountpoint.contains("\"enabled\":false"));
-    assert!(
-        mountpoint
-            .contains("\"source_expectation\":{\"formats\":[\"rtcm3\"],\"msm_versions\":[4,7]}")
-    );
-    assert!(!mountpoint.contains("upload"));
+    let mountpoint = response_body(&mountpoint);
+    let mountpoint = &mountpoint["mountpoint"];
+    assert_eq!(mountpoint["region"], "east");
+    assert_eq!(mountpoint["advertise"], false);
+    assert_eq!(mountpoint["enabled"], false);
+    assert_eq!(mountpoint["latitude"], 31.3);
+    assert_eq!(mountpoint["longitude"], 121.5);
+    assert_eq!(mountpoint["coverage_radius_m"], 35_000.0);
+    assert_eq!(mountpoint["str_fields"]["identifier"], "Farm 2");
+    assert_eq!(mountpoint["source_expectation"]["formats"][0], "rtcm3");
+    assert_eq!(mountpoint["source_expectation"]["msm_versions"][1], 7);
+    assert!(mountpoint.get("ntrip1_upload_password").is_none());
+    assert!(mountpoint.get("ntrip1_upload_password_hash").is_none());
     assert!(accounts.snapshot().user_by_id("editor-id").is_some());
     assert!(
         request_raw(

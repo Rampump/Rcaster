@@ -9,6 +9,23 @@ use rcaster_service::{
     auth::{AuthError, ClientAuthorizer, ClientCredentials, SourceAuthorizer, SourceCredentials},
 };
 
+#[test]
+fn rejects_invalid_mountpoint_coordinates_and_coverage() {
+    for mutate in [
+        |mountpoint: &mut Mountpoint| mountpoint.latitude = Some(91.0),
+        |mountpoint: &mut Mountpoint| mountpoint.longitude = Some(181.0),
+        |mountpoint: &mut Mountpoint| mountpoint.coverage_radius_m = Some(0.0),
+        |mountpoint: &mut Mountpoint| mountpoint.latitude = Some(31.0),
+    ] {
+        let mut mountpoint = test_mountpoint(None);
+        mutate(&mut mountpoint);
+        assert!(matches!(
+            AccountSnapshot::new([test_user(true, "hash")], [mountpoint]),
+            Err(AccountError::InvalidMountpoint)
+        ));
+    }
+}
+
 #[tokio::test]
 async fn ntrip1_uses_the_mountpoint_upload_password() {
     let user = test_user(true, "user-hash");
@@ -299,6 +316,10 @@ fn test_mountpoint(ntrip1_password_hash: Option<String>) -> Mountpoint {
         ntrip1_upload_password_hash: ntrip1_password_hash,
         advertise: true,
         region: Some("test".to_owned()),
+        latitude: None,
+        longitude: None,
+        coverage_radius_m: None,
+        str_fields: None,
         source_expectation: None,
         created_at: "2026-11-22T00:00:00Z".to_owned(),
         updated_at: "2026-11-22T00:00:00Z".to_owned(),

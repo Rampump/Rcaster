@@ -1,4 +1,7 @@
-use crate::protocol::{DataFormat, DataProfile, GeoPosition};
+use crate::{
+    account::Mountpoint,
+    protocol::{DataFormat, DataProfile, GeoPosition, GnssSystem},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -25,15 +28,34 @@ pub struct StrRecord {
 
 impl StrRecord {
     pub fn from_profile(mountpoint: &str, profile: &DataProfile) -> Self {
-        let format = match profile.primary_format {
-            Some(DataFormat::Rtcm3) => "RTCM 3.3",
-            Some(DataFormat::Rtcm2) => "RTCM 2",
-            Some(DataFormat::Binex) => "BINEX",
-            Some(DataFormat::Cmr) => "CMR/CMR+",
-            Some(DataFormat::Nmea) => "NMEA",
-            None => "UNKNOWN",
+        Self::from_profile_and_metadata(mountpoint, profile, None)
+    }
+
+    pub fn from_profile_and_mountpoint(
+        mountpoint: &str,
+        profile: &DataProfile,
+        configured: &Mountpoint,
+    ) -> Self {
+        Self::from_profile_and_metadata(mountpoint, profile, Some(configured))
+    }
+
+    fn from_profile_and_metadata(
+        mountpoint: &str,
+        profile: &DataProfile,
+        configured: Option<&Mountpoint>,
+    ) -> Self {
+        let fields = configured.and_then(|mountpoint| mountpoint.str_fields.as_ref());
+        let format = detected_format(profile)
+            .or_else(|| fields.and_then(|fields| fields.format.as_deref()))
+            .unwrap_or("UNKNOWN");
+        let detected_details = profile.format_message_numbers();
+        let details = if detected_details.is_empty() {
+            fields
+                .and_then(|fields| fields.formats.clone())
+                .unwrap_or_default()
+        } else {
+            detected_details
         };
-        let details = profile.format_message_numbers();
         let generator = profile
             .device
             .as_ref()
@@ -43,33 +65,58 @@ impl StrRecord {
         let (latitude, longitude) = profile
             .position
             .map(position_text)
+            .or_else(|| {
+                configured.and_then(|mountpoint| {
+                    Some((
+                        format!("{:.7}", mountpoint.latitude?),
+                        format!("{:.7}", mountpoint.longitude?),
+                    ))
+                })
+            })
             .unwrap_or_else(|| ("0".to_owned(), "0".to_owned()));
+        let identifier = profile
+            .device
+            .as_ref()
+            .map(|device| device.antenna_descriptor.as_str())
+            .filter(|value| !value.is_empty())
+            .or_else(|| fields.and_then(|fields| fields.identifier.as_deref()))
+            .unwrap_or(mountpoint);
+        let navigation_system = navigation_system(profile)
+            .or_else(|| fields.and_then(|fields| fields.navigation_system.clone()))
+            .unwrap_or_else(|| "GPS".to_owned());
         Self {
             mountpoint: clean_field(mountpoint),
-            identifier: clean_field(
-                profile
-                    .device
-                    .as_ref()
-                    .map(|device| device.antenna_descriptor.as_str())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(mountpoint),
-            ),
+            identifier: clean_field(identifier),
             format: format.to_owned(),
             format_details: clean_field(&details),
-            carrier: "2".to_owned(),
-            navigation_system: "GPS".to_owned(),
-            network: "RCaster".to_owned(),
-            country: "XXX".to_owned(),
+            carrier: fields
+                .and_then(|fields| fields.carrier.clone())
+                .unwrap_or_else(|| "2".to_owned()),
+            navigation_system,
+            network: fields
+                .and_then(|fields| fields.network.clone())
+                .unwrap_or_else(|| "RCaster".to_owned()),
+            country: fields
+                .and_then(|fields| fields.country.clone())
+                .unwrap_or_else(|| "XXX".to_owned()),
             latitude,
             longitude,
             nmea: "0".to_owned(),
-            solution: "0".to_owned(),
+            solution: fields
+                .and_then(|fields| fields.solution.clone())
+                .unwrap_or_else(|| "0".to_owned()),
             generator: clean_field(&generator),
             compression: "none".to_owned(),
             authentication: "N".to_owned(),
             fee: "N".to_owned(),
             bitrate: "0".to_owned(),
-            misc: String::new(),
+            misc: if profile.primary_format == Some(DataFormat::Nmea)
+                && !profile.has_correction_data
+            {
+                "nmea_only".to_owned()
+            } else {
+                String::new()
+            },
         }
     }
 
@@ -96,6 +143,34 @@ impl StrRecord {
             self.misc,
         )
     }
+}
+
+fn detected_format(profile: &DataProfile) -> Option<&'static str> {
+    match profile.primary_format {
+        Some(DataFormat::Rtcm3) => Some("RTCM 3.3"),
+        Some(DataFormat::Rtcm2) => Some("RTCM 2"),
+        Some(DataFormat::Binex) => Some("BINEX"),
+        Some(DataFormat::Cmr) => Some("CMR/CMR+"),
+        Some(DataFormat::Nmea) => Some("NMEA"),
+        None => None,
+    }
+}
+
+fn navigation_system(profile: &DataProfile) -> Option<String> {
+    let systems = profile
+        .msm_observations
+        .iter()
+        .map(|observation| match observation.system {
+            GnssSystem::Gps => "GPS",
+            GnssSystem::Glonass => "GLO",
+            GnssSystem::Galileo => "GAL",
+            GnssSystem::Sbas => "SBS",
+            GnssSystem::Qzss => "QZS",
+            GnssSystem::NavIc => "NAVIC",
+            GnssSystem::Bds => "BDS",
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    (!systems.is_empty()).then(|| systems.into_iter().collect::<Vec<_>>().join("+"))
 }
 
 fn position_text(position: GeoPosition) -> (String, String) {

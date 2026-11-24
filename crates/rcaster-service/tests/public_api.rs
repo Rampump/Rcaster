@@ -31,8 +31,13 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     let _private_source = activate(&hub, "PRIVATE");
     let _disabled_source = activate(&hub, "DISABLED");
     let _unknown_source = activate(&hub, "UNKNOWN");
+    let _fallback_source = activate_without_position(&hub, "FALLBACK");
     let mut disabled = mountpoint("DISABLED", "east", true);
     disabled.enabled = false;
+    let mut fallback = mountpoint("FALLBACK", "east", true);
+    fallback.latitude = Some(30.0);
+    fallback.longitude = Some(120.0);
+    fallback.coverage_radius_m = Some(25_000.0);
     let accounts = AccountDirectory::static_snapshot(
         AccountSnapshot::new(
             [User {
@@ -51,6 +56,7 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
             }],
             [
                 mountpoint("C63", "east", true),
+                fallback,
                 mountpoint("PRIVATE", "east", false),
                 disabled,
             ],
@@ -211,6 +217,8 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     let map = request(address, "/api/v1/public/map/stations").await;
     assert!(map.contains("\"type\":\"FeatureCollection\""));
     assert!(map.contains("[121.4,31.2]"));
+    assert!(map.contains("[120.0,30.0]"));
+    assert!(map.contains("\"coverage_m\":25000.0"));
     assert!(!map.contains("PRIVATE"));
     let viewport = request(
         address,
@@ -438,6 +446,20 @@ fn activate(hub: &MountpointHub, name: &str) -> rcaster_service::hub::SourceLeas
     source
 }
 
+fn activate_without_position(hub: &MountpointHub, name: &str) -> rcaster_service::hub::SourceLease {
+    let source = hub.claim_source(name).expect("source");
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Rtcm3),
+        has_correction_data: true,
+        ..DataProfile::default()
+    };
+    source
+        .set_str_record(StrRecord::from_profile(name, &profile))
+        .expect("str");
+    source.set_profile(profile).expect("profile");
+    source
+}
+
 fn mountpoint(name: &str, region: &str, advertise: bool) -> Mountpoint {
     Mountpoint {
         schema_version: 1,
@@ -448,6 +470,10 @@ fn mountpoint(name: &str, region: &str, advertise: bool) -> Mountpoint {
         ntrip1_upload_password_hash: None,
         advertise,
         region: Some(region.to_owned()),
+        latitude: None,
+        longitude: None,
+        coverage_radius_m: None,
+        str_fields: None,
         source_expectation: None,
         created_at: "2026-11-22T00:00:00Z".to_owned(),
         updated_at: "2026-11-22T00:00:00Z".to_owned(),

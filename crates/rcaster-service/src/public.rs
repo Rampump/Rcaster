@@ -208,6 +208,7 @@ struct PublicRecord {
     #[serde(flatten)]
     record: StrRecord,
     region: Option<String>,
+    coverage_radius_m: Option<f64>,
 }
 
 pub async fn serve_public<F>(
@@ -925,21 +926,34 @@ async fn public_records(state: &PublicState) -> BTreeMap<String, PublicRecord> {
         .hub
         .sourcetable_records()
         .into_iter()
-        .map(|record| {
-            let region = accounts
-                .mountpoint(&record.mountpoint)
-                .and_then(|mountpoint| mountpoint.region.clone());
-            (record.mountpoint.clone(), PublicRecord { record, region })
+        .map(|mut record| {
+            let configured = accounts.mountpoint(&record.mountpoint);
+            let region = configured.and_then(|mountpoint| mountpoint.region.clone());
+            let coverage_radius_m = configured.and_then(|mountpoint| mountpoint.coverage_radius_m);
+            apply_configured_position(&mut record, configured);
+            (
+                record.mountpoint.clone(),
+                PublicRecord {
+                    record,
+                    region,
+                    coverage_radius_m,
+                },
+            )
         })
         .collect::<BTreeMap<_, _>>();
     if let Some(runtime) = &state.runtime {
-        for record in runtime.sourcetable_records().await {
-            let region = accounts
-                .mountpoint(&record.mountpoint)
-                .and_then(|mountpoint| mountpoint.region.clone());
+        for mut record in runtime.sourcetable_records().await {
+            let configured = accounts.mountpoint(&record.mountpoint);
+            let region = configured.and_then(|mountpoint| mountpoint.region.clone());
+            let coverage_radius_m = configured.and_then(|mountpoint| mountpoint.coverage_radius_m);
+            apply_configured_position(&mut record, configured);
             records
                 .entry(record.mountpoint.clone())
-                .or_insert(PublicRecord { record, region });
+                .or_insert(PublicRecord {
+                    record,
+                    region,
+                    coverage_radius_m,
+                });
         }
     }
     records.retain(|name, _| {
@@ -948,6 +962,25 @@ async fn public_records(state: &PublicState) -> BTreeMap<String, PublicRecord> {
             .is_some_and(|mountpoint| mountpoint.enabled && mountpoint.advertise)
     });
     records
+}
+
+fn apply_configured_position(
+    record: &mut StrRecord,
+    configured: Option<&rcaster_core::account::Mountpoint>,
+) {
+    let missing = record
+        .latitude
+        .parse::<f64>()
+        .ok()
+        .zip(record.longitude.parse::<f64>().ok())
+        .is_none_or(|(latitude, longitude)| latitude == 0.0 && longitude == 0.0);
+    if missing
+        && let Some((latitude, longitude)) =
+            configured.and_then(|mountpoint| mountpoint.latitude.zip(mountpoint.longitude))
+    {
+        record.latitude = format!("{latitude:.7}");
+        record.longitude = format!("{longitude:.7}");
+    }
 }
 
 fn mountpoints(records: &BTreeMap<String, PublicRecord>, query: &BTreeMap<&str, &str>) -> Value {
@@ -1003,6 +1036,7 @@ fn map_stations(records: &BTreeMap<String, PublicRecord>, bbox: Option<MapBbox>)
                     "format": record.format,
                     "network": record.network,
                     "region": entry.region,
+                    "coverage_m": entry.coverage_radius_m,
                 },
             }))
         })

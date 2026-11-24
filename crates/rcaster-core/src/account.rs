@@ -30,7 +30,7 @@ pub struct User {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Mountpoint {
     pub schema_version: u8,
     pub mod_revision: u64,
@@ -41,9 +41,38 @@ pub struct Mountpoint {
     pub advertise: bool,
     pub region: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_radius_m: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub str_fields: Option<MountpointStrConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_expectation: Option<SourceExpectation>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MountpointStrConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formats: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "nav_system")]
+    pub navigation_system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solution: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -96,6 +125,7 @@ impl AccountSnapshot {
             validate_mountpoint(&mountpoint.mountpoint)
                 .map_err(|_| AccountError::InvalidMountpoint)?;
             validate_source_expectation(mountpoint.source_expectation.as_ref())?;
+            validate_mountpoint_metadata(&mountpoint)?;
             if !seen.insert(mountpoint.mountpoint.clone()) {
                 return Err(AccountError::DuplicateMountpoint);
             }
@@ -195,6 +225,23 @@ fn validate_source_expectation(
             .msm_versions
             .iter()
             .any(|version| !(1..=7).contains(version))
+    {
+        return Err(AccountError::InvalidMountpoint);
+    }
+    Ok(())
+}
+
+fn validate_mountpoint_metadata(mountpoint: &Mountpoint) -> Result<(), AccountError> {
+    if mountpoint
+        .latitude
+        .is_some_and(|latitude| !latitude.is_finite() || !(-90.0..=90.0).contains(&latitude))
+        || mountpoint.longitude.is_some_and(|longitude| {
+            !longitude.is_finite() || !(-180.0..=180.0).contains(&longitude)
+        })
+        || mountpoint.latitude.is_some() != mountpoint.longitude.is_some()
+        || mountpoint
+            .coverage_radius_m
+            .is_some_and(|radius| !radius.is_finite() || radius <= 0.0)
     {
         return Err(AccountError::InvalidMountpoint);
     }

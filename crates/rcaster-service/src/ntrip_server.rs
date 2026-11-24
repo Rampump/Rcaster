@@ -9,7 +9,7 @@ use std::{
 };
 
 use rand::Rng;
-use rcaster_core::account::SourceExpectation;
+use rcaster_core::account::{Mountpoint, SourceExpectation};
 use rcaster_core::ntrip::{
     BodyFraming, Headers, NtripVersion, Request, SourceV1Request, SourceV2Request,
     chunked::ChunkedDecoder,
@@ -798,6 +798,10 @@ where
         Some(runtime) => runtime.lease_health().await,
         None => None,
     };
+    let configured_mountpoint = config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.snapshot().mountpoint(source.mountpoint()).cloned());
 
     let operation = async {
         if version == NtripVersion::Two
@@ -821,11 +825,16 @@ where
                 config.metrics.clone(),
                 config.cluster_runtime.clone(),
                 context.remote_ip,
+                configured_mountpoint.clone(),
             )
             .await
         } else {
             let profile = rcaster_core::protocol::DataProfile::default();
-            let record = StrRecord::from_profile(source.mountpoint(), &profile);
+            let record = record_from_profile(
+                source.mountpoint(),
+                &profile,
+                configured_mountpoint.as_ref(),
+            );
             source.set_str_record(record.clone()).map_err(invalid_hub)?;
             source.set_profile(profile).map_err(invalid_hub)?;
             _permit.activate_source(&record).await?;
@@ -862,6 +871,7 @@ async fn forward_admitted_body<S>(
     metrics: Option<Arc<HealthState>>,
     runtime: Option<SharedClusterRuntime>,
     source_ip: IpAddr,
+    configured_mountpoint: Option<Mountpoint>,
 ) -> io::Result<()>
 where
     S: AsyncRead + Unpin,
@@ -869,7 +879,13 @@ where
     if let Some(expectation) = &source_expectation {
         config.policy = config.policy.with_source_expectation(expectation);
     }
-    let mut admission = AdmissionFeed::new(config.clone(), metrics, runtime, source_ip);
+    let mut admission = AdmissionFeed::new(
+        config.clone(),
+        metrics,
+        runtime,
+        source_ip,
+        configured_mountpoint,
+    );
     match framing {
         BodyFraming::Stream => {
             if !buffered.is_empty() && !admission.feed(&buffered, source, permit).await? {
@@ -1042,6 +1058,18 @@ struct AdmissionFeed {
     metrics: Option<Arc<HealthState>>,
     runtime: Option<SharedClusterRuntime>,
     source_ip: IpAddr,
+    configured_mountpoint: Option<Mountpoint>,
+}
+
+fn record_from_profile(
+    mountpoint: &str,
+    profile: &rcaster_core::protocol::DataProfile,
+    configured: Option<&Mountpoint>,
+) -> StrRecord {
+    configured.map_or_else(
+        || StrRecord::from_profile(mountpoint, profile),
+        |configured| StrRecord::from_profile_and_mountpoint(mountpoint, profile, configured),
+    )
 }
 
 impl AdmissionFeed {
@@ -1050,6 +1078,7 @@ impl AdmissionFeed {
         metrics: Option<Arc<HealthState>>,
         runtime: Option<SharedClusterRuntime>,
         source_ip: IpAddr,
+        configured_mountpoint: Option<Mountpoint>,
     ) -> Self {
         Self {
             window: SourceAdmissionWindow::new(config.policy, config.max_bytes, config.max_frames),
@@ -1058,6 +1087,7 @@ impl AdmissionFeed {
             metrics,
             runtime,
             source_ip,
+            configured_mountpoint,
         }
     }
 
@@ -1090,7 +1120,11 @@ impl AdmissionFeed {
         match self.window.push(bytes) {
             WindowOutcome::Pending => Ok(true),
             WindowOutcome::Accepted { bytes, .. } => {
-                let record = StrRecord::from_profile(source.mountpoint(), self.window.profile());
+                let record = record_from_profile(
+                    source.mountpoint(),
+                    self.window.profile(),
+                    self.configured_mountpoint.as_ref(),
+                );
                 source.set_str_record(record.clone()).map_err(invalid_hub)?;
                 source
                     .set_profile(self.window.profile().clone())
@@ -1142,7 +1176,11 @@ impl AdmissionFeed {
                     return Ok(());
                 }
             };
-            let record = StrRecord::from_profile(source.mountpoint(), self.window.profile());
+            let record = record_from_profile(
+                source.mountpoint(),
+                self.window.profile(),
+                self.configured_mountpoint.as_ref(),
+            );
             source.set_str_record(record.clone()).map_err(invalid_hub)?;
             source
                 .set_profile(self.window.profile().clone())

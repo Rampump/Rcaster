@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures_util::{SinkExt, StreamExt};
-use rcaster_core::account::{Mountpoint, SourceExpectation, User, UserRole};
+use rcaster_core::account::{Mountpoint, MountpointStrConfig, SourceExpectation, User, UserRole};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -1495,6 +1495,30 @@ async fn handle(
                     }
                 },
             };
+            let Ok(latitude) = parse_optional_number(&body, "latitude") else {
+                return Ok(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid latitude"}),
+                ));
+            };
+            let Ok(longitude) = parse_optional_number(&body, "longitude") else {
+                return Ok(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid longitude"}),
+                ));
+            };
+            let Ok(coverage_radius_m) = parse_optional_number(&body, "coverage_radius_m") else {
+                return Ok(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid coverage radius"}),
+                ));
+            };
+            let Ok(str_fields) = parse_optional_str_fields(&body) else {
+                return Ok(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid STR fields"}),
+                ));
+            };
             let mountpoint = Mountpoint {
                 schema_version: 1,
                 mod_revision: 0,
@@ -1510,6 +1534,10 @@ async fn handle(
                     .get("region")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                latitude,
+                longitude,
+                coverage_radius_m,
+                str_fields,
                 source_expectation,
                 created_at: now.clone(),
                 updated_at: now,
@@ -1590,6 +1618,43 @@ async fn handle(
             }
             if let Some(region) = body.get("region") {
                 updated.region = region.as_str().map(str::to_owned);
+            }
+            if body.get("latitude").is_some() {
+                let Ok(latitude) = parse_optional_number(&body, "latitude") else {
+                    return Ok(response(
+                        400,
+                        json!({"code":"BAD_REQUEST","message":"invalid latitude"}),
+                    ));
+                };
+                updated.latitude = latitude;
+            }
+            if body.get("longitude").is_some() {
+                let Ok(longitude) = parse_optional_number(&body, "longitude") else {
+                    return Ok(response(
+                        400,
+                        json!({"code":"BAD_REQUEST","message":"invalid longitude"}),
+                    ));
+                };
+                updated.longitude = longitude;
+            }
+            if body.get("coverage_radius_m").is_some() {
+                let Ok(coverage_radius_m) = parse_optional_number(&body, "coverage_radius_m")
+                else {
+                    return Ok(response(
+                        400,
+                        json!({"code":"BAD_REQUEST","message":"invalid coverage radius"}),
+                    ));
+                };
+                updated.coverage_radius_m = coverage_radius_m;
+            }
+            if body.get("str_fields").is_some() {
+                let Ok(str_fields) = parse_optional_str_fields(&body) else {
+                    return Ok(response(
+                        400,
+                        json!({"code":"BAD_REQUEST","message":"invalid STR fields"}),
+                    ));
+                };
+                updated.str_fields = str_fields;
             }
             if let Some(value) = body.get("source_expectation") {
                 updated.source_expectation = if value.is_null() {
@@ -2686,10 +2751,30 @@ fn mountpoint_view(mountpoint: &rcaster_core::account::Mountpoint) -> Value {
         "enabled": mountpoint.enabled,
         "advertise": mountpoint.advertise,
         "region": mountpoint.region,
+        "latitude": mountpoint.latitude,
+        "longitude": mountpoint.longitude,
+        "coverage_radius_m": mountpoint.coverage_radius_m,
+        "str_fields": mountpoint.str_fields,
         "source_expectation": mountpoint.source_expectation,
         "created_at": mountpoint.created_at,
         "updated_at": mountpoint.updated_at,
     })
+}
+
+fn parse_optional_number(body: &Value, key: &str) -> Result<Option<f64>, ()> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_f64().map(Some).ok_or(()),
+    }
+}
+
+fn parse_optional_str_fields(body: &Value) -> Result<Option<MountpointStrConfig>, ()> {
+    match body.get("str_fields") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| ()),
+    }
 }
 
 fn account_error_response(error: AccountDirectoryError) -> Vec<u8> {
