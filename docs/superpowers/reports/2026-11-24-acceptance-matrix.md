@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-24 23:12 CST
+Status date: 2026-11-24 23:29 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -93,6 +93,9 @@ Local verification for this remediation:
   pass.
 - Release build: pass; `target/release/rcaster` SHA-256
   `C822F31EBE2E57FEAAF34D3433BBC70E091BDE6F8F705A29C1D9F5C91030B78D`.
+- The complete four-command gate was rerun on the current working tree on
+  2026-11-24 23:29 CST with exit code 0. Documentation-only commits do not
+  change the verified source code or release artifact.
 
 None of this remediation was deployed, pushed, or connected to the four soak
 servers. The deployed soak candidate and its 72-hour evidence remain the frozen
