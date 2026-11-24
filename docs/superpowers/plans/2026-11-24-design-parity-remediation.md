@@ -309,6 +309,12 @@ The test is `uploaded_rtcm3_generates_active_etcd_str_record`.
 The same test accepts `RCASTER_SERIAL_CAPTURE=<path>` to replace synthetic
 RTCM3 with a temporary capture from the real local COM3 module.
 
+The follow-on test
+`second_caster_serves_cached_etcd_str_without_local_source` starts two local
+Casters against the same etcd. Source Caster A uploads RTCM, Caster B converges
+its `SourceWatcher` cache, and a client connected to B receives `STR;C66` from
+B's locally generated source table. B never owns or hosts the source.
+
 ### Task 2: Observe Unknown Streams and Deadline Semantics
 
 **Status:** Complete locally.
@@ -559,7 +565,9 @@ git commit -m "fix: add source health warnings and metrics"
 
 ### Task 5: NEAR Spatial Index and Limits
 
-**Status:** Spatial index and revision-based cache implemented locally; remaining GGA/query limit configuration is still open.
+**Status:** Complete locally. The spatial index, revision cache, GGA rate/jump
+guards, query rate/concurrency limiter, position TTL and fixed-label metrics are
+implemented. A live CRTK.NET test also models 1,302 public RTCM3 STR candidates.
 
 **Files:**
 - Modify: `crates/rcaster-service/src/near.rs`
@@ -572,7 +580,7 @@ git commit -m "fix: add source health warnings and metrics"
 - Consumes: `NearSource` candidates.
 - Produces: bounded spatial index refresh and query limiter.
 
-- [ ] **Step 1: Add failing near-query test**
+- [x] **Step 1: Add failing near-query test**
 
 ```rust
 #[test]
@@ -584,26 +592,26 @@ fn near_index_returns_same_source_as_full_scan() {
 }
 ```
 
-- [ ] **Step 2: Add config fields**
+- [x] **Step 2: Add config fields**
 
 Add `max_spatial_queries_per_second`, `max_query_concurrency`, `gga_max_input_per_second`, `gga_max_jump_speed_mps`, `position_ttl_s` and `position_ttl_action` with design-compatible defaults.
 
-- [ ] **Step 3: Implement a fixed-grid spatial index**
+- [x] **Step 3: Implement a fixed-grid spatial index**
 
 Use a latitude/longitude cell index rebuilt when STR revision changes. Query neighboring cells until the current minimum distance proves remaining cells cannot contain closer candidates.
 
-- [ ] **Step 4: Apply global and per-client limits**
+- [x] **Step 4: Apply global and per-client limits**
 
 Return no switch when a limit is hit and increment fixed-label metrics. Preserve current GGA drop behavior.
 
-- [ ] **Step 5: Run NEAR tests**
+- [x] **Step 5: Run NEAR tests**
 
 ```powershell
 cargo test -p rcaster-service --test near --locked
 cargo test -p rcaster-service --test ntrip_server near_ --locked
 ```
 
-- [ ] **Step 6: Commit locally**
+- [x] **Step 6: Commit locally**
 
 ```powershell
 git add crates/rcaster-service/src/near.rs crates/rcaster-service/src/ntrip_server.rs crates/rcaster-app/src/config.rs
@@ -611,6 +619,8 @@ git commit -m "fix: bound NEAR spatial queries"
 ```
 
 ### Task 6: Admin Filters, Monitor Generation and Dashboard
+
+**Status:** Complete locally.
 
 **Files:**
 - Modify: `crates/rcaster-service/src/admin.rs`
@@ -624,7 +634,7 @@ git commit -m "fix: bound NEAR spatial queries"
 - Produces: `validation_result`, `expected_format_mismatch` and `msm_version` source filters.
 - Produces: source-generation-bound `MonitorTicket`.
 
-- [ ] **Step 1: Add failing source-filter test**
+- [x] **Step 1: Add failing source-filter test**
 
 ```rust
 assert_eq!(
@@ -633,7 +643,7 @@ assert_eq!(
 );
 ```
 
-- [ ] **Step 2: Add failing monitor-generation test**
+- [x] **Step 2: Add failing monitor-generation test**
 
 ```rust
 let ticket = issue_ticket_for_generation(1001).await;
@@ -641,22 +651,22 @@ replace_source_with_generation(1002).await;
 assert_source_changed_closes_websocket(ticket).await;
 ```
 
-- [ ] **Step 3: Implement filters and generation check**
+- [x] **Step 3: Implement filters and generation check**
 
 Add `source_generation: u64` to `MonitorTicket`. Compare it on every monitor tick. Add the three missing source filters and include validation summary fields in list responses.
 
-- [ ] **Step 4: Hide write controls in service mode**
+- [x] **Step 4: Hide write controls in service mode**
 
 When `session.kind=service`, hide create/edit/delete controls and show a persistent read-only label. Keep server-side 403 enforcement.
 
-- [ ] **Step 5: Run admin and public tests**
+- [x] **Step 5: Run admin and public tests**
 
 ```powershell
 cargo test -p rcaster-service --test admin_api --locked
 cargo test -p rcaster-service --test public_api --locked
 ```
 
-- [ ] **Step 6: Commit locally**
+- [x] **Step 6: Commit locally**
 
 ```powershell
 git add crates/rcaster-service/src/admin.rs crates/rcaster-service/src/public_auth.rs crates/rcaster-service/src/public.rs
@@ -664,6 +674,8 @@ git commit -m "fix: tighten management and monitor semantics"
 ```
 
 ### Task 7: Standalone Blacklist
+
+**Status:** Complete locally.
 
 **Files:**
 - Modify: `crates/rcaster-service/src/account_store.rs`
@@ -677,7 +689,7 @@ git commit -m "fix: tighten management and monitor semantics"
 - Consumes: `BlacklistRule`.
 - Produces: standalone `list/put/delete` methods using a dedicated redb table.
 
-- [ ] **Step 1: Add failing persistence test**
+- [x] **Step 1: Add failing persistence test**
 
 ```rust
 #[test]
@@ -692,22 +704,22 @@ fn standalone_blacklist_round_trips_across_reopen() {
 }
 ```
 
-- [ ] **Step 2: Implement dedicated table and directory methods**
+- [x] **Step 2: Implement dedicated table and directory methods**
 
 Do not mix rules into the users or mountpoints table. Validate normalized CIDR uniqueness before write.
 
-- [ ] **Step 3: Wire standalone admin and admission**
+- [x] **Step 3: Wire standalone admin and admission**
 
 When `runtime=None`, route blacklist CRUD to the Account Store and reload the local limiter immediately.
 
-- [ ] **Step 4: Run account and admin tests**
+- [x] **Step 4: Run account and admin tests**
 
 ```powershell
 cargo test -p rcaster-service --test account_store --locked
 cargo test -p rcaster-service --test admin_api --locked
 ```
 
-- [ ] **Step 5: Commit locally**
+- [x] **Step 5: Commit locally**
 
 ```powershell
 git add crates/rcaster-service/src/account_store.rs crates/rcaster-service/src/account_directory.rs crates/rcaster-service/src/admin.rs crates/rcaster-service/src/ntrip_server.rs
@@ -715,6 +727,8 @@ git commit -m "fix: persist blacklist rules in standalone mode"
 ```
 
 ### Task 8: Full Local Verification
+
+**Status:** Complete locally.
 
 **Files:**
 - Modify: `docs/工作日记.md`
@@ -724,35 +738,35 @@ git commit -m "fix: persist blacklist rules in standalone mode"
 - Consumes: all previous tasks.
 - Produces: verified local status and handoff record.
 
-- [ ] **Step 1: Run formatting**
+- [x] **Step 1: Run formatting**
 
 ```powershell
 cargo fmt --all -- --check
 ```
 
-- [ ] **Step 2: Run the full workspace**
+- [x] **Step 2: Run the full workspace**
 
 ```powershell
 wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "RTKLIB_SOURCE_DIR=/tmp/RTKLIB cargo test --workspace --all-features --locked"
 ```
 
-- [ ] **Step 3: Run Clippy**
+- [x] **Step 3: Run Clippy**
 
 ```powershell
 wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "RTKLIB_SOURCE_DIR=/tmp/RTKLIB cargo clippy --workspace --all-features --all-targets --locked -- -D warnings"
 ```
 
-- [ ] **Step 4: Run release build**
+- [x] **Step 4: Run release build**
 
 ```powershell
 wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "RTKLIB_SOURCE_DIR=/tmp/RTKLIB cargo build --release -p rcaster-app --bin rcaster --all-features --locked"
 ```
 
-- [ ] **Step 5: Update records**
+- [x] **Step 5: Update records**
 
 Record changed behavior, remaining gaps and the fact that the soak candidate was not touched or redeployed.
 
-- [ ] **Step 6: Commit locally and do not push**
+- [x] **Step 6: Commit locally and do not push**
 
 ```powershell
 git add docs/工作日记.md docs/superpowers/reports/2026-11-24-acceptance-matrix.md

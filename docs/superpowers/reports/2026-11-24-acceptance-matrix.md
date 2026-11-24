@@ -1,12 +1,15 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-24 20:25 CST
+Status date: 2026-11-24 22:14 CST
 
-Deployed release:
+Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
 
-Source code commit:
+Deployed soak source code commit:
 `9bdc2f8`
+
+Local remediation commit:
+`58e6090` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -26,21 +29,60 @@ not be described as final production acceptance.
 
 | Design section | Current status | Authoritative evidence | Remaining proof |
 |---|---|---|---|
-| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. | More receiver models; real CMR/CMR+ capture; a few public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
+| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. A live CRTK.NET test models 1,302 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. | More receiver models; real CMR/CMR+ capture; public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
 | 18.2 Consistency and ownership | Verified | `source_fencing`, `user_admission`, `revision_admission`, `config_revision`, `cluster_runtime`, `blacklist_write`, `account_directory`, `connections` and `upgrade` integration tests cover races, stale revisions, generation/connection fencing, owner commands and cleanup. Live cluster ownership was checked at 3/2/3/2 across four nodes. | Re-run the same assertions after the 72-hour run exits to prove no orphan state remains. |
 | 18.3 Capacity | Partial | Target-node probes completed 10 sources/8,000 subscribers, 1 source/10,000 subscribers and 10,000 mountpoints. Coordinator spikes achieved about 1,000 admissions/s for independent users, hot users and shared NAT IPs. | The design's 500-source and 100-relay per-node combination has not been exercised as one long run; current acceptance relay run uses 10 sources/50 subscribers. |
 | 18.4 Stability | Pending | Pre-runs showed zero restarts and bounded RSS/FD. The current frozen candidate is running four local and one cross-region soak units. | Successful completion of all five 259,200-second runs, final RSS/FD curves, zero restart, empty stderr and clean post-run state. |
 | 18.5 Security | Partial | Automated tests cover forced TLS, mTLS etcd/relay, admin authorization, CSRF, token scope escalation, trusted proxy IP handling, WebSocket origin, private-key permissions and log redaction paths. RustSec scanned 248 dependencies with no known vulnerability. Live checks confirmed public plaintext 2101 is closed and private SOAK sources are absent from TLS source tables. | A formal long-running fuzz campaign for the RTKLIB worker and protocol decoders; production certificate/OCSP validation. |
 | 18.6 Multi-protocol regression | Partial | Frozen official RTCM2/RTCM3 fixtures and a 17.6 MB real BINEX stream pass across chunk boundaries. Deterministic malformed, split, oversized and resynchronization cases pass for RTCM2, RTCM3, BINEX, CMR/CMR+, NMEA and mixed streams. | No public, traceable real CMR/CMR+ capture was found; CMR remains structurally validated with synthetic fixtures only. |
 | 18.7 NTRIP compatibility | Partial | Byte-level request/response tests pass. Live clients include RTKLIB `str2str`, Windows `strsvr`, BKG BNC 2.13.7, Lefebure 2017.07.27, u-center 25.03 and the local CH340 RTK base. | Additional commercial clients and receiver models remain explicitly `NOT VERIFIED`. |
-| 18.8 STR lifecycle | Verified | NTRIP, source-fencing, cluster-runtime and public API tests cover VALIDATING visibility, ACTIVE publication, private filtering, source generation changes, remote owner routing and removal. | Confirm the final soak sources disappear and public/private source tables converge after cleanup. |
-| 18.9 etcd Watch | Verified | Config, blacklist and account watch tests cover snapshot-before-watch, incremental updates, compaction/reconnect, silent-stall detection, leader failure and full-quorum recovery. | Final soak exit check should confirm no watch-related warnings and the expected cleaned key set. |
+| 18.8 STR lifecycle | Verified | NTRIP, source-fencing, cluster-runtime and public API tests cover VALIDATING visibility, ACTIVE publication, private filtering, source generation changes, remote owner routing and removal. `second_caster_serves_cached_etcd_str_without_local_source` proves source Caster A uploads RTCM to etcd, edge Caster B converges its local watcher cache, and B serves `STR;C66` from its locally generated source table without owning the source. | Confirm the final soak sources disappear and public/private source tables converge after cleanup. |
+| 18.9 etcd Watch | Verified | Config, blacklist, source and account watch tests cover snapshot-before-watch, incremental updates, compaction/reconnect, silent-stall detection, leader failure and full-quorum recovery. The two-Caster STR test confirms etcd changes converge into the edge source cache and are served locally. | Final soak exit check should confirm no watch-related warnings and the expected cleaned key set. |
 | 18.10 Ownership and reconnect | Verified | Automated tests cover owner-only writes, runtime epoch changes, source generation fencing, lease expiry, stale cache replacement and old-connection rejection. | Repeat a post-window orphan-key and source/session count audit. |
 | 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download and slot switching. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
 | 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. The admin dashboard was loaded through real mTLS and service-token authentication. | Public web is not exposed on this test deployment (`public_bind=null`); external DNS/LB, real tile service, large-map behavior and production monitor load remain unverified. |
 
-## Current Candidate Evidence
+## Local Design-Parity Remediation
+
+Commit `58e6090` closes the remaining code gaps tracked by
+`docs/superpowers/plans/2026-11-24-design-parity-remediation.md`:
+
+- NEAR now enforces per-client GGA input rate and jump speed, global query QPS
+  and concurrency, position TTL, and fixed-label NEAR metrics.
+- A live CRTK.NET test pulls the public STR table and builds the same NEAR model
+  used at runtime. The run found 1,302 RTCM3 candidates and all 26 sampled
+  fixed-grid queries matched a full Haversine scan.
+- The cross-Caster STR cache path is covered by an integration test: source
+  Caster A uploads RTCM through NTRIP, edge Caster B converges its etcd source
+  watch cache, and B serves the resulting `STR;C66` from its local source table
+  while owning no source.
+- Public monitor tickets are bound to source generation and close a live
+  WebSocket with `SOURCE_CHANGED` after generation 1001 is replaced by 1002.
+- Service-token management sessions are read-only in both the browser and the
+  server: write controls are hidden and all write requests return 403.
+- Standalone blacklist rules persist in a dedicated redb table, use normalized
+  CIDR uniqueness and revision CAS, reload immediately, and deny matching
+  clients before authentication when quota is zero.
+- The real local COM3 capture again passed
+  `uploaded_rtcm3_generates_active_etcd_str_record`: upload, RTCM parsing,
+  admission, ACTIVE source generation and etcd STR creation with 1005/1074 and
+  non-zero coordinates.
+
+Local verification for this remediation:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test --workspace --all-features --locked`: pass.
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`:
+  pass.
+- Release build: pass; `target/release/rcaster` SHA-256
+  `D3D6972DF74B685ED9D21C57D7927E370FDB25972FEA55FBAC5E42155DE00F12`.
+
+None of this remediation was deployed, pushed, or connected to the four soak
+servers. The deployed soak candidate and its 72-hour evidence remain the frozen
+`76f542d...` artifact.
+
+## Frozen Deployed Soak Candidate Evidence
 
 The final candidate passed:
 
