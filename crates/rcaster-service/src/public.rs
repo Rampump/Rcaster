@@ -209,6 +209,7 @@ struct PublicRecord {
     record: StrRecord,
     region: Option<String>,
     coverage_radius_m: Option<f64>,
+    source_generation: Option<u64>,
 }
 
 pub async fn serve_public<F>(
@@ -527,13 +528,20 @@ where
                 ))
                 .await;
         }
-        if !public_records(state).await.contains_key(mountpoint) {
+        let records = public_records(state).await;
+        let Some(record) = records.get(mountpoint) else {
             return stream
                 .write_all(&response(404, json!({"code":"NOT_FOUND"})))
                 .await;
-        }
-        return match public_auth::issue_ticket(&state.accounts, &identity, mountpoint, peer_ip)
-            .await
+        };
+        return match public_auth::issue_ticket(
+            &state.accounts,
+            &identity,
+            mountpoint,
+            peer_ip,
+            record.source_generation,
+        )
+        .await
         {
             Ok(ticket) => {
                 let cookie = format!(
@@ -575,17 +583,25 @@ where
                 .write_all(&response(401, json!({"code":"TICKET_REQUIRED"})))
                 .await;
         };
-        let identity =
+        let (identity, source_generation) =
             match public_auth::consume_ticket(&state.accounts, ticket, mountpoint, peer_ip).await {
-                Ok(identity) => identity,
+                Ok(value) => value,
                 Err(_) => {
                     return stream
                         .write_all(&response(401, json!({"code":"INVALID_TICKET"})))
                         .await;
                 }
             };
-        return serve_public_websocket(stream, state, &headers, mountpoint, identity, peer_ip)
-            .await;
+        return serve_public_websocket(
+            stream,
+            state,
+            &headers,
+            mountpoint,
+            identity,
+            peer_ip,
+            source_generation,
+        )
+        .await;
     }
     if method != "GET" {
         return stream
@@ -743,6 +759,7 @@ async fn serve_public_websocket<S>(
     mountpoint: &str,
     identity: PublicIdentity,
     peer_ip: &str,
+    source_generation: Option<u64>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -827,7 +844,9 @@ where
                         .await;
                     break;
                 }
-                let Some(snapshot) = monitor_snapshot(state, mountpoint).await else {
+                let Some((current_generation, snapshot)) =
+                    monitor_snapshot(state, mountpoint).await
+                else {
                     let _ = websocket
                         .send(Message::Text(
                             json!({"type":"monitor_closed","reason":"SOURCE_CHANGED"})
@@ -837,6 +856,16 @@ where
                         .await;
                     break;
                 };
+                if source_generation.is_some() && current_generation != source_generation {
+                    let _ = websocket
+                        .send(Message::Text(
+                            json!({"type":"monitor_closed","reason":"SOURCE_CHANGED"})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                    break;
+                }
                 if !matches!(
                     timeout(
                         Duration::from_secs(2),
@@ -868,37 +897,41 @@ where
     Ok(())
 }
 
-async fn monitor_snapshot(state: &PublicState, mountpoint: &str) -> Option<Value> {
+async fn monitor_snapshot(state: &PublicState, mountpoint: &str) -> Option<(Option<u64>, Value)> {
     let mut records = public_records(state).await;
     let entry = records.remove(mountpoint)?;
+    let source_generation = entry.source_generation;
     let health = state.hub.source_health(mountpoint);
     let profile = state.hub.source_profile(mountpoint);
-    Some(json!({
-        "str": entry,
-        "subscribers": state.hub.subscriber_count(mountpoint).unwrap_or_default(),
-        "profile": profile.map(|profile| json!({
-            "satellite_count": profile.satellite_count,
-            "satellite_ids": profile.satellite_ids.iter().copied().collect::<Vec<_>>(),
-            "signal_count": profile.signal_count,
-            "signal_ids": profile.signal_ids.iter().copied().collect::<Vec<_>>(),
-            "msm_versions": profile.msm_versions.iter().copied().collect::<Vec<_>>(),
-            "satellites": profile.satellite_positions.iter().map(|satellite| json!({
-                "system": satellite.system,
-                "prn": satellite.prn,
-                "elevation_deg": satellite.elevation_deg,
-                "azimuth_deg": satellite.azimuth_deg,
-                "snr_db": satellite.snr_db,
-            })).collect::<Vec<_>>(),
-            "satellite_cn0_db_hz": profile.satellite_cn0_q4.iter().map(|(prn, cn0_q4)| {
-                (prn.to_string(), json!(f64::from(*cn0_q4) / 4.0))
-            }).collect::<serde_json::Map<_, _>>(),
-            "msm_observation_count": profile.msm_observations.len(),
-            "msm_observations": profile.msm_observations.iter().map(observation_view).collect::<Vec<_>>(),
-        })),
-        "bitrate_bps": health.and_then(|health| health.bitrate_bps),
-        "last_packet_age_seconds": health.and_then(|health| health.last_packet_age_seconds),
-        "stream_health_warning": health.is_some_and(|health| health.warning_codes != 0),
-    }))
+    Some((
+        source_generation,
+        json!({
+            "str": entry,
+            "subscribers": state.hub.subscriber_count(mountpoint).unwrap_or_default(),
+            "profile": profile.map(|profile| json!({
+                "satellite_count": profile.satellite_count,
+                "satellite_ids": profile.satellite_ids.iter().copied().collect::<Vec<_>>(),
+                "signal_count": profile.signal_count,
+                "signal_ids": profile.signal_ids.iter().copied().collect::<Vec<_>>(),
+                "msm_versions": profile.msm_versions.iter().copied().collect::<Vec<_>>(),
+                "satellites": profile.satellite_positions.iter().map(|satellite| json!({
+                    "system": satellite.system,
+                    "prn": satellite.prn,
+                    "elevation_deg": satellite.elevation_deg,
+                    "azimuth_deg": satellite.azimuth_deg,
+                    "snr_db": satellite.snr_db,
+                })).collect::<Vec<_>>(),
+                "satellite_cn0_db_hz": profile.satellite_cn0_q4.iter().map(|(prn, cn0_q4)| {
+                    (prn.to_string(), json!(f64::from(*cn0_q4) / 4.0))
+                }).collect::<serde_json::Map<_, _>>(),
+                "msm_observation_count": profile.msm_observations.len(),
+                "msm_observations": profile.msm_observations.iter().map(observation_view).collect::<Vec<_>>(),
+            })),
+            "bitrate_bps": health.and_then(|health| health.bitrate_bps),
+            "last_packet_age_seconds": health.and_then(|health| health.last_packet_age_seconds),
+            "stream_health_warning": health.is_some_and(|health| health.warning_codes != 0),
+        }),
+    ))
 }
 
 fn observation_view(observation: &rcaster_core::protocol::GnssObservation) -> Value {
@@ -937,22 +970,34 @@ async fn public_records(state: &PublicState) -> BTreeMap<String, PublicRecord> {
                     record,
                     region,
                     coverage_radius_m,
+                    source_generation: None,
                 },
             )
         })
         .collect::<BTreeMap<_, _>>();
     if let Some(runtime) = &state.runtime {
         for mut record in runtime.sourcetable_records().await {
+            let source_generation = runtime
+                .source_route(&record.mountpoint)
+                .await
+                .map(|route| route.source_generation);
             let configured = accounts.mountpoint(&record.mountpoint);
             let region = configured.and_then(|mountpoint| mountpoint.region.clone());
             let coverage_radius_m = configured.and_then(|mountpoint| mountpoint.coverage_radius_m);
             apply_configured_position(&mut record, configured);
             records
                 .entry(record.mountpoint.clone())
+                .and_modify(|entry| {
+                    entry.record = record.clone();
+                    entry.region = region.clone();
+                    entry.coverage_radius_m = coverage_radius_m;
+                    entry.source_generation = source_generation;
+                })
                 .or_insert(PublicRecord {
                     record,
                     region,
                     coverage_radius_m,
+                    source_generation,
                 });
         }
     }

@@ -93,6 +93,60 @@ fn resolves_standalone_backup_directory_and_rejects_zero_interval() {
 }
 
 #[test]
+fn loads_and_validates_near_resource_limits() {
+    let directory = TempDirectory::new();
+    let path = directory.path().join("caster.json");
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "account_db": "accounts.redb",
+            "client_auth_require_tls": false,
+            "source_auth_require_tls": false,
+            "near": {
+                "enabled": true,
+                "mountpoint": "AUTO_NEAR",
+                "no_source_timeout_ms": 1000,
+                "gga_max_input_per_second": 5,
+                "max_spatial_queries_per_second": 100,
+                "max_query_concurrency": 2,
+                "position_ttl_s": 30,
+                "position_ttl_action": "exclude_candidate"
+            }
+        }"#,
+    )
+    .expect("write NEAR config");
+    let config = StandaloneConfig::load(&path).expect("load NEAR config");
+    let near = config.near.expect("NEAR config");
+    assert_eq!(near.gga_max_input_per_second, 5);
+    assert_eq!(near.max_spatial_queries_per_second, 100);
+    assert_eq!(near.max_query_concurrency, 2);
+    assert_eq!(near.position_ttl_s, 30);
+    assert_eq!(near.position_ttl_action, "exclude_candidate");
+
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "account_db": "accounts.redb",
+            "client_auth_require_tls": false,
+            "source_auth_require_tls": false,
+            "near": {
+                "enabled": true,
+                "mountpoint": "AUTO_NEAR",
+                "no_source_timeout_ms": 1000,
+                "position_ttl_action": "nearest"
+            }
+        }"#,
+    )
+    .expect("write invalid NEAR config");
+    assert!(matches!(
+        StandaloneConfig::load(&path),
+        Err(ConfigError::InvalidSourceAdmission)
+    ));
+}
+
+#[test]
 fn requires_tls_for_authenticated_transports_by_default() {
     let directory = TempDirectory::new();
     let path = directory.path().join("caster.json");

@@ -152,12 +152,44 @@ impl Default for SourceHealthPolicyFile {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct NearConfigFile {
     pub enabled: bool,
     pub mountpoint: String,
     #[serde(default)]
     pub advertise: bool,
+    #[serde(default = "default_near_max_distance_m")]
+    pub max_distance_m: f64,
+    #[serde(default = "default_near_hysteresis_m")]
+    pub hysteresis_m: f64,
+    #[serde(default = "default_near_base_position_uncertainty_m")]
+    pub base_position_uncertainty_m: f64,
+    #[serde(default = "default_near_hdop_m_per_unit")]
+    pub hdop_m_per_unit: f64,
+    #[serde(default = "default_near_max_hdop")]
+    pub max_hdop: f32,
+    #[serde(default = "default_near_switch_observe_ms")]
+    pub switch_observe_ms: u64,
+    #[serde(default = "default_near_switch_position_threshold_m")]
+    pub switch_position_threshold_m: f64,
+    #[serde(default = "default_near_min_recompute_interval_ms")]
+    pub min_recompute_interval_ms: u64,
+    #[serde(default = "default_near_max_recompute_interval_ms")]
+    pub max_recompute_interval_ms: u64,
+    #[serde(default = "default_near_min_recompute_distance_m")]
+    pub min_recompute_distance_m: f64,
+    #[serde(default = "default_near_max_spatial_qps")]
+    pub max_spatial_queries_per_second: u32,
+    #[serde(default = "default_near_max_query_concurrency")]
+    pub max_query_concurrency: usize,
+    #[serde(default = "default_near_gga_max_input_per_second")]
+    pub gga_max_input_per_second: u32,
+    #[serde(default = "default_near_gga_max_jump_speed_mps")]
+    pub gga_max_jump_speed_mps: f64,
+    #[serde(default)]
+    pub position_ttl_s: u64,
+    #[serde(default = "default_near_position_ttl_action")]
+    pub position_ttl_action: String,
     #[serde(default = "default_near_no_source_timeout_ms")]
     pub no_source_timeout_ms: u64,
 }
@@ -579,7 +611,30 @@ impl StandaloneConfig {
                     .mountpoint
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-                || near.no_source_timeout_ms == 0)
+                || near.no_source_timeout_ms == 0
+                || !near.max_distance_m.is_finite()
+                || near.max_distance_m <= 0.0
+                || !near.hysteresis_m.is_finite()
+                || near.hysteresis_m < 0.0
+                || !near.base_position_uncertainty_m.is_finite()
+                || near.base_position_uncertainty_m < 0.0
+                || !near.hdop_m_per_unit.is_finite()
+                || near.hdop_m_per_unit < 0.0
+                || !near.max_hdop.is_finite()
+                || near.max_hdop <= 0.0
+                || near.switch_observe_ms == 0
+                || !near.switch_position_threshold_m.is_finite()
+                || near.switch_position_threshold_m < 0.0
+                || near.min_recompute_interval_ms == 0
+                || near.max_recompute_interval_ms < near.min_recompute_interval_ms
+                || !near.min_recompute_distance_m.is_finite()
+                || near.min_recompute_distance_m < 0.0
+                || near.max_spatial_queries_per_second == 0
+                || near.max_query_concurrency == 0
+                || near.gga_max_input_per_second == 0
+                || !near.gga_max_jump_speed_mps.is_finite()
+                || near.gga_max_jump_speed_mps <= 0.0
+                || near.position_ttl_action != "exclude_candidate")
         {
             return Err(ConfigError::InvalidSourceAdmission);
         }
@@ -886,6 +941,66 @@ fn default_relay_idle_timeout_ms() -> u64 {
 
 fn default_near_no_source_timeout_ms() -> u64 {
     10_000
+}
+
+fn default_near_max_distance_m() -> f64 {
+    100_000.0
+}
+
+fn default_near_hysteresis_m() -> f64 {
+    5.0
+}
+
+fn default_near_base_position_uncertainty_m() -> f64 {
+    1.0
+}
+
+fn default_near_hdop_m_per_unit() -> f64 {
+    1.5
+}
+
+fn default_near_max_hdop() -> f32 {
+    2.5
+}
+
+fn default_near_switch_observe_ms() -> u64 {
+    3_000
+}
+
+fn default_near_switch_position_threshold_m() -> f64 {
+    4.0
+}
+
+fn default_near_min_recompute_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_near_max_recompute_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_near_min_recompute_distance_m() -> f64 {
+    4.0
+}
+
+fn default_near_max_spatial_qps() -> u32 {
+    10_000
+}
+
+fn default_near_max_query_concurrency() -> usize {
+    8
+}
+
+fn default_near_gga_max_input_per_second() -> u32 {
+    10
+}
+
+fn default_near_gga_max_jump_speed_mps() -> f64 {
+    1_000.0
+}
+
+fn default_near_position_ttl_action() -> String {
+    "exclude_candidate".to_owned()
 }
 
 fn resolve_relative(config_path: &Path, path: &Path) -> PathBuf {

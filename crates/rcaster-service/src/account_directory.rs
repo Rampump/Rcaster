@@ -16,6 +16,7 @@ use tokio::{
 use crate::{
     ETCD_WATCH_IDLE_TIMEOUT,
     account_store::{AccountStore, StoreError},
+    blacklist::{BlacklistError, BlacklistRule},
 };
 
 #[derive(Clone)]
@@ -25,6 +26,7 @@ pub struct AccountDirectory {
     client: Option<Arc<Mutex<Client>>>,
     cluster_id: Option<String>,
     store: Option<Arc<Mutex<AccountStore>>>,
+    blacklist: Arc<RwLock<Vec<BlacklistRule>>>,
 }
 
 pub struct AccountWatcher {
@@ -44,6 +46,7 @@ pub enum AccountDirectoryError {
     Json(serde_json::Error),
     Account(AccountError),
     Store(StoreError),
+    Blacklist(BlacklistError),
 }
 
 impl fmt::Display for AccountDirectoryError {
@@ -58,6 +61,7 @@ impl fmt::Display for AccountDirectoryError {
             Self::Json(error) => write!(formatter, "account JSON error: {error}"),
             Self::Account(error) => write!(formatter, "account snapshot error: {error}"),
             Self::Store(error) => write!(formatter, "account store error: {error}"),
+            Self::Blacklist(error) => write!(formatter, "blacklist error: {error}"),
         }
     }
 }
@@ -88,6 +92,12 @@ impl From<StoreError> for AccountDirectoryError {
     }
 }
 
+impl From<BlacklistError> for AccountDirectoryError {
+    fn from(error: BlacklistError) -> Self {
+        Self::Blacklist(error)
+    }
+}
+
 impl AccountDirectory {
     pub fn static_snapshot(snapshot: AccountSnapshot) -> Self {
         Self {
@@ -96,17 +106,23 @@ impl AccountDirectory {
             client: None,
             cluster_id: None,
             store: None,
+            blacklist: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    pub fn with_store(snapshot: AccountSnapshot, store: AccountStore) -> Self {
-        Self {
+    pub fn with_store(
+        snapshot: AccountSnapshot,
+        store: AccountStore,
+    ) -> Result<Self, AccountDirectoryError> {
+        let blacklist = store.blacklist_rules()?;
+        Ok(Self {
             snapshot: Arc::new(RwLock::new(snapshot)),
             healthy: Arc::new(AtomicBool::new(true)),
             client: None,
             cluster_id: None,
             store: Some(Arc::new(Mutex::new(store))),
-        }
+            blacklist: Arc::new(RwLock::new(blacklist)),
+        })
     }
 
     pub fn snapshot(&self) -> AccountSnapshot {
@@ -122,6 +138,56 @@ impl AccountDirectory {
 
     pub fn is_writable(&self) -> bool {
         self.client.is_some() || self.store.is_some()
+    }
+
+    pub fn blacklist_rules(&self) -> Vec<BlacklistRule> {
+        self.blacklist
+            .read()
+            .map(|rules| rules.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn blacklist_quota_for_ip(&self, address: std::net::IpAddr) -> Option<i32> {
+        let rules = self.blacklist.read().ok()?;
+        rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .filter_map(|rule| {
+                let network = crate::session_limit::IpNetwork::parse(&rule.cidr)?;
+                network
+                    .contains(address)
+                    .then_some((network.prefix(), rule.quota))
+            })
+            .max_by_key(|(prefix, _)| *prefix)
+            .map(|(_, quota)| quota)
+    }
+
+    pub async fn put_blacklist_rule(
+        &self,
+        rule: &BlacklistRule,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Err(AccountDirectoryError::InvalidCluster);
+        };
+        let store = store.lock().await;
+        let revision = store.put_blacklist_rule(rule, expected_revision)?;
+        replace_blacklist(&self.blacklist, store.blacklist_rules()?);
+        Ok(revision)
+    }
+
+    pub async fn delete_blacklist_rule(
+        &self,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<(), AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Err(AccountDirectoryError::InvalidCluster);
+        };
+        let store = store.lock().await;
+        store.delete_blacklist_rule(id, expected_revision)?;
+        replace_blacklist(&self.blacklist, store.blacklist_rules()?);
+        Ok(())
     }
 
     pub async fn refresh(&self) -> Result<AccountSnapshot, AccountDirectoryError> {
@@ -557,6 +623,7 @@ impl AccountWatcher {
             client: Some(Arc::new(Mutex::new(client.clone()))),
             cluster_id: Some(cluster_id.to_owned()),
             store: None,
+            blacklist: Arc::new(RwLock::new(Vec::new())),
         };
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_directory = directory.clone();
@@ -774,6 +841,12 @@ async fn range(
 fn replace_snapshot(snapshot: &RwLock<AccountSnapshot>, next: &AccountSnapshot) {
     if let Ok(mut current) = snapshot.write() {
         *current = next.clone();
+    }
+}
+
+fn replace_blacklist(blacklist: &RwLock<Vec<BlacklistRule>>, next: Vec<BlacklistRule>) {
+    if let Ok(mut current) = blacklist.write() {
+        *current = next;
     }
 }
 

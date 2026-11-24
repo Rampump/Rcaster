@@ -249,6 +249,14 @@ impl LocalSessionLimiter {
         &self,
         request: SessionRequest<'_>,
     ) -> Result<SessionPermit, SessionLimitError> {
+        self.try_acquire_with_ip_quota(request, None)
+    }
+
+    pub fn try_acquire_with_ip_quota(
+        &self,
+        request: SessionRequest<'_>,
+        ip_quota_override: Option<i32>,
+    ) -> Result<SessionPermit, SessionLimitError> {
         let user = request.user;
         let user_quota = user.map(|user| {
             self.inner
@@ -258,8 +266,8 @@ impl LocalSessionLimiter {
                 .copied()
                 .unwrap_or(self.inner.config.default_max_sessions)
         });
-        let ip_quota =
-            (request.kind == SessionKind::Client).then(|| self.inner.ip_quota(request.remote_ip));
+        let ip_quota = (request.kind == SessionKind::Client)
+            .then(|| ip_quota_override.unwrap_or_else(|| self.inner.ip_quota(request.remote_ip)));
 
         if user_quota.is_some_and(|quota| quota == 0) || ip_quota.is_some_and(|quota| quota == 0) {
             return Err(SessionLimitError::Exceeded);
@@ -456,7 +464,11 @@ fn default_max_ip_sessions() -> i32 {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::ConnectionLimiter;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{
+        ConnectionLimiter, LocalSessionLimiter, SessionKind, SessionLimitConfig, SessionRequest,
+    };
 
     #[test]
     fn connection_limiter_releases_capacity() {
@@ -479,5 +491,23 @@ mod tests {
         assert!(limiter.try_accept_at(start));
         assert!(!limiter.try_accept_at(start));
         assert!(limiter.try_accept_at(start + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn standalone_blacklist_quota_override_denies_client_before_auth() {
+        let limiter =
+            LocalSessionLimiter::new(SessionLimitConfig::default()).expect("session limiter");
+        assert!(
+            limiter
+                .try_acquire_with_ip_quota(
+                    SessionRequest {
+                        user: None,
+                        kind: SessionKind::Client,
+                        remote_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                    },
+                    Some(0),
+                )
+                .is_err()
+        );
     }
 }

@@ -13,7 +13,10 @@ use rcaster_service::{
     account_auth::hash_password,
     account_directory::{AccountDirectory, AccountWatcher},
     audit::AuditLog,
+    cluster_runtime::{ClusterRuntimeOptions, SharedClusterRuntime},
+    config::{CasterConfig, publish_config},
     connections::ConnectionController,
+    coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
     hub::MountpointHub,
     public::{PublicMapTiles, PublicState, serve_public},
 };
@@ -425,6 +428,218 @@ async fn public_login_ticket_and_monitor_websocket_are_single_use() {
     assert!(events.iter().any(|event| event.result == "failure"));
     assert!(events.iter().any(|event| event.result == "success"));
     let _ = std::fs::remove_file(audit_path);
+}
+
+#[tokio::test]
+async fn public_monitor_closes_when_source_generation_changes() {
+    let cluster = format!(
+        "public-generation-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let mut etcd = connect().await;
+    publish_config(&mut etcd, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, CoordinatorOptions::default())
+            .await
+            .expect("coordinator"),
+    );
+    let runtime = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        ClusterRuntimeOptions {
+            cluster_id: cluster.clone(),
+            caster_id: "caster-public".to_owned(),
+            runtime_epoch: format!("epoch-{}", std::process::id()),
+            relay_endpoint: "127.0.0.1:12102".to_owned(),
+            lease_ttl_s: 30,
+            keep_alive: true,
+        },
+    )
+    .await
+    .expect("runtime");
+    let watcher = AccountWatcher::start(
+        connect().await,
+        &cluster,
+        AccountSnapshot::new(
+            [User {
+                password_hash: hash_password("secret").expect("hash"),
+                username: "viewer".to_owned(),
+                ..user()
+            }],
+            [mountpoint("C63", "east", true)],
+        )
+        .expect("snapshot"),
+    )
+    .await
+    .expect("account watcher");
+    let accounts = watcher.directory();
+    let hub = Arc::new(MountpointHub::new(16).expect("hub"));
+    let source = activate(&hub, "C63");
+    let str_record = hub
+        .sourcetable_records()
+        .into_iter()
+        .next()
+        .expect("source STR");
+    let source_key = format!("/rcaster/{cluster}/runtime/sources/C63");
+    let source_value = |generation: u64| {
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "state": "ACTIVE",
+            "source_generation": generation,
+            "connection_id": "public-source",
+            "mountpoint": "C63",
+            "caster_id": "caster-public",
+            "runtime_epoch": "public-epoch",
+            "relay_endpoint": "127.0.0.1:12102",
+            "effective_user_id": "owner-id",
+            "created_at": "0",
+            "str": &str_record,
+        }))
+        .expect("source JSON")
+    };
+    etcd.put(source_key.clone(), source_value(1001), None)
+        .await
+        .expect("publish source generation");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime
+                .source_route("C63")
+                .await
+                .is_some_and(|route| route.source_generation == 1001)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initial source generation");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_public(
+        listener,
+        PublicState {
+            hub,
+            runtime: Some(runtime.clone()),
+            accounts,
+            relays: None,
+            audit: Default::default(),
+            websockets: Default::default(),
+            login_limiter: Default::default(),
+            monitor_starts: Default::default(),
+            map_tiles: None,
+            proxy_protocol: None,
+            connections: Arc::new(ConnectionController::default()),
+            auth_limiter: Default::default(),
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let login = request_raw(
+        address,
+        "POST",
+        "/api/v1/auth/login",
+        "",
+        r#"{"username":"viewer","password":"secret"}"#,
+    )
+    .await;
+    assert!(login.starts_with("HTTP/1.1 200 OK"));
+    let cookie = header_value(&login, "set-cookie")
+        .and_then(|value| value.split(';').next())
+        .expect("cookie")
+        .to_owned();
+    let csrf = response_json(&login)["csrf_token"]
+        .as_str()
+        .expect("csrf")
+        .to_owned();
+    let ticket_response = request_raw(
+        address,
+        "POST",
+        "/api/v1/monitors/C63/ticket",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+        "",
+    )
+    .await;
+    assert!(ticket_response.starts_with("HTTP/1.1 201 Created"));
+    let ticket_cookie = header_value(&ticket_response, "set-cookie")
+        .and_then(|value| value.split(';').next())
+        .expect("ticket cookie")
+        .to_owned();
+    let path = "/api/v1/monitors/C63/ws";
+    let mut websocket = websocket_connect(address, path, Some(&ticket_cookie))
+        .await
+        .expect("websocket");
+    let ready = tokio::time::timeout(Duration::from_secs(2), websocket.next())
+        .await
+        .expect("ready timeout")
+        .expect("ready")
+        .expect("ready frame");
+    assert!(ready.to_text().expect("ready").contains("monitor_ready"));
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), websocket.next())
+        .await
+        .expect("snapshot timeout")
+        .expect("snapshot")
+        .expect("snapshot frame");
+    assert!(
+        snapshot
+            .to_text()
+            .expect("snapshot")
+            .contains("monitor_snapshot")
+    );
+
+    etcd.put(source_key, source_value(1002), None)
+        .await
+        .expect("replace source generation");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if runtime
+                .source_route("C63")
+                .await
+                .is_some_and(|route| route.source_generation == 1002)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("replacement source generation");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = websocket
+                .next()
+                .await
+                .expect("monitor close")
+                .expect("monitor message");
+            if message
+                .to_text()
+                .is_ok_and(|text| text.contains("SOURCE_CHANGED"))
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("generation close timeout");
+    drop(websocket);
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("server").expect("public server");
+    watcher.shutdown().await;
+    drop(source);
+    runtime.shutdown().await.expect("runtime shutdown");
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
 }
 
 fn activate(hub: &MountpointHub, name: &str) -> rcaster_service::hub::SourceLease {

@@ -49,6 +49,7 @@ use crate::{
     proxy_protocol::{ProxyProtocolConfig, resolve_client_ip},
     relay::RelayManager,
     relay_grpc::RelayGrpcClient,
+    source_claim::SourceAdmissionSummary,
     tls_reload::ReloadableTlsConfig,
     upgrade::UpgradeManager,
     web_security::websocket_origin_allowed,
@@ -486,6 +487,120 @@ async fn handle(
                 json!({"code":"CSRF_INVALID","message":"invalid CSRF token"}),
             ));
         }
+    }
+    if method != "GET" && matches!(&access, Access::Service) {
+        return Ok(response(
+            403,
+            json!({"code":"FORBIDDEN","message":"service token is read-only"}),
+        ));
+    }
+    if state.runtime.is_none()
+        && matches!(method, "POST" | "PATCH")
+        && path == "/admin/v1/blacklist"
+    {
+        let Ok(body) = serde_json::from_str::<Value>(body) else {
+            return Ok(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"invalid JSON body"}),
+            ));
+        };
+        let Some(quota) = body
+            .get("quota")
+            .and_then(Value::as_i64)
+            .and_then(|quota| i32::try_from(quota).ok())
+        else {
+            return Ok(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"invalid quota"}),
+            ));
+        };
+        let rule = crate::blacklist::BlacklistRule {
+            schema_version: 1,
+            mod_revision: 0,
+            id: body
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            cidr: body
+                .get("cidr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            quota,
+            enabled: body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            description: body
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            updated_at: String::new(),
+        };
+        let expected = header(&headers, "if-match").and_then(parse_revision);
+        return match state.accounts.put_blacklist_rule(&rule, expected).await {
+            Ok(revision) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(&access),
+                    "blacklist.upsert",
+                    &rule.id,
+                    "success",
+                    json!({"cidr": rule.cidr, "quota": rule.quota}),
+                );
+                Ok(response(
+                    if method == "POST" { 201 } else { 200 },
+                    json!({"revision": revision}),
+                ))
+            }
+            Err(error) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(&access),
+                    "blacklist.upsert",
+                    &rule.id,
+                    "failure",
+                    json!({"error": error.to_string()}),
+                );
+                Ok(blacklist_directory_error_response(error))
+            }
+        };
+    }
+    if state.runtime.is_none() && method == "DELETE" && path.starts_with("/admin/v1/blacklist/") {
+        let id = &path["/admin/v1/blacklist/".len()..];
+        let Some(revision) = header(&headers, "if-match").and_then(parse_revision) else {
+            return Ok(response(
+                428,
+                json!({"code":"PRECONDITION_REQUIRED","message":"If-Match required"}),
+            ));
+        };
+        return match state.accounts.delete_blacklist_rule(id, revision).await {
+            Ok(()) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(&access),
+                    "blacklist.delete",
+                    id,
+                    "success",
+                    json!({}),
+                );
+                Ok(response(204, Value::Null))
+            }
+            Err(error) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(&access),
+                    "blacklist.delete",
+                    id,
+                    "failure",
+                    json!({"error": error.to_string()}),
+                );
+                Ok(blacklist_directory_error_response(error))
+            }
+        };
     }
     if method != "GET" {
         let Some(runtime) = &state.runtime else {
@@ -2081,11 +2196,25 @@ async fn handle(
         "/admin/v1/blacklist" => json!({
             "rules": match &state.runtime {
                 Some(runtime) => serde_json::to_value(runtime.blacklist_rules().await).unwrap_or(Value::Array(Vec::new())),
-                None => Value::Array(Vec::new()),
+                None => serde_json::to_value(state.accounts.blacklist_rules()).unwrap_or(Value::Array(Vec::new())),
             },
         }),
         path if path.starts_with("/admin/v1/blacklist/") => {
             let id = &path["/admin/v1/blacklist/".len()..];
+            if state.runtime.is_none() {
+                return match state
+                    .accounts
+                    .blacklist_rules()
+                    .into_iter()
+                    .find(|rule| rule.id == id)
+                {
+                    Some(rule) => Ok(response(200, json!({"rule": rule}))),
+                    None => Ok(response(
+                        404,
+                        json!({"code":"NOT_FOUND","message":"blacklist rule not found"}),
+                    )),
+                };
+            }
             let key = format!("/rcaster/{}/config/blacklist/{id}", state.cluster_id);
             let rule = match state.accounts.etcd_get(&key).await {
                 Ok(Some((value, revision))) => {
@@ -2802,6 +2931,29 @@ fn account_error_response(error: AccountDirectoryError) -> Vec<u8> {
     }
 }
 
+fn blacklist_directory_error_response(error: AccountDirectoryError) -> Vec<u8> {
+    match error {
+        AccountDirectoryError::Blacklist(crate::blacklist::BlacklistError::Conflict) => response(
+            409,
+            json!({"code":"CONFLICT","message":"blacklist revision conflict"}),
+        ),
+        AccountDirectoryError::Blacklist(crate::blacklist::BlacklistError::NotFound) => response(
+            404,
+            json!({"code":"NOT_FOUND","message":"blacklist rule not found"}),
+        ),
+        AccountDirectoryError::Blacklist(crate::blacklist::BlacklistError::InvalidConfig) => {
+            response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"invalid blacklist rule"}),
+            )
+        }
+        _ => response(
+            503,
+            json!({"code":"UNAVAILABLE","message":"blacklist store unavailable"}),
+        ),
+    }
+}
+
 fn now_timestamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2861,6 +3013,7 @@ struct SourceEntry {
     record: rcaster_core::str_record::StrRecord,
     caster_id: String,
     region: Option<String>,
+    admission: Option<SourceAdmissionSummary>,
 }
 
 async fn sources(state: &AdminState, query: &BTreeMap<&str, &str>) -> Result<Value, &'static str> {
@@ -2884,29 +3037,53 @@ async fn sources(state: &AdminState, query: &BTreeMap<&str, &str>) -> Result<Val
     if limit == 0 || limit > 500 {
         return Err("limit must be between 1 and 500");
     }
+    let validation_result = query.get("validation_result").copied();
+    if validation_result.is_some_and(|result| !matches!(result, "pass" | "warn" | "fail")) {
+        return Err("invalid validation_result");
+    }
+    let expected_format_mismatch = match query.get("expected_format_mismatch").copied() {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => return Err("invalid expected_format_mismatch"),
+    };
+    let msm_version = query
+        .get("msm_version")
+        .map(|value| value.parse::<u8>())
+        .transpose()
+        .map_err(|_| "invalid msm_version")?;
+    if msm_version.is_some_and(|version| !(1..=7).contains(&version)) {
+        return Err("msm_version must be between 1 and 7");
+    }
     let accounts = state.accounts.snapshot();
     let mut entries = state
         .hub
         .sourcetable_records()
         .into_iter()
         .map(|record| {
+            let admission = state
+                .hub
+                .source_profile(&record.mountpoint)
+                .map(|profile| SourceAdmissionSummary::from_profile(&profile, &[]));
             let entry = SourceEntry {
                 region: accounts
                     .mountpoint(&record.mountpoint)
                     .and_then(|mountpoint| mountpoint.region.clone()),
                 record,
                 caster_id: state.caster_id.clone(),
+                admission,
             };
             (entry.record.mountpoint.clone(), entry)
         })
         .collect::<BTreeMap<_, _>>();
     if let Some(runtime) = &state.runtime {
         for record in runtime.sourcetable_records().await {
-            let caster_id = runtime
-                .source_route(&record.mountpoint)
-                .await
-                .map(|route| route.caster_id)
+            let route = runtime.source_route(&record.mountpoint).await;
+            let caster_id = route
+                .as_ref()
+                .map(|route| route.caster_id.clone())
                 .unwrap_or_default();
+            let admission = route.and_then(|route| route.admission);
             let region = accounts
                 .mountpoint(&record.mountpoint)
                 .and_then(|mountpoint| mountpoint.region.clone());
@@ -2916,6 +3093,7 @@ async fn sources(state: &AdminState, query: &BTreeMap<&str, &str>) -> Result<Val
                     record,
                     caster_id,
                     region,
+                    admission,
                 },
             );
         }
@@ -2931,6 +3109,24 @@ async fn sources(state: &AdminState, query: &BTreeMap<&str, &str>) -> Result<Val
                 .is_none_or(|format| source_format(&entry.record.format) == format)
                 && caster_id.is_none_or(|caster_id| entry.caster_id == caster_id)
                 && region.is_none_or(|region| entry.region.as_deref() == Some(region))
+                && validation_result.is_none_or(|result| {
+                    entry
+                        .admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.validation_result == result)
+                })
+                && expected_format_mismatch.is_none_or(|expected| {
+                    entry
+                        .admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.expected_format_mismatch == expected)
+                })
+                && msm_version.is_none_or(|version| {
+                    entry
+                        .admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.msm_versions.contains(&version))
+                })
                 && cursor.is_none_or(|cursor| entry.record.mountpoint.as_str() > cursor)
         })
         .collect::<Vec<_>>();
@@ -2946,6 +3142,10 @@ async fn sources(state: &AdminState, query: &BTreeMap<&str, &str>) -> Result<Val
                 object.insert(
                     "region".to_owned(),
                     entry.region.map(Value::String).unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "admission".to_owned(),
+                    serde_json::to_value(entry.admission).unwrap_or(Value::Null),
                 );
             }
             record
@@ -3127,14 +3327,14 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 <style>body{font:15px system-ui;margin:0;background:#f5f6f8;color:#17202a}header{background:#17202a;color:white;padding:16px 24px}main{max-width:1100px;margin:24px auto;padding:0 18px}section{background:white;border:1px solid #d9dee5;border-radius:8px;padding:18px;margin-bottom:16px}input{width:360px;max-width:70%;padding:8px}button{padding:8px 14px;margin-left:8px}pre{overflow:auto;white-space:pre-wrap}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #e5e7eb;padding:7px;text-align:left}</style></head>
 <body><header><strong>RCaster Admin</strong></header><main>
 <section id="login"><h3>Administrator login</h3><label>Username <input id="username" autocomplete="username"></label><label>Password <input id="password" type="password" autocomplete="current-password"></label><button onclick="login()">Sign in</button><p id="status">Sign in to continue.</p></section>
-<section id="account" hidden><p id="account-name"></p><button onclick="logout()">Sign out</button></section>
+<section id="account" hidden><p id="account-name"></p><p id="read-only" hidden><strong>Read-only service session.</strong> Mutations are disabled.</p><button id="logout" onclick="logout()">Sign out</button></section>
 <section><h3>Cluster</h3><pre id="cluster">-</pre><h3>Sources</h3><table><thead><tr><th>Mountpoint</th><th>Format</th><th>Identifier</th><th>Action</th></tr></thead><tbody id="sources"></tbody></table></section>
 <section><h3>Source health</h3><pre id="source-health">Select Health on a source.</pre></section>
 <section><h3>Relays</h3><table><thead><tr><th>Mountpoint</th><th>Subscribers</th></tr></thead><tbody id="relays"></tbody></table></section>
-<section><h3>Users</h3><p><input id="user-id" aria-label="User ID" placeholder="user id"><input id="user-name" aria-label="Username" placeholder="username"><input id="user-password" aria-label="Password" type="password" placeholder="password (blank to keep)"><select id="user-role" aria-label="Role"><option value="user">user</option><option value="admin">admin</option></select><label><input id="user-enabled" type="checkbox" checked> enabled</label><button onclick="saveUser()">Save user</button></p><table><thead><tr><th>Username</th><th>Role</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="users"></tbody></table></section>
-<section><h3>Mountpoints</h3><p><input id="mount-name" aria-label="Mountpoint" placeholder="mountpoint"><input id="mount-owner" aria-label="Owner user ID" placeholder="owner user id"><input id="mount-password" aria-label="NTRIP1 upload password" type="password" placeholder="upload password (blank to keep)"><input id="mount-region" aria-label="Region" placeholder="region"><label><input id="mount-enabled" type="checkbox" checked> enabled</label><label><input id="mount-advertise" type="checkbox" checked> advertise</label><button onclick="saveMount()">Save mountpoint</button></p><table><thead><tr><th>Mountpoint</th><th>Owner</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="mountpoints"></tbody></table></section>
+<section><h3>Users</h3><p class="write-control"><input id="user-id" aria-label="User ID" placeholder="user id"><input id="user-name" aria-label="Username" placeholder="username"><input id="user-password" aria-label="Password" type="password" placeholder="password (blank to keep)"><select id="user-role" aria-label="Role"><option value="user">user</option><option value="admin">admin</option></select><label><input id="user-enabled" type="checkbox" checked> enabled</label><button onclick="saveUser()">Save user</button></p><table><thead><tr><th>Username</th><th>Role</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="users"></tbody></table></section>
+<section><h3>Mountpoints</h3><p class="write-control"><input id="mount-name" aria-label="Mountpoint" placeholder="mountpoint"><input id="mount-owner" aria-label="Owner user ID" placeholder="owner user id"><input id="mount-password" aria-label="NTRIP1 upload password" type="password" placeholder="upload password (blank to keep)"><input id="mount-region" aria-label="Region" placeholder="region"><label><input id="mount-enabled" type="checkbox" checked> enabled</label><label><input id="mount-advertise" type="checkbox" checked> advertise</label><button onclick="saveMount()">Save mountpoint</button></p><table><thead><tr><th>Mountpoint</th><th>Owner</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="mountpoints"></tbody></table></section>
 <section id="api-tokens-section"><h3>API tokens</h3><p><input id="api-token-name" aria-label="Token name" placeholder="token name"><select id="api-token-scope" aria-label="Scope"><option value="read">read only</option><option value="write" selected>read + write</option></select><input id="api-token-expiry" aria-label="Expiry seconds" type="number" min="0" placeholder="expiry seconds (optional)"><button onclick="createApiToken()">Create token</button></p><pre id="api-token-secret"></pre><table><thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Scopes</th><th>Expires</th><th>Action</th></tr></thead><tbody id="api-tokens"></tbody></table></section>
-<section><h3>Blacklist</h3><p><input id="bl-id" aria-label="Rule ID" placeholder="rule id"><input id="bl-cidr" aria-label="CIDR" placeholder="CIDR"><input id="bl-quota" aria-label="Quota" type="number" value="0" style="width:90px"><input id="bl-description" aria-label="Description" placeholder="description"><button onclick="addBlacklist()">Add rule</button></p><table><thead><tr><th>ID</th><th>CIDR</th><th>Quota</th><th>Enabled</th></tr></thead><tbody id="blacklist"></tbody></table></section>
+<section><h3>Blacklist</h3><p class="write-control"><input id="bl-id" aria-label="Rule ID" placeholder="rule id"><input id="bl-cidr" aria-label="CIDR" placeholder="CIDR"><input id="bl-quota" aria-label="Quota" type="number" value="0" style="width:90px"><input id="bl-description" aria-label="Description" placeholder="description"><button onclick="addBlacklist()">Add rule</button></p><table><thead><tr><th>ID</th><th>CIDR</th><th>Quota</th><th>Enabled</th></tr></thead><tbody id="blacklist"></tbody></table></section>
 <section><h3>Sessions</h3><table><thead><tr><th>Type</th><th>User</th><th>Mountpoint</th><th>Caster</th></tr></thead><tbody id="sessions"></tbody></table></section>
 <section><h3>Source cooldowns</h3><table><thead><tr><th>Mountpoint</th><th>Source IP</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead><tbody id="cooldowns"></tbody></table></section>
 </main><script>
@@ -3143,28 +3343,29 @@ let blacklistRevision=null;
 let userRevision=null,mountRevision=null;
 let csrfToken='';
 let monitorSocket=null;
-async function api(path,options={}){const method=options.method||'GET';const headers={'Content-Type':'application/json',...(options.headers||{})};if(method!=='GET')headers['X-CSRF-Token']=csrfToken;const r=await fetch(path,{...options,headers:headers});if(!r.ok)throw new Error(await r.text());return r.status===204?null:r.json();}
+let serviceReadOnly=false;
+async function api(path,options={}){const method=options.method||'GET';if(serviceReadOnly&&method!=='GET')throw new Error('Read-only service session');const headers={'Content-Type':'application/json',...(options.headers||{})};if(method!=='GET')headers['X-CSRF-Token']=csrfToken;const r=await fetch(path,{...options,headers:headers});if(!r.ok)throw new Error(await r.text());return r.status===204?null:r.json();}
 function row(cells){const tr=document.createElement('tr');for(const value of cells){const td=document.createElement('td');td.textContent=value??'';tr.append(td)}return tr}
 async function login(){try{const result=await api('/admin/v1/auth/login',{method:'POST',body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});csrfToken=result.csrf_token;document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=result.username;await load();}catch(e){status.textContent=String(e)}}
 async function logout(){try{await api('/admin/v1/auth/logout',{method:'POST'});csrfToken='';document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent='Signed out';}catch(e){status.textContent=String(e)}}
-async function load(){try{status.textContent='Loading...';const session=await api('/admin/v1/auth/session');const service=session.kind==='service';csrfToken=service?'':((await api('/admin/v1/auth/csrf')).csrf_token||'');document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=session.username||session.kind;document.getElementById('api-tokens-section').hidden=service;const c=await api('/admin/v1/cluster/status');document.getElementById('cluster').textContent=JSON.stringify(c,null,2);const s=await api('/admin/v1/sources');document.getElementById('sources').replaceChildren(...s.sources.map(sourceRow));const r=await api('/admin/v1/relays');document.getElementById('relays').replaceChildren(...r.relays.map(x=>row([x.mountpoint,x.subscribers])));const u=await api('/admin/v1/users');document.getElementById('users').replaceChildren(...u.users.map(userRow));const m=await api('/admin/v1/mountpoints');document.getElementById('mountpoints').replaceChildren(...m.mountpoints.map(mountRow));const b=await api('/admin/v1/blacklist');document.getElementById('blacklist').replaceChildren(...b.rules.map(blacklistRow));const ss=await api('/admin/v1/sessions');document.getElementById('sessions').replaceChildren(...ss.sessions.map(sessionRow));const cd=await api('/admin/v1/source-cooldowns');document.getElementById('cooldowns').replaceChildren(...cd.cooldowns.map(cooldownRow));if(!service){const at=await api('/admin/v1/api-tokens');document.getElementById('api-tokens').replaceChildren(...at.tokens.map(apiTokenRow));}status.textContent=service?'Connected (service read-only)':'Connected';}catch(e){document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent=String(e)}}
-function sourceRow(source){const tr=row([source.mountpoint,source.format,source.identifier]);const td=document.createElement('td');const health=document.createElement('button');health.textContent='Health';health.onclick=()=>showSourceHealth(source.mountpoint);const live=document.createElement('button');live.textContent='Live';live.onclick=()=>monitorSource(source.mountpoint);const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSource(source.mountpoint);td.append(health,live,disconnect);tr.append(td);return tr}
-function sessionRow(session){const tr=row([session.session_type,session.user_id,session.mountpoint,session.caster_id]);const td=document.createElement('td');const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSession(session.session_id);td.append(disconnect);tr.append(td);return tr}
-function cooldownRow(cooldown){const tr=row([cooldown.mountpoint,cooldown.source_ip,cooldown.reason,cooldown.expires_at]);const td=document.createElement('td');const clear=document.createElement('button');clear.textContent='Clear';clear.onclick=()=>clearCooldown(cooldown.fingerprint);td.append(clear);tr.append(td);return tr}
+async function load(){try{status.textContent='Loading...';const session=await api('/admin/v1/auth/session');const service=session.kind==='service';serviceReadOnly=service;csrfToken=service?'':((await api('/admin/v1/auth/csrf')).csrf_token||'');document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=session.username||session.kind;document.getElementById('read-only').hidden=!service;document.getElementById('logout').hidden=service;document.querySelectorAll('.write-control').forEach(element=>element.hidden=service);document.getElementById('api-tokens-section').hidden=service;const c=await api('/admin/v1/cluster/status');document.getElementById('cluster').textContent=JSON.stringify(c,null,2);const s=await api('/admin/v1/sources');document.getElementById('sources').replaceChildren(...s.sources.map(sourceRow));const r=await api('/admin/v1/relays');document.getElementById('relays').replaceChildren(...r.relays.map(x=>row([x.mountpoint,x.subscribers])));const u=await api('/admin/v1/users');document.getElementById('users').replaceChildren(...u.users.map(userRow));const m=await api('/admin/v1/mountpoints');document.getElementById('mountpoints').replaceChildren(...m.mountpoints.map(mountRow));const b=await api('/admin/v1/blacklist');document.getElementById('blacklist').replaceChildren(...b.rules.map(blacklistRow));const ss=await api('/admin/v1/sessions');document.getElementById('sessions').replaceChildren(...ss.sessions.map(sessionRow));const cd=await api('/admin/v1/source-cooldowns');document.getElementById('cooldowns').replaceChildren(...cd.cooldowns.map(cooldownRow));if(!service){const at=await api('/admin/v1/api-tokens');document.getElementById('api-tokens').replaceChildren(...at.tokens.map(apiTokenRow));}status.textContent=service?'Connected (service read-only)':'Connected';}catch(e){document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent=String(e)}}
+function sourceRow(source){const tr=row([source.mountpoint,source.format,source.identifier]);const td=document.createElement('td');const health=document.createElement('button');health.textContent='Health';health.onclick=()=>showSourceHealth(source.mountpoint);const live=document.createElement('button');live.textContent='Live';live.onclick=()=>monitorSource(source.mountpoint);td.append(health,live);if(!serviceReadOnly){const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSource(source.mountpoint);td.append(disconnect)}tr.append(td);return tr}
+function sessionRow(session){const tr=row([session.session_type,session.user_id,session.mountpoint,session.caster_id]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSession(session.session_id);td.append(disconnect)}tr.append(td);return tr}
+function cooldownRow(cooldown){const tr=row([cooldown.mountpoint,cooldown.source_ip,cooldown.reason,cooldown.expires_at]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const clear=document.createElement('button');clear.textContent='Clear';clear.onclick=()=>clearCooldown(cooldown.fingerprint);td.append(clear)}tr.append(td);return tr}
 async function disconnectSource(mountpoint){if(!confirm('Disconnect source '+mountpoint+'?'))return;try{await api('/admin/v1/sources/'+encodeURIComponent(mountpoint),{method:'DELETE'});status.textContent='Disconnect accepted for '+mountpoint;}catch(e){status.textContent=String(e)}}
 async function disconnectSession(sessionId){if(!confirm('Disconnect session '+sessionId+'?'))return;try{await api('/admin/v1/sessions/'+encodeURIComponent(sessionId),{method:'DELETE'});status.textContent='Disconnect accepted for '+sessionId;}catch(e){status.textContent=String(e)}}
 async function clearCooldown(fingerprint){if(!confirm('Clear source cooldown?'))return;try{await api('/admin/v1/source-cooldowns/'+encodeURIComponent(fingerprint),{method:'DELETE'});status.textContent='Source cooldown cleared';await load();}catch(e){status.textContent=String(e)}}
 function monitorSource(mountpoint){if(monitorSocket)monitorSocket.close();const target=document.getElementById('source-health');const scheme=location.protocol==='https:'?'wss':'ws';const socket=new WebSocket(scheme+'://'+location.host+'/admin/v1/ws?mountpoint='+encodeURIComponent(mountpoint));monitorSocket=socket;status.textContent='Live monitor connecting for '+mountpoint;target.textContent='Waiting for monitor_ready...';socket.onmessage=event=>{try{const message=JSON.parse(event.data);if(message.type==='monitor_snapshot')status.textContent='Live: '+mountpoint;target.textContent=JSON.stringify(message,null,2);}catch(e){target.textContent=String(e)}};socket.onerror=()=>{status.textContent='Live monitor failed';};socket.onclose=()=>{if(monitorSocket===socket)monitorSocket=null;if(status.textContent.startsWith('Live'))status.textContent='Live monitor closed';};}
-function userRow(user){const tr=row([user.username,user.role,user.enabled]);const td=document.createElement('td');const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editUser(user);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteUser(user);td.append(edit,del);tr.append(td);return tr}
+function userRow(user){const tr=row([user.username,user.role,user.enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editUser(user);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteUser(user);td.append(edit,del)}tr.append(td);return tr}
 function editUser(user){userRevision=user.mod_revision;document.getElementById('user-id').value=user.user_id;document.getElementById('user-name').value=user.username;document.getElementById('user-password').value='';document.getElementById('user-role').value=user.role;document.getElementById('user-enabled').checked=user.enabled;status.textContent='Editing '+user.username}
 async function saveUser(){try{const body={user_id:document.getElementById('user-id').value,username:document.getElementById('user-name').value,role:document.getElementById('user-role').value,enabled:document.getElementById('user-enabled').checked};const password=document.getElementById('user-password').value;if(password)body.password=password;const headers=userRevision===null?{}:{'If-Match':'"'+userRevision+'"'};await api('/admin/v1/users'+(userRevision===null?'':'/'+encodeURIComponent(body.user_id)),{method:userRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});userRevision=null;status.textContent='User saved';await load();}catch(e){status.textContent=String(e)}}
 async function deleteUser(user){if(!confirm('Delete user '+user.username+'?'))return;try{await api('/admin/v1/users/'+encodeURIComponent(user.user_id),{method:'DELETE',headers:{'If-Match':'"'+user.mod_revision+'"'}});status.textContent='User deleted';await load();}catch(e){status.textContent=String(e)}}
-function mountRow(mount){const tr=row([mount.mountpoint,mount.owner_user_id,mount.enabled]);const td=document.createElement('td');const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editMount(mount);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteMount(mount);td.append(edit,del);tr.append(td);return tr}
+function mountRow(mount){const tr=row([mount.mountpoint,mount.owner_user_id,mount.enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editMount(mount);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteMount(mount);td.append(edit,del)}tr.append(td);return tr}
 function editMount(mount){mountRevision=mount.mod_revision;document.getElementById('mount-name').value=mount.mountpoint;document.getElementById('mount-owner').value=mount.owner_user_id;document.getElementById('mount-password').value='';document.getElementById('mount-region').value=mount.region||'';document.getElementById('mount-enabled').checked=mount.enabled;document.getElementById('mount-advertise').checked=mount.advertise;status.textContent='Editing '+mount.mountpoint}
 async function saveMount(){try{const body={mountpoint:document.getElementById('mount-name').value,owner_user_id:document.getElementById('mount-owner').value,region:document.getElementById('mount-region').value||null,enabled:document.getElementById('mount-enabled').checked,advertise:document.getElementById('mount-advertise').checked};const password=document.getElementById('mount-password').value;if(password)body.ntrip1_upload_password=password;const headers=mountRevision===null?{}:{'If-Match':'"'+mountRevision+'"'};await api('/admin/v1/mountpoints'+(mountRevision===null?'':'/'+encodeURIComponent(body.mountpoint)),{method:mountRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});mountRevision=null;status.textContent='Mountpoint saved';await load();}catch(e){status.textContent=String(e)}}
 async function deleteMount(mount){if(!confirm('Delete mountpoint '+mount.mountpoint+'?'))return;try{await api('/admin/v1/mountpoints/'+encodeURIComponent(mount.mountpoint),{method:'DELETE',headers:{'If-Match':'"'+mount.mod_revision+'"'}});status.textContent='Mountpoint deleted';await load();}catch(e){status.textContent=String(e)}}
 async function showSourceHealth(mountpoint){try{document.getElementById('source-health').textContent='Loading...';const health=await api('/admin/v1/sources/'+encodeURIComponent(mountpoint)+'/health');document.getElementById('source-health').textContent=JSON.stringify(health,null,2);status.textContent='Health loaded for '+mountpoint}catch(e){document.getElementById('source-health').textContent=String(e)}}
-function blacklistRow(rule){const tr=row([rule.id,rule.cidr,rule.quota,rule.enabled]);const td=document.createElement('td');const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editBlacklist(rule);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteBlacklist(rule);td.append(edit,del);tr.append(td);return tr}
+function blacklistRow(rule){const tr=row([rule.id,rule.cidr,rule.quota,rule.enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editBlacklist(rule);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteBlacklist(rule);td.append(edit,del)}tr.append(td);return tr}
 function editBlacklist(rule){blacklistRevision=rule.mod_revision;document.getElementById('bl-id').value=rule.id;document.getElementById('bl-cidr').value=rule.cidr;document.getElementById('bl-quota').value=rule.quota;document.getElementById('bl-description').value=rule.description;status.textContent='Editing '+rule.id}
 async function addBlacklist(){try{const body={id:document.getElementById('bl-id').value,cidr:document.getElementById('bl-cidr').value,quota:Number(document.getElementById('bl-quota').value),enabled:true,description:document.getElementById('bl-description').value};const headers=blacklistRevision===null?{}:{'If-Match':'"'+blacklistRevision+'"'};await api('/admin/v1/blacklist',{method:blacklistRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});status.textContent='Blacklist rule saved';blacklistRevision=null;await load();}catch(e){status.textContent=String(e)}}
 async function deleteBlacklist(rule){if(!confirm('Delete blacklist rule '+rule.id+'?'))return;try{await api('/admin/v1/blacklist/'+encodeURIComponent(rule.id),{method:'DELETE',headers:{'If-Match':'"'+rule.mod_revision+'"'}});status.textContent='Blacklist rule deleted';await load();}catch(e){status.textContent=String(e)}}

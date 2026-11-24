@@ -5,7 +5,11 @@ use std::{
 };
 
 use rcaster_core::account::{AccountSnapshot, Mountpoint, User, UserRole};
-use rcaster_service::{account_directory::AccountDirectory, account_store::AccountStore};
+use rcaster_service::{
+    account_directory::AccountDirectory,
+    account_store::AccountStore,
+    blacklist::{BlacklistError, BlacklistRule},
+};
 
 #[test]
 fn account_store_persists_and_reloads_the_snapshot() {
@@ -65,7 +69,8 @@ async fn writable_account_directory_persists_password_rehash() {
     let initial = snapshot("owner-id", "owner", "C63");
     let store = AccountStore::open(path.as_ref()).expect("open store");
     store.replace(&initial).expect("initial accounts");
-    let directory = AccountDirectory::with_store(store.load().expect("load snapshot"), store);
+    let directory = AccountDirectory::with_store(store.load().expect("load snapshot"), store)
+        .expect("account directory");
     assert!(
         directory
             .update_user_password_hash("owner-id", "hash", "new-hash".to_owned())
@@ -80,6 +85,57 @@ async fn writable_account_directory_persists_password_rehash() {
     assert_eq!(
         reloaded.user_by_id("owner-id").expect("user").password_hash,
         "new-hash"
+    );
+}
+
+#[test]
+fn standalone_blacklist_round_trips_across_reopen() {
+    let path = TempDatabase::new();
+    let first = blacklist_rule("blocked", "192.0.2.0/24");
+    {
+        let store = AccountStore::open(path.as_ref()).expect("open store");
+        let revision = store
+            .put_blacklist_rule(&first, None)
+            .expect("create blacklist rule");
+        assert_eq!(revision, 1);
+        assert_eq!(
+            store.put_blacklist_rule(&blacklist_rule("duplicate", "192.0.2.0/24"), None),
+            Err(BlacklistError::InvalidConfig)
+        );
+    }
+
+    let store = AccountStore::open(path.as_ref()).expect("reopen store");
+    let rules = store.blacklist_rules().expect("load blacklist rules");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].id, "blocked");
+    assert_eq!(rules[0].mod_revision, 1);
+
+    store
+        .delete_blacklist_rule("blocked", 1)
+        .expect("delete blacklist rule");
+    assert!(store.blacklist_rules().expect("reload rules").is_empty());
+}
+
+#[tokio::test]
+async fn standalone_blacklist_directory_reloads_limiter_state() {
+    let path = TempDatabase::new();
+    let store = AccountStore::open(path.as_ref()).expect("open store");
+    let snapshot = snapshot("owner-id", "owner", "C63");
+    store.replace(&snapshot).expect("initial accounts");
+    let directory = AccountDirectory::with_store(snapshot, store).expect("account directory");
+
+    directory
+        .put_blacklist_rule(&blacklist_rule("blocked", "192.0.2.0/24"), None)
+        .await
+        .expect("persist blacklist rule");
+
+    assert_eq!(
+        directory.blacklist_quota_for_ip("192.0.2.10".parse().expect("IP")),
+        Some(0)
+    );
+    assert_eq!(
+        directory.blacklist_quota_for_ip("198.51.100.1".parse().expect("IP")),
+        None
     );
 }
 
@@ -118,6 +174,19 @@ fn snapshot(user_id: &str, username: &str, mountpoint: &str) -> AccountSnapshot 
         }],
     )
     .expect("account snapshot")
+}
+
+fn blacklist_rule(id: &str, cidr: &str) -> BlacklistRule {
+    BlacklistRule {
+        schema_version: 1,
+        mod_revision: 0,
+        id: id.to_owned(),
+        cidr: cidr.to_owned(),
+        quota: 0,
+        enabled: true,
+        description: String::new(),
+        updated_at: String::new(),
+    }
 }
 
 struct TempDatabase(PathBuf);

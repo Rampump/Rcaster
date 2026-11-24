@@ -50,6 +50,12 @@ pub struct HealthState {
     sources_cmr: AtomicUsize,
     sources_nmea: AtomicUsize,
     sources_unknown: AtomicUsize,
+    near_queries: AtomicU64,
+    near_queries_limited: AtomicU64,
+    near_gga_rate_limited: AtomicU64,
+    near_gga_jump_rejected: AtomicU64,
+    near_gga_invalid: AtomicU64,
+    near_switches: AtomicU64,
     process_rss_bytes: AtomicU64,
     process_open_fds: AtomicU64,
     process_usage_available: AtomicBool,
@@ -142,6 +148,30 @@ impl HealthState {
 
     pub fn source_accepted(&self) {
         self.source_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_query(&self) {
+        self.near_queries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_query_limited(&self) {
+        self.near_queries_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_gga_rate_limited(&self) {
+        self.near_gga_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_gga_jump_rejected(&self) {
+        self.near_gga_jump_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_gga_invalid(&self) {
+        self.near_gga_invalid.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn near_switched(&self) {
+        self.near_switches.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn source_rejected(&self) {
@@ -282,6 +312,15 @@ impl HealthState {
         metrics.push_str(&format!(
             "# HELP rcaster_auth_failure_fallback_total Shared authentication limiter failures that fell back to node-local protection.\n# TYPE rcaster_auth_failure_fallback_total counter\nrcaster_auth_failure_fallback_total {}\n",
             self.auth_failure_fallback.load(Ordering::Relaxed)
+        ));
+        metrics.push_str(&format!(
+            "# HELP rcaster_near_events_total NEAR selection and input limiter events.\n# TYPE rcaster_near_events_total counter\nrcaster_near_events_total{{event=\"query\"}} {}\nrcaster_near_events_total{{event=\"query_limited\"}} {}\nrcaster_near_events_total{{event=\"gga_rate_limited\"}} {}\nrcaster_near_events_total{{event=\"gga_jump_rejected\"}} {}\nrcaster_near_events_total{{event=\"gga_invalid\"}} {}\nrcaster_near_events_total{{event=\"switch\"}} {}\n",
+            self.near_queries.load(Ordering::Relaxed),
+            self.near_queries_limited.load(Ordering::Relaxed),
+            self.near_gga_rate_limited.load(Ordering::Relaxed),
+            self.near_gga_jump_rejected.load(Ordering::Relaxed),
+            self.near_gga_invalid.load(Ordering::Relaxed),
+            self.near_switches.load(Ordering::Relaxed),
         ));
         let process_available = self.process_usage_available.load(Ordering::Acquire);
         metrics.push_str(&format!(

@@ -762,6 +762,218 @@ async fn rejected_source_sets_cluster_cooldown_for_reconnect() {
         .await;
 }
 
+#[tokio::test]
+async fn second_caster_serves_cached_etcd_str_without_local_source() {
+    let cluster = unique("cross-node-str-cache");
+    let mut admin = connect().await;
+    publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, CoordinatorOptions::default())
+            .await
+            .expect("coordinator"),
+    );
+    let source_caster = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        ClusterRuntimeOptions {
+            cluster_id: cluster.clone(),
+            caster_id: "caster-source".to_owned(),
+            runtime_epoch: unique("epoch-source"),
+            relay_endpoint: "10.0.0.31:12102".to_owned(),
+            lease_ttl_s: 30,
+            keep_alive: true,
+        },
+    )
+    .await
+    .expect("source caster");
+    let edge_caster = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        ClusterRuntimeOptions {
+            cluster_id: cluster.clone(),
+            caster_id: "caster-edge".to_owned(),
+            runtime_epoch: unique("epoch-edge"),
+            relay_endpoint: "10.0.0.32:12102".to_owned(),
+            lease_ttl_s: 30,
+            keep_alive: true,
+        },
+    )
+    .await
+    .expect("edge caster");
+    let accounts = AccountDirectory::static_snapshot(
+        AccountSnapshot::new(
+            [User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "owner-id".to_owned(),
+                username: "owner".to_owned(),
+                password_hash: "hash".to_owned(),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: true,
+                web_enabled: false,
+                role: UserRole::User,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            }],
+            [Mountpoint {
+                schema_version: 1,
+                mod_revision: 1,
+                mountpoint: "C66".to_owned(),
+                owner_user_id: "owner-id".to_owned(),
+                enabled: true,
+                ntrip1_upload_password_hash: None,
+                advertise: true,
+                region: Some("east".to_owned()),
+                latitude: None,
+                longitude: None,
+                coverage_radius_m: None,
+                str_fields: None,
+                source_expectation: None,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            }],
+        )
+        .expect("accounts"),
+    );
+    let (source_address, source_shutdown, source_server) =
+        start_cluster_listener(source_caster.clone(), accounts.clone()).await;
+    let (edge_address, edge_shutdown, edge_server) =
+        start_cluster_listener(edge_caster.clone(), accounts).await;
+
+    let mut source = TcpStream::connect(source_address)
+        .await
+        .expect("source connect");
+    source
+        .write_all(b"SOURCE secret /C66\r\nUser-Agent: cache-test\r\n\r\n")
+        .await
+        .expect("source request");
+    assert_eq!(read_http_head(&mut source).await, b"ICY 200 OK\r\n\r\n");
+    source
+        .write_all(&decode_hex(RTCM3_1005))
+        .await
+        .expect("position frame");
+    source
+        .write_all(&synthetic_rtcm3(1074))
+        .await
+        .expect("MSM frame");
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if edge_caster
+                .source_route("C66")
+                .await
+                .is_some_and(|route| route.caster_id == "caster-source")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("edge source cache");
+    assert!(
+        edge_caster
+            .sourcetable_records()
+            .await
+            .iter()
+            .any(|record| record.mountpoint == "C66")
+    );
+
+    let mut edge_client = TcpStream::connect(edge_address)
+        .await
+        .expect("edge client connect");
+    edge_client
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nNtrip-Version: Ntrip/2.0\r\n\r\n")
+        .await
+        .expect("edge sourcetable request");
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        edge_client.read_to_end(&mut response),
+    )
+    .await
+    .expect("edge response timeout")
+    .expect("edge response");
+    let response = String::from_utf8(response).expect("UTF-8 source table");
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains("STR;C66;"));
+    assert!(response.contains("1005"));
+    assert!(response.contains("1074"));
+
+    drop(source);
+    source_shutdown.send(()).expect("source shutdown");
+    edge_shutdown.send(()).expect("edge shutdown");
+    source_server
+        .await
+        .expect("source server join")
+        .expect("source server");
+    edge_server
+        .await
+        .expect("edge server join")
+        .expect("edge server");
+    source_caster.shutdown().await.expect("source runtime");
+    edge_caster.shutdown().await.expect("edge runtime");
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
+}
+
+async fn start_cluster_listener(
+    runtime: SharedClusterRuntime,
+    accounts: AccountDirectory,
+) -> (
+    std::net::SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_ntrip(
+        listener,
+        Arc::new(MountpointHub::new(64).expect("hub")),
+        TestAuthorizer,
+        NtripServerConfig {
+            head_timeout: Duration::from_secs(1),
+            content_length_max_bytes: 1024,
+            client_auth_required: false,
+            session_limiter: Arc::new(
+                LocalSessionLimiter::new(SessionLimitConfig::default()).expect("limiter"),
+            ),
+            connection_limiter: Arc::new(ConnectionLimiter::new(100).expect("connections")),
+            cluster_runtime: Some(runtime),
+            relay_manager: None,
+            source_admission: Some(SourceAdmissionConfig {
+                policy: AdmissionPolicy {
+                    mode: AdmissionMode::Observe,
+                    allowed_formats: vec![DataFormat::Rtcm3],
+                    require_correction_data: true,
+                    min_valid_frames: 1,
+                    ..AdmissionPolicy::default()
+                },
+                max_bytes: 4096,
+                max_frames: 8,
+                timeout: Duration::from_millis(150),
+                read_timeout: Duration::from_secs(2),
+            }),
+            near: None,
+            accounts: Some(accounts),
+            metrics: None,
+            connections: None,
+            proxy_protocol: None,
+            auth_login_limiter: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    (address, shutdown_tx, server)
+}
+
 fn nmea_gga() -> String {
     let body = "GPGGA,000000,0000.0000,N,00000.0000,E,1,08,0.9,0.0,M,0.0,M,,";
     let checksum = body.bytes().fold(0_u8, |checksum, byte| checksum ^ byte);

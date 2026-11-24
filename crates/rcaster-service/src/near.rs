@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -20,6 +21,11 @@ pub struct NearConfig {
     pub min_recompute_interval: Duration,
     pub max_recompute_interval: Duration,
     pub min_recompute_distance_m: f64,
+    pub max_spatial_queries_per_second: u32,
+    pub max_query_concurrency: usize,
+    pub gga_max_input_per_second: u32,
+    pub gga_max_jump_speed_mps: f64,
+    pub position_ttl_s: u64,
 }
 
 impl Default for NearConfig {
@@ -35,8 +41,101 @@ impl Default for NearConfig {
             min_recompute_interval: Duration::from_secs(1),
             max_recompute_interval: Duration::from_secs(5),
             min_recompute_distance_m: 4.0,
+            max_spatial_queries_per_second: 10_000,
+            max_query_concurrency: 8,
+            gga_max_input_per_second: 10,
+            gga_max_jump_speed_mps: 1_000.0,
+            position_ttl_s: 0,
         }
     }
+}
+
+pub struct NearQueryLimiter {
+    inner: Arc<QueryLimiterInner>,
+}
+
+struct QueryLimiterInner {
+    max_queries_per_second: u32,
+    max_concurrency: usize,
+    state: Mutex<QueryLimiterState>,
+}
+
+struct QueryLimiterState {
+    tokens: f64,
+    last_refill: Instant,
+    active: usize,
+}
+
+pub struct NearQueryPermit {
+    inner: Arc<QueryLimiterInner>,
+}
+
+impl NearQueryLimiter {
+    pub fn new(max_queries_per_second: u32, max_concurrency: usize) -> Option<Self> {
+        if max_queries_per_second == 0 || max_concurrency == 0 {
+            return None;
+        }
+        Some(Self {
+            inner: Arc::new(QueryLimiterInner {
+                max_queries_per_second,
+                max_concurrency,
+                state: Mutex::new(QueryLimiterState {
+                    tokens: f64::from(max_queries_per_second),
+                    last_refill: Instant::now(),
+                    active: 0,
+                }),
+            }),
+        })
+    }
+
+    pub fn try_acquire(&self) -> Option<NearQueryPermit> {
+        self.try_acquire_at(Instant::now())
+    }
+
+    #[doc(hidden)]
+    pub fn try_acquire_at(&self, now: Instant) -> Option<NearQueryPermit> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active >= self.inner.max_concurrency {
+            return None;
+        }
+        let elapsed = now
+            .saturating_duration_since(state.last_refill)
+            .as_secs_f64();
+        let capacity = f64::from(self.inner.max_queries_per_second);
+        state.tokens = (state.tokens + elapsed * capacity).min(capacity);
+        state.last_refill = now;
+        if state.tokens < 1.0 {
+            return None;
+        }
+        state.tokens -= 1.0;
+        state.active += 1;
+        Some(NearQueryPermit {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+}
+
+impl Drop for NearQueryPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = state.active.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GgaAcceptance {
+    Accepted,
+    RateLimited,
+    JumpRejected,
+    Invalid,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,7 +155,7 @@ pub struct NearSource {
 
 impl NearSource {
     pub fn from_str_record(record: &StrRecord) -> Option<Self> {
-        if !record.format.starts_with("RTCM 3") {
+        if !record.format.eq_ignore_ascii_case("RTCM3") && !record.format.starts_with("RTCM 3") {
             return None;
         }
         let latitude = record.latitude.parse::<f64>().ok()?;
@@ -160,6 +259,8 @@ pub struct NearSelector {
     config: NearConfig,
     current: Option<String>,
     observation: Option<Observation>,
+    gga_window: Option<GgaWindow>,
+    last_gga: Option<(Instant, GeoPosition)>,
 }
 
 struct Observation {
@@ -168,12 +269,19 @@ struct Observation {
     position: GeoPosition,
 }
 
+struct GgaWindow {
+    started: Instant,
+    count: u32,
+}
+
 impl NearSelector {
     pub fn new(config: NearConfig) -> Self {
         Self {
             config,
             current: None,
             observation: None,
+            gga_window: None,
+            last_gga: None,
         }
     }
 
@@ -194,6 +302,39 @@ impl NearSelector {
         elapsed >= self.config.min_recompute_interval
             && (elapsed >= self.config.max_recompute_interval
                 || distance_m(last_position, gga.position) >= self.config.min_recompute_distance_m)
+    }
+
+    pub fn accept_gga(&mut self, gga: &NearGga, now: Instant) -> GgaAcceptance {
+        let window = self.gga_window.get_or_insert(GgaWindow {
+            started: now,
+            count: 0,
+        });
+        if now.saturating_duration_since(window.started) >= Duration::from_secs(1) {
+            window.started = now;
+            window.count = 0;
+        }
+        if window.count >= self.config.gga_max_input_per_second {
+            return GgaAcceptance::RateLimited;
+        }
+        window.count += 1;
+        if !matches!(gga.fix_quality, 1 | 2 | 4 | 5) || gga.hdop > self.config.max_hdop {
+            return GgaAcceptance::Invalid;
+        }
+        if let Some((previous_at, previous_position)) = self.last_gga {
+            let elapsed = now.saturating_duration_since(previous_at).as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                distance_m(previous_position, gga.position) / elapsed
+            } else if previous_position == gga.position {
+                0.0
+            } else {
+                f64::INFINITY
+            };
+            if speed > self.config.gga_max_jump_speed_mps {
+                return GgaAcceptance::JumpRejected;
+            }
+        }
+        self.last_gga = Some((now, gga.position));
+        GgaAcceptance::Accepted
     }
 
     pub fn update(

@@ -32,7 +32,9 @@ use crate::{
     connections::{ConnectionCancel, ConnectionController},
     health::HealthState,
     hub::{HubError, MountpointHub, SourceLease},
-    near::{NearConfig, NearGga, NearIndex, NearSelector, NearSource},
+    near::{
+        GgaAcceptance, NearConfig, NearGga, NearIndex, NearQueryLimiter, NearSelector, NearSource,
+    },
     ntrip_io::{ReadHeadError, read_request_head},
     proxy_protocol::{ProxyProtocolConfig, resolve_client_ip},
     relay::RelayManager,
@@ -41,6 +43,7 @@ use crate::{
         SessionUser,
     },
     source_admission::{SourceAdmissionConfig, SourceAdmissionWindow, WindowOutcome},
+    source_claim::SourceAdmissionSummary,
     tls_reload::ReloadableTlsConfig,
 };
 
@@ -74,6 +77,7 @@ pub struct NtripServerConfig {
 pub struct NearServerConfig {
     pub mountpoint: String,
     pub selector: NearConfig,
+    pub query_limiter: std::sync::Arc<NearQueryLimiter>,
     pub no_source_timeout: Duration,
     pub advertise: bool,
 }
@@ -133,11 +137,19 @@ impl SessionHold {
     }
 
     async fn activate_source(&self, str_record: &StrRecord) -> io::Result<()> {
+        self.activate_source_with_summary(str_record, None).await
+    }
+
+    async fn activate_source_with_summary(
+        &self,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> io::Result<()> {
         if let Self::ClusterSource(hold) = self
             && let Some(permit) = &hold.permit
         {
             hold.runtime
-                .activate_source(permit, str_record)
+                .activate_source_with_summary(permit, str_record, admission)
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
@@ -432,7 +444,8 @@ where
                 let ip_denied = if let Some(runtime) = &config.cluster_runtime {
                     runtime.is_ip_denied(remote_ip).await
                 } else {
-                    config.session_limiter.is_ip_denied(remote_ip)
+                    standalone_ip_quota(&config, remote_ip).is_some_and(|quota| quota == 0)
+                        || config.session_limiter.is_ip_denied(remote_ip)
                 };
                 if ip_denied {
                     return send_client_error(&mut stream, 403, None).await;
@@ -527,14 +540,17 @@ where
                             Err(_) => return send_client_error(&mut stream, 503, Some(5)).await,
                         }
                     }
-                    _ => match config.session_limiter.try_acquire(SessionRequest {
-                        user: authenticated_user.as_ref().map(|user| SessionUser {
-                            user_id: &user.user_id,
-                            username: &user.username,
-                        }),
-                        kind: SessionKind::Client,
-                        remote_ip,
-                    }) {
+                    _ => match config.session_limiter.try_acquire_with_ip_quota(
+                        SessionRequest {
+                            user: authenticated_user.as_ref().map(|user| SessionUser {
+                                user_id: &user.user_id,
+                                username: &user.username,
+                            }),
+                            kind: SessionKind::Client,
+                            remote_ip,
+                        },
+                        standalone_ip_quota(&config, remote_ip),
+                    ) {
                         Ok(permit) => SessionHold::Local(Box::new(permit)),
                         Err(_) => return send_client_error(&mut stream, 429, None).await,
                     },
@@ -1119,17 +1135,21 @@ impl AdmissionFeed {
         }
         match self.window.push(bytes) {
             WindowOutcome::Pending => Ok(true),
-            WindowOutcome::Accepted { bytes, .. } => {
+            WindowOutcome::Accepted { bytes, warnings } => {
                 let record = record_from_profile(
                     source.mountpoint(),
                     self.window.profile(),
                     self.configured_mountpoint.as_ref(),
                 );
+                let admission =
+                    SourceAdmissionSummary::from_profile(self.window.profile(), &warnings);
                 source.set_str_record(record.clone()).map_err(invalid_hub)?;
                 source
                     .set_profile(self.window.profile().clone())
                     .map_err(invalid_hub)?;
-                permit.activate_source(&record).await?;
+                permit
+                    .activate_source_with_summary(&record, Some(admission))
+                    .await?;
                 if let Some(metrics) = &self.metrics {
                     metrics.source_accepted();
                 }
@@ -1157,8 +1177,33 @@ impl AdmissionFeed {
         permit.ensure_source_publishing().await?;
         if self.demux.is_none() {
             let outcome = self.window.finish();
-            let bytes = match outcome {
-                WindowOutcome::Accepted { bytes, .. } => bytes,
+            match outcome {
+                WindowOutcome::Accepted { bytes, warnings } => {
+                    let admission =
+                        SourceAdmissionSummary::from_profile(self.window.profile(), &warnings);
+                    let record = record_from_profile(
+                        source.mountpoint(),
+                        self.window.profile(),
+                        self.configured_mountpoint.as_ref(),
+                    );
+                    source.set_str_record(record.clone()).map_err(invalid_hub)?;
+                    source
+                        .set_profile(self.window.profile().clone())
+                        .map_err(invalid_hub)?;
+                    permit
+                        .activate_source_with_summary(&record, Some(admission))
+                        .await?;
+                    if let Some(metrics) = &self.metrics {
+                        metrics.source_accepted();
+                    }
+                    if self.window.profile().has_correction_data {
+                        publish_correction(source, bytes)?;
+                    } else {
+                        publish(source, bytes)?;
+                    }
+                    self.demux = Some(self.window.take_demux());
+                    return Ok(());
+                }
                 WindowOutcome::Rejected { violations } => {
                     self.record_cooldown(source.mountpoint(), "SOURCE_ADMISSION_REJECTED")
                         .await;
@@ -1176,25 +1221,6 @@ impl AdmissionFeed {
                     return Ok(());
                 }
             };
-            let record = record_from_profile(
-                source.mountpoint(),
-                self.window.profile(),
-                self.configured_mountpoint.as_ref(),
-            );
-            source.set_str_record(record.clone()).map_err(invalid_hub)?;
-            source
-                .set_profile(self.window.profile().clone())
-                .map_err(invalid_hub)?;
-            permit.activate_source(&record).await?;
-            if let Some(metrics) = &self.metrics {
-                metrics.source_accepted();
-            }
-            if self.window.profile().has_correction_data {
-                publish_correction(source, bytes)?;
-            } else {
-                publish(source, bytes)?;
-            }
-            self.demux = Some(self.window.take_demux());
         }
         Ok(())
     }
@@ -1464,21 +1490,31 @@ where
     let mut no_source_deadline = Instant::now() + near.no_source_timeout;
     let mut last_query = None;
 
-    if let Some(gga) = initial_gga.and_then(parse_near_gga_header) {
+    if let Some(gga) = initial_gga.and_then(parse_near_gga_header)
+        && accept_near_gga(&mut selector, &gga, config.metrics.as_ref())
+    {
         last_query = Some((std::time::Instant::now(), gga.position));
-        switch_near_source(
-            &mut selector,
-            &mut receiver,
-            &mut demux,
-            &hub,
-            &config,
-            &near_index,
-            gga,
-            &mut no_source_deadline,
-            near.no_source_timeout,
-            &mut pending_output,
-        )
-        .await;
+        if let Some(query_permit) = near.query_limiter.try_acquire() {
+            if let Some(metrics) = &config.metrics {
+                metrics.near_query();
+            }
+            switch_near_source(
+                &mut selector,
+                &mut receiver,
+                &mut demux,
+                &hub,
+                &config,
+                &near_index,
+                gga,
+                &mut no_source_deadline,
+                near.no_source_timeout,
+                &mut pending_output,
+                query_permit,
+            )
+            .await;
+        } else if let Some(metrics) = &config.metrics {
+            metrics.near_query_limited();
+        }
     }
 
     let mut read_buffer = [0_u8; 4096];
@@ -1498,10 +1534,22 @@ where
                         return Ok(());
                     }
                     for gga in near_ggas(&mut pending, &read_buffer[..read]) {
+                        if !accept_near_gga(&mut selector, &gga, config.metrics.as_ref()) {
+                            continue;
+                        }
                         if !selector.should_query(last_query, &gga, std::time::Instant::now()) {
                             continue;
                         }
                         last_query = Some((std::time::Instant::now(), gga.position));
+                        let Some(query_permit) = near.query_limiter.try_acquire() else {
+                            if let Some(metrics) = &config.metrics {
+                                metrics.near_query_limited();
+                            }
+                            continue;
+                        };
+                        if let Some(metrics) = &config.metrics {
+                            metrics.near_query();
+                        }
                         switch_near_source(
                             &mut selector,
                             &mut receiver,
@@ -1513,6 +1561,7 @@ where
                             &mut no_source_deadline,
                             near.no_source_timeout,
                             &mut pending_output,
+                            query_permit,
                         ).await;
                     }
                 }
@@ -1540,10 +1589,22 @@ where
                 return Ok(());
             }
             for gga in near_ggas(&mut pending, &read_buffer[..read]) {
+                if !accept_near_gga(&mut selector, &gga, config.metrics.as_ref()) {
+                    continue;
+                }
                 if !selector.should_query(last_query, &gga, std::time::Instant::now()) {
                     continue;
                 }
                 last_query = Some((std::time::Instant::now(), gga.position));
+                let Some(query_permit) = near.query_limiter.try_acquire() else {
+                    if let Some(metrics) = &config.metrics {
+                        metrics.near_query_limited();
+                    }
+                    continue;
+                };
+                if let Some(metrics) = &config.metrics {
+                    metrics.near_query();
+                }
                 switch_near_source(
                     &mut selector,
                     &mut receiver,
@@ -1555,6 +1616,7 @@ where
                     &mut no_source_deadline,
                     near.no_source_timeout,
                     &mut pending_output,
+                    query_permit,
                 )
                 .await;
                 if receiver.is_some() {
@@ -1577,7 +1639,9 @@ async fn switch_near_source(
     no_source_deadline: &mut Instant,
     no_source_timeout: Duration,
     pending_output: &mut std::collections::VecDeque<Arc<[u8]>>,
+    _query_permit: crate::near::NearQueryPermit,
 ) {
+    let previous = selector.current().map(str::to_owned);
     let Some(mountpoint) = selector.update_indexed(&gga, candidates, std::time::Instant::now())
     else {
         return;
@@ -1588,21 +1652,103 @@ async fn switch_near_source(
         *receiver = Some(next);
         *demux = Some(ProtocolDemux::new());
         *no_source_deadline = Instant::now() + no_source_timeout;
+        if previous.as_deref() != Some(mountpoint.as_str())
+            && let Some(metrics) = &config.metrics
+        {
+            metrics.near_switched();
+        }
+    }
+}
+
+fn accept_near_gga(
+    selector: &mut NearSelector,
+    gga: &NearGga,
+    metrics: Option<&Arc<crate::health::HealthState>>,
+) -> bool {
+    match selector.accept_gga(gga, std::time::Instant::now()) {
+        GgaAcceptance::Accepted => true,
+        GgaAcceptance::RateLimited => {
+            if let Some(metrics) = metrics {
+                metrics.near_gga_rate_limited();
+            }
+            false
+        }
+        GgaAcceptance::JumpRejected => {
+            if let Some(metrics) = metrics {
+                metrics.near_gga_jump_rejected();
+            }
+            false
+        }
+        GgaAcceptance::Invalid => {
+            if let Some(metrics) = metrics {
+                metrics.near_gga_invalid();
+            }
+            false
+        }
     }
 }
 
 async fn near_candidates(hub: &MountpointHub, config: &NtripServerConfig) -> Vec<NearSource> {
-    sourcetable_records(hub, config)
-        .await
-        .iter()
-        .filter(|record| {
-            config
-                .near
-                .as_ref()
-                .is_none_or(|near| near.mountpoint != record.mountpoint)
-        })
-        .filter_map(NearSource::from_str_record)
-        .collect()
+    let position_ttl_s = config
+        .near
+        .as_ref()
+        .map(|near| near.selector.position_ttl_s)
+        .unwrap_or_default();
+    let records = sourcetable_records(hub, config).await;
+    let mut candidates = Vec::new();
+    for record in records {
+        if config
+            .near
+            .as_ref()
+            .is_some_and(|near| near.mountpoint == record.mountpoint)
+        {
+            continue;
+        }
+        if position_ttl_s > 0
+            && !near_position_is_fresh(hub, config, &record.mountpoint, position_ttl_s).await
+        {
+            continue;
+        }
+        if let Some(candidate) = NearSource::from_str_record(&record) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+async fn near_position_is_fresh(
+    hub: &MountpointHub,
+    config: &NtripServerConfig,
+    mountpoint: &str,
+    ttl_s: u64,
+) -> bool {
+    if let Some(age) = hub
+        .source_health(mountpoint)
+        .and_then(|health| health.last_packet_age_seconds)
+    {
+        return age <= ttl_s;
+    }
+    let Some(runtime) = &config.cluster_runtime else {
+        return false;
+    };
+    let Some(route) = runtime.source_route(mountpoint).await else {
+        return false;
+    };
+    let Ok(created_at) = route.created_at.parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(created_at) <= ttl_s
+}
+
+fn standalone_ip_quota(config: &NtripServerConfig, remote_ip: std::net::IpAddr) -> Option<i32> {
+    config
+        .accounts
+        .as_ref()
+        .and_then(|accounts| accounts.blacklist_quota_for_ip(remote_ip))
 }
 
 fn parse_near_gga_header(value: &str) -> Option<NearGga> {

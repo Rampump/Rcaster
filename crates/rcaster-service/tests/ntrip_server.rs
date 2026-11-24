@@ -405,8 +405,12 @@ async fn near_switch_sends_cached_station_position_from_new_source() {
             observe_time: Duration::ZERO,
             min_recompute_interval: Duration::ZERO,
             min_recompute_distance_m: 0.0,
+            gga_max_jump_speed_mps: 1_000_000_000.0,
             ..rcaster_service::near::NearConfig::default()
         },
+        query_limiter: Arc::new(
+            rcaster_service::near::NearQueryLimiter::new(10_000, 8).expect("NEAR query limiter"),
+        ),
         no_source_timeout: Duration::from_secs(1),
         advertise: true,
     };
@@ -1190,6 +1194,10 @@ async fn start_test_near_server() -> (
         Some(rcaster_service::ntrip_server::NearServerConfig {
             mountpoint: "AUTO_NEAR".to_owned(),
             selector: rcaster_service::near::NearConfig::default(),
+            query_limiter: Arc::new(
+                rcaster_service::near::NearQueryLimiter::new(10_000, 8)
+                    .expect("NEAR query limiter"),
+            ),
             no_source_timeout: Duration::from_secs(1),
             advertise: true,
         }),

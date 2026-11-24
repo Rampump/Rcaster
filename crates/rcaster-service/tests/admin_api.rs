@@ -3,7 +3,11 @@ use std::{fs, sync::Arc, time::Duration};
 use ed25519_dalek::{Signer, SigningKey};
 use etcd_client::{Client, ConnectOptions, GetOptions};
 use futures_util::StreamExt;
-use rcaster_core::{account::AccountSnapshot, protocol::DataProfile, str_record::StrRecord};
+use rcaster_core::{
+    account::{AccountSnapshot, User, UserRole},
+    protocol::DataProfile,
+    str_record::StrRecord,
+};
 use rcaster_service::{
     admin::{AdminState, serve_admin_mtls},
     admission::SessionRecord,
@@ -14,6 +18,7 @@ use rcaster_service::{
     coordinator_grpc::GrpcServerTls,
     health::HealthState,
     hub::MountpointHub,
+    source_claim::SourceAdmissionSummary,
     upgrade::{SignedUpgradeManifest, UpgradeManager, UpgradeManifest, UpgradePolicy},
 };
 use rcgen::{
@@ -97,6 +102,9 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("createApiToken"));
     assert!(page.contains("id=\"api-tokens-section\""));
     assert!(page.contains("session.kind==='service'"));
+    assert!(page.contains("serviceReadOnly"));
+    assert!(page.contains("class=\"write-control\""));
+    assert!(page.contains("Read-only service session"));
     assert!(page.contains("disconnectSource"));
     assert!(page.contains("disconnectSession"));
     assert!(page.contains("monitorSource"));
@@ -128,6 +136,19 @@ async fn admin_routes_require_mtls_and_service_token() {
         request(address, &pki, "/admin/v1/api-tokens", "Bearer secret")
             .await
             .starts_with("HTTP/1.1 403 Forbidden")
+    );
+    assert!(
+        request_raw(
+            address,
+            &pki,
+            "DELETE",
+            "/admin/v1/sources/C63",
+            "Bearer secret",
+            "",
+            "",
+        )
+        .await
+        .starts_with("HTTP/1.1 403 Forbidden")
     );
     assert!(
         request_fragmented_get(address, &pki, "/admin/v1/cluster/status", "Bearer secret")
@@ -400,6 +421,27 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .account_directory()
         .await
         .expect("account directory");
+    accounts
+        .upsert_user(
+            User {
+                schema_version: 1,
+                mod_revision: 0,
+                user_id: "admin-api".to_owned(),
+                username: "admin-api".to_owned(),
+                password_hash: rcaster_service::account_auth::hash_password("admin-secret")
+                    .expect("admin password hash"),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: false,
+                web_enabled: true,
+                role: UserRole::Admin,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("admin user");
     let upgrade_key = SigningKey::from_bytes(&[11_u8; 32]);
     let upgrades = Some(UpgradeManager::new(
         connect().await,
@@ -449,12 +491,48 @@ async fn admin_writes_blacklist_with_revision_cas() {
         },
     ));
 
+    let login = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/auth/login",
+        "",
+        "",
+        r#"{"username":"admin-api","password":"admin-secret"}"#,
+    )
+    .await;
+    assert!(login.starts_with("HTTP/1.1 200 OK"));
+    let cookie = response_header(&login, "set-cookie")
+        .and_then(|value| value.split(';').next())
+        .expect("admin login cookie");
+    let csrf = response_body(&login)["csrf_token"]
+        .as_str()
+        .expect("admin CSRF token")
+        .to_owned();
+    let token_response = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/api-tokens",
+        "",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+        r#"{"name":"admin-api-test","scopes":["admin:read","admin:write","upgrade:write"]}"#,
+    )
+    .await;
+    assert!(token_response.starts_with("HTTP/1.1 201 Created"));
+    let auth_token = response_body(&token_response)["token"]
+        .as_str()
+        .expect("admin API token")
+        .to_owned();
+    let auth = format!("Bearer {auth_token}");
+    let auth = auth.as_str();
+
     let created = request_raw(
         address,
         &pki,
         "POST",
         "/admin/v1/blacklist",
-        "Bearer secret",
+        auth,
         "",
         r#"{"id":"blocked","cidr":"192.0.2.0/24","quota":0,"enabled":true,"description":"test"}"#,
     )
@@ -465,7 +543,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             address,
             &pki,
             "/admin/v1/sources?caster_id=caster-remote",
-            "Bearer secret",
+            auth,
         )
         .await,
     );
@@ -486,7 +564,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .expect("created revision");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if request(address, &pki, "/admin/v1/blacklist", "Bearer secret")
+            if request(address, &pki, "/admin/v1/blacklist", auth)
                 .await
                 .contains("\"id\":\"blocked\"")
             {
@@ -498,21 +576,16 @@ async fn admin_writes_blacklist_with_revision_cas() {
     .await
     .expect("blacklist create propagation");
     assert!(
-        request(
-            address,
-            &pki,
-            "/admin/v1/blacklist/blocked",
-            "Bearer secret"
-        )
-        .await
-        .contains("\"cidr\":\"192.0.2.0/24\"")
+        request(address, &pki, "/admin/v1/blacklist/blocked", auth)
+            .await
+            .contains("\"cidr\":\"192.0.2.0/24\"")
     );
     let updated = request_raw(
         address,
         &pki,
         "PATCH",
         "/admin/v1/blacklist",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{revision}\"\r\n"),
         r#"{"id":"blocked","cidr":"192.0.2.0/24","quota":2,"enabled":true,"description":"updated"}"#,
     )
@@ -525,21 +598,16 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .and_then(|body| body.get("revision").and_then(serde_json::Value::as_u64))
         .expect("updated revision");
     assert!(
-        request(
-            address,
-            &pki,
-            "/admin/v1/blacklist/blocked",
-            "Bearer secret"
-        )
-        .await
-        .contains("\"quota\":2")
+        request(address, &pki, "/admin/v1/blacklist/blocked", auth)
+            .await
+            .contains("\"quota\":2")
     );
     let deleted = request_raw(
         address,
         &pki,
         "DELETE",
         "/admin/v1/blacklist/blocked",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{revision}\"\r\n"),
         "",
     )
@@ -547,7 +615,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
     assert!(deleted.starts_with("HTTP/1.1 204 No Content"));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if !request(address, &pki, "/admin/v1/blacklist", "Bearer secret")
+            if !request(address, &pki, "/admin/v1/blacklist", auth)
                 .await
                 .contains("\"id\":\"blocked\"")
             {
@@ -564,7 +632,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/users",
-        "Bearer secret",
+        auth,
         "",
         r#"{"user_id":"editor-id","username":"editor","password":"secret","role":"user","enabled":true,"ntrip_enabled":true,"web_enabled":true}"#,
     )
@@ -572,7 +640,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
     assert!(created_user.starts_with("HTTP/1.1 201 Created"));
     let mut user_revision = body_revision(&created_user);
     assert!(
-        request(address, &pki, "/admin/v1/users/editor-id", "Bearer secret")
+        request(address, &pki, "/admin/v1/users/editor-id", auth)
             .await
             .contains("\"username\":\"editor\"")
     );
@@ -581,7 +649,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/mountpoints",
-        "Bearer secret",
+        auth,
         "",
         r#"{"mountpoint":"C64","owner_user_id":"editor-id","ntrip1_upload_password":"upload","latitude":31.2,"longitude":121.4,"coverage_radius_m":30000,"str_fields":{"identifier":"Farm 1","network":"RTK-NET","country":"CHN","carrier":"2","navigation_system":"GPS+GLO"},"source_expectation":{"formats":["rtcm3"],"msm_versions":[4]}}"#,
     )
@@ -594,7 +662,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "DELETE",
             "/admin/v1/users/editor-id",
-            "Bearer secret",
+            auth,
             &format!("If-Match: \"{user_revision}\"\r\n"),
             "",
         )
@@ -607,7 +675,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "PATCH",
         "/admin/v1/users/editor-id",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{user_revision}\"\r\n"),
         r#"{"enabled":false}"#,
     )
@@ -620,7 +688,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "PATCH",
             "/admin/v1/users/editor-id",
-            "Bearer secret",
+            auth,
             &format!("If-Match: \"{}\"\r\n", user_revision - 1),
             r#"{"enabled":true}"#,
         )
@@ -632,7 +700,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "PATCH",
         "/admin/v1/users/editor-id",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{user_revision}\"\r\n"),
         r#"{"enabled":true}"#,
     )
@@ -653,7 +721,19 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .expect("C64 source admission");
     let c64_record = StrRecord::from_profile("C64", &DataProfile::default());
     runtime
-        .activate_source(&c64_permit, &c64_record)
+        .activate_source_with_summary(
+            &c64_permit,
+            &c64_record,
+            Some(SourceAdmissionSummary {
+                primary_format: Some("rtcm3".to_owned()),
+                msm_versions: vec![4],
+                validation_result: "warn".to_owned(),
+                expected_format_mismatch: true,
+                correction_frames: 2,
+                valid_frames: 3,
+                crc_error_ratio: Some(0.1),
+            }),
+        )
         .await
         .expect("C64 source activation");
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -663,13 +743,22 @@ async fn admin_writes_blacklist_with_revision_cas() {
     })
     .await
     .expect("C64 source route");
+    let filtered = request(
+        address,
+        &pki,
+        "/admin/v1/sources?validation_result=warn&expected_format_mismatch=true&msm_version=4",
+        auth,
+    )
+    .await;
+    assert!(filtered.contains("\"mountpoint\":\"C64\""));
+    assert!(filtered.contains("\"validation_result\":\"warn\""));
 
     let updated_mount = request_raw(
         address,
         &pki,
         "PATCH",
         "/admin/v1/mountpoints/C64",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{mount_revision}\"\r\n"),
         r#"{"region":"east","advertise":false,"enabled":false,"latitude":31.3,"longitude":121.5,"coverage_radius_m":35000,"str_fields":{"identifier":"Farm 2","network":"RTK-NET","country":"CHN","carrier":"1","navigation_system":"GPS+GLO"}, "source_expectation":{"formats":["rtcm3"],"msm_versions":[4,7]}}"#,
     )
@@ -689,7 +778,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .await
         .expect("C64 source commands");
     assert_eq!(commands.kvs().len(), 1);
-    let mountpoint = request(address, &pki, "/admin/v1/mountpoints/C64", "Bearer secret").await;
+    let mountpoint = request(address, &pki, "/admin/v1/mountpoints/C64", auth).await;
     let mountpoint = response_body(&mountpoint);
     let mountpoint = &mountpoint["mountpoint"];
     assert_eq!(mountpoint["region"], "east");
@@ -710,7 +799,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "DELETE",
             "/admin/v1/mountpoints/C64",
-            "Bearer secret",
+            auth,
             &format!("If-Match: \"{mount_revision}\"\r\n"),
             "",
         )
@@ -731,7 +820,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "DELETE",
         "/admin/v1/mountpoints/C64?force=true",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{mount_revision}\"\r\n"),
         "",
     )
@@ -743,7 +832,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "DELETE",
         "/admin/v1/users/editor-id",
-        "Bearer secret",
+        auth,
         &format!("If-Match: \"{user_revision}\"\r\n"),
         "",
     )
@@ -755,7 +844,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/users",
-        "Bearer secret",
+        auth,
         "",
         r#"{"user_id":"admin-http","username":"admin-http","password":"admin-password","role":"admin","enabled":true,"ntrip_enabled":false,"web_enabled":true}"#,
     )
@@ -1042,7 +1131,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let audit = request(address, &pki, "/admin/v1/audit?limit=100", "Bearer secret").await;
+            let audit = request(address, &pki, "/admin/v1/audit?limit=100", auth).await;
             if audit.contains("\"action\":\"user.create\"")
                 && audit.contains("\"action\":\"api_token.create\"")
             {
@@ -1058,7 +1147,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "PUT",
         "/admin/v1/config",
-        "Bearer secret",
+        auth,
         "",
         r#"{"schema_version":1,"generation":2,"source_health":{"observation_timeout_s":12,"crc_error_ratio_max":0.2}}"#,
     )
@@ -1081,13 +1170,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
     let snapshot = runtime.config_snapshot().await.expect("config snapshot");
     assert_eq!(snapshot.config.source_health.observation_timeout_s, 12);
     assert_eq!(snapshot.config.source_health.crc_error_ratio_max, 0.2);
-    let revisions = request(
-        address,
-        &pki,
-        "/admin/v1/config/revisions?limit=10",
-        "Bearer secret",
-    )
-    .await;
+    let revisions = request(address, &pki, "/admin/v1/config/revisions?limit=10", auth).await;
     assert!(revisions.contains("\"generation\":2"));
     assert!(revisions.contains("\"revision\":"));
     assert!(
@@ -1096,7 +1179,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "POST",
             "/admin/v1/config/reload",
-            "Bearer secret",
+            auth,
             "",
             "{}",
         )
@@ -1108,7 +1191,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/operations/preview",
-        "Bearer secret",
+        auth,
         "",
         r#"{"action":"config.rollback","generation":2}"#,
     )
@@ -1120,7 +1203,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/operations",
-        "Bearer secret",
+        auth,
         "",
         r#"{"action":"config.rollback","generation":2}"#,
     )
@@ -1135,7 +1218,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             address,
             &pki,
             &format!("/admin/v1/operations/{operation_id}"),
-            "Bearer secret",
+            auth,
         )
         .await
         .contains("\"status\":\"SUCCEEDED\"")
@@ -1146,7 +1229,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "POST",
             &format!("/admin/v1/operations/{operation_id}/cancel"),
-            "Bearer secret",
+            auth,
             "",
             "{}",
         )
@@ -1154,7 +1237,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .starts_with("HTTP/1.1 409")
     );
     assert!(
-        request(address, &pki, "/admin/v1/near/clients", "Bearer secret")
+        request(address, &pki, "/admin/v1/near/clients", auth)
             .await
             .contains("\"clients\":[]")
     );
@@ -1164,7 +1247,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "POST",
             "/admin/v1/maintenance",
-            "Bearer secret",
+            auth,
             "",
             r#"{"maintenance":true}"#,
         )
@@ -1176,7 +1259,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         "true\n"
     );
     assert!(
-        request(address, &pki, "/admin/v1/maintenance", "Bearer secret")
+        request(address, &pki, "/admin/v1/maintenance", auth)
             .await
             .contains("\"maintenance\":true")
     );
@@ -1186,7 +1269,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "POST",
             "/admin/v1/maintenance",
-            "Bearer secret",
+            auth,
             "",
             r#"{"maintenance":false}"#,
         )
@@ -1212,7 +1295,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/upgrades/preview",
-        "Bearer secret",
+        auth,
         "",
         &upgrade.to_string(),
     )
@@ -1224,7 +1307,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         &pki,
         "POST",
         "/admin/v1/upgrades",
-        "Bearer secret",
+        auth,
         "",
         &upgrade.to_string(),
     )
@@ -1242,7 +1325,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             address,
             &pki,
             &format!("/admin/v1/upgrades/{upgrade_id}"),
-            "Bearer secret",
+            auth,
         )
         .await
         .contains("\"status\":\"RUNNING\"")
@@ -1253,7 +1336,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "POST",
             &format!("/admin/v1/upgrades/{upgrade_id}/cancel"),
-            "Bearer secret",
+            auth,
             "",
             "{}",
         )
@@ -1281,7 +1364,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "DELETE",
             "/admin/v1/sessions/command-session",
-            "Bearer secret",
+            auth,
             "",
             "",
         )
@@ -1301,14 +1384,9 @@ async fn admin_writes_blacklist_with_revision_cas() {
             .contains("\"session_id\":\"command-session\"")
     );
     assert!(
-        request(
-            address,
-            &pki,
-            "/admin/v1/users/owner/sessions",
-            "Bearer secret",
-        )
-        .await
-        .contains("\"session_id\":\"command-session\"")
+        request(address, &pki, "/admin/v1/users/owner/sessions", auth,)
+            .await
+            .contains("\"session_id\":\"command-session\"")
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !runtime.is_healthy().await {
@@ -1342,7 +1420,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "DELETE",
             "/admin/v1/sources/C99",
-            "Bearer secret",
+            auth,
             "",
             "",
         )
@@ -1366,21 +1444,15 @@ async fn admin_writes_blacklist_with_revision_cas() {
             address,
             &pki,
             "/admin/v1/ws?mountpoint=C99",
-            "Bearer secret",
+            auth,
             Some("https://attacker.example"),
         )
         .await
         .is_err()
     );
-    let mut websocket = websocket_connect(
-        address,
-        &pki,
-        "/admin/v1/ws?mountpoint=C99",
-        "Bearer secret",
-        None,
-    )
-    .await
-    .expect("websocket handshake");
+    let mut websocket = websocket_connect(address, &pki, "/admin/v1/ws?mountpoint=C99", auth, None)
+        .await
+        .expect("websocket handshake");
     let ready = tokio::time::timeout(Duration::from_secs(2), websocket.next())
         .await
         .expect("monitor ready timeout")
@@ -1409,7 +1481,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "POST",
             "/admin/v1/streams/C99/monitor",
-            "Bearer secret",
+            auth,
             "",
             "{}",
         )
@@ -1422,7 +1494,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "DELETE",
             "/admin/v1/streams/C99/monitor",
-            "Bearer secret",
+            auth,
             "",
             "",
         )
@@ -1449,7 +1521,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .record_source_cooldown("C63", "198.51.100.20", "TEST_REJECTION")
         .await
         .expect("record cooldown");
-    let cooldowns = request(address, &pki, "/admin/v1/source-cooldowns", "Bearer secret").await;
+    let cooldowns = request(address, &pki, "/admin/v1/source-cooldowns", auth).await;
     assert!(cooldowns.contains("\"reason\":\"TEST_REJECTION\""));
     let cooldown_fingerprint = response_body(&cooldowns)["cooldowns"][0]["fingerprint"]
         .as_str()
@@ -1461,7 +1533,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             &pki,
             "DELETE",
             &format!("/admin/v1/source-cooldowns/{cooldown_fingerprint}"),
-            "Bearer secret",
+            auth,
             "",
             "",
         )

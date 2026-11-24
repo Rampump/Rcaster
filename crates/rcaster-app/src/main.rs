@@ -192,7 +192,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
         None => rcaster_service::account_directory::AccountDirectory::with_store(
             accounts.clone(),
             account_store,
-        ),
+        )?,
     };
     let auth_limiter = AuthConcurrencyLimiter::new(config.auth_max_concurrency)?;
     let connections = Arc::new(ConnectionController::default());
@@ -805,7 +805,30 @@ async fn serve(args: &[String]) -> AppResult<()> {
             .filter(|near| near.enabled)
             .map(|near| rcaster_service::ntrip_server::NearServerConfig {
                 mountpoint: near.mountpoint.clone(),
-                selector: rcaster_service::near::NearConfig::default(),
+                selector: rcaster_service::near::NearConfig {
+                    max_distance_m: near.max_distance_m,
+                    hysteresis_m: near.hysteresis_m,
+                    base_position_uncertainty_m: near.base_position_uncertainty_m,
+                    hdop_m_per_unit: near.hdop_m_per_unit,
+                    max_hdop: near.max_hdop,
+                    switch_position_threshold_m: near.switch_position_threshold_m,
+                    observe_time: Duration::from_millis(near.switch_observe_ms),
+                    min_recompute_interval: Duration::from_millis(near.min_recompute_interval_ms),
+                    max_recompute_interval: Duration::from_millis(near.max_recompute_interval_ms),
+                    min_recompute_distance_m: near.min_recompute_distance_m,
+                    max_spatial_queries_per_second: near.max_spatial_queries_per_second,
+                    max_query_concurrency: near.max_query_concurrency,
+                    gga_max_input_per_second: near.gga_max_input_per_second,
+                    gga_max_jump_speed_mps: near.gga_max_jump_speed_mps,
+                    position_ttl_s: near.position_ttl_s,
+                },
+                query_limiter: Arc::new(
+                    rcaster_service::near::NearQueryLimiter::new(
+                        near.max_spatial_queries_per_second,
+                        near.max_query_concurrency,
+                    )
+                    .expect("validated NEAR query limiter"),
+                ),
                 no_source_timeout: Duration::from_millis(near.no_source_timeout_ms),
                 advertise: near.advertise,
             }),

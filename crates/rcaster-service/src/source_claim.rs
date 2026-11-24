@@ -1,7 +1,10 @@
 use std::fmt;
 
 use etcd_client::{Client, Compare, CompareOp, DeleteOptions, PutOptions, Txn, TxnOp};
-use rcaster_core::{protocol::DataProfile, str_record::StrRecord};
+use rcaster_core::{
+    protocol::{AdmissionViolation, DataFormat, DataProfile},
+    str_record::StrRecord,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -59,7 +62,7 @@ pub struct SourceClaim {
     pub created_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SourceRoute {
     pub source_generation: u64,
     pub connection_id: String,
@@ -67,7 +70,52 @@ pub struct SourceRoute {
     pub caster_id: String,
     pub runtime_epoch: String,
     pub relay_endpoint: String,
+    pub created_at: String,
     pub str_record: StrRecord,
+    pub admission: Option<SourceAdmissionSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SourceAdmissionSummary {
+    pub primary_format: Option<String>,
+    pub msm_versions: Vec<u8>,
+    pub validation_result: String,
+    pub expected_format_mismatch: bool,
+    pub correction_frames: u64,
+    pub valid_frames: u64,
+    pub crc_error_ratio: Option<f64>,
+}
+
+impl SourceAdmissionSummary {
+    pub fn from_profile(profile: &DataProfile, warnings: &[AdmissionViolation]) -> Self {
+        let integrity_attempts = profile.valid_frames.saturating_add(profile.crc_errors);
+        Self {
+            primary_format: profile.primary_format.map(format_name).map(str::to_owned),
+            msm_versions: profile.msm_versions.iter().copied().collect(),
+            validation_result: if warnings.is_empty() {
+                "pass".to_owned()
+            } else {
+                "warn".to_owned()
+            },
+            expected_format_mismatch: warnings.iter().any(|violation| {
+                matches!(violation, AdmissionViolation::ExpectedFormatMismatch(_))
+            }),
+            correction_frames: profile.correction_frames,
+            valid_frames: profile.valid_frames,
+            crc_error_ratio: (integrity_attempts > 0)
+                .then_some(profile.crc_errors as f64 / integrity_attempts as f64),
+        }
+    }
+}
+
+fn format_name(format: DataFormat) -> &'static str {
+    match format {
+        DataFormat::Rtcm3 => "rtcm3",
+        DataFormat::Rtcm2 => "rtcm2",
+        DataFormat::Binex => "binex",
+        DataFormat::Cmr => "cmr",
+        DataFormat::Nmea => "nmea",
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -161,12 +209,19 @@ struct SourceRecord {
     relay_endpoint: String,
     effective_user_id: String,
     created_at: String,
+    #[serde(default)]
+    admission: Option<SourceAdmissionSummary>,
     #[serde(rename = "str")]
     str_record: StrRecord,
 }
 
 impl SourceRecord {
-    fn from_claim(claim: &SourceClaim, state: SourceState, str_record: &StrRecord) -> Self {
+    fn from_claim(
+        claim: &SourceClaim,
+        state: SourceState,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> Self {
         let mut str_record = str_record.clone();
         str_record.mountpoint = claim.mountpoint.clone();
         Self {
@@ -180,6 +235,7 @@ impl SourceRecord {
             relay_endpoint: claim.relay_endpoint.clone(),
             effective_user_id: claim.effective_user_id.clone(),
             created_at: claim.created_at.clone(),
+            admission,
             str_record,
         }
     }
@@ -208,7 +264,9 @@ pub(crate) fn decode_source_route(value: &[u8]) -> Result<Option<SourceRoute>, C
         caster_id: record.caster_id,
         runtime_epoch: record.runtime_epoch,
         relay_endpoint: record.relay_endpoint,
+        created_at: record.created_at,
         str_record: record.str_record,
+        admission: record.admission,
     }))
 }
 
@@ -323,6 +381,7 @@ pub(crate) async fn prepare_source_claim(
         &claim,
         SourceState::Validating,
         &provisional_str,
+        None,
     ))?;
     let generation_compare = match generation_value {
         Some(value) => Compare::value(generation_key.clone(), CompareOp::Equal, value.value()),
@@ -361,10 +420,20 @@ pub async fn publish_active(
     claimed: &ClaimedSource,
     str_record: &StrRecord,
 ) -> Result<(), ClaimError> {
+    publish_active_with_summary(client, claimed, str_record, None).await
+}
+
+pub async fn publish_active_with_summary(
+    client: &mut Client,
+    claimed: &ClaimedSource,
+    str_record: &StrRecord,
+    admission: Option<SourceAdmissionSummary>,
+) -> Result<(), ClaimError> {
     let active_source_value = serde_json::to_vec(&SourceRecord::from_claim(
         &claimed.claim,
         SourceState::Active,
         str_record,
+        admission,
     ))?;
     let transaction = Txn::new()
         .when(claimed.publish_compares())
@@ -438,6 +507,27 @@ pub async fn activate_source_for_connection(
     runtime_epoch: &str,
     str_record: &StrRecord,
 ) -> Result<(), ClaimError> {
+    activate_source_for_connection_with_summary(
+        client,
+        cluster_id,
+        mountpoint,
+        connection_id,
+        runtime_epoch,
+        str_record,
+        None,
+    )
+    .await
+}
+
+pub async fn activate_source_for_connection_with_summary(
+    client: &mut Client,
+    cluster_id: &str,
+    mountpoint: &str,
+    connection_id: &str,
+    runtime_epoch: &str,
+    str_record: &StrRecord,
+    admission: Option<SourceAdmissionSummary>,
+) -> Result<(), ClaimError> {
     validate_identifier(cluster_id, "cluster ID")?;
     validate_mountpoint(mountpoint)?;
     let claim_key = format!("/rcaster/{cluster_id}/runtime/source-claims/{mountpoint}");
@@ -457,6 +547,7 @@ pub async fn activate_source_for_connection(
         &claim,
         SourceState::Active,
         str_record,
+        admission,
     ))?;
     let transaction = Txn::new()
         .when([

@@ -47,6 +47,7 @@ pub enum BlacklistError {
     NotFound,
     Conflict,
     Etcd(String),
+    Storage(String),
     Json(String),
 }
 
@@ -273,6 +274,7 @@ impl fmt::Display for BlacklistError {
             Self::NotFound => formatter.write_str("blacklist rule not found"),
             Self::Conflict => formatter.write_str("blacklist rule changed concurrently"),
             Self::Etcd(error) => write!(formatter, "blacklist etcd error: {error}"),
+            Self::Storage(error) => write!(formatter, "blacklist storage error: {error}"),
             Self::Json(error) => write!(formatter, "blacklist JSON error: {error}"),
         }
     }
@@ -367,7 +369,7 @@ pub async fn delete_blacklist_rule(
     }
 }
 
-fn validate_rule(rule: &BlacklistRule) -> Result<(), BlacklistError> {
+pub(crate) fn validate_rule(rule: &BlacklistRule) -> Result<(), BlacklistError> {
     if rule.schema_version != 1
         || rule.id.is_empty()
         || rule.id.len() > 128

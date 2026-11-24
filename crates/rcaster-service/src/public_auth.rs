@@ -37,6 +37,8 @@ pub struct MonitorTicket {
     pub session_id: String,
     pub mountpoint: String,
     pub client_ip: String,
+    #[serde(default)]
+    pub source_generation: Option<u64>,
     pub created_at: u64,
     pub expires_at: u64,
 }
@@ -176,6 +178,7 @@ pub async fn issue_ticket(
     identity: &PublicIdentity,
     mountpoint: &str,
     client_ip: &str,
+    source_generation: Option<u64>,
 ) -> Result<String, PublicAuthError> {
     let ticket_id = random_hex();
     let secret = random_hex();
@@ -191,6 +194,7 @@ pub async fn issue_ticket(
         session_id: identity.session_id.clone(),
         mountpoint: mountpoint.to_owned(),
         client_ip: client_ip.to_owned(),
+        source_generation,
         created_at: now,
         expires_at: now.saturating_add(MONITOR_TICKET_TTL_S as u64),
     };
@@ -210,7 +214,7 @@ pub async fn consume_ticket(
     ticket: &str,
     mountpoint: &str,
     client_ip: &str,
-) -> Result<PublicIdentity, PublicAuthError> {
+) -> Result<(PublicIdentity, Option<u64>), PublicAuthError> {
     let (ticket_id, secret) = split_token(ticket).ok_or(PublicAuthError::Invalid)?;
     let key = ticket_key(directory, ticket_id)?;
     let (stored, revision) = directory
@@ -231,13 +235,16 @@ pub async fn consume_ticket(
         return Err(PublicAuthError::Invalid);
     }
     let user = current_user(directory, &ticket.user_id, ticket.auth_version).await?;
-    Ok(PublicIdentity {
-        user_id: user.user_id,
-        username: user.username,
-        auth_version: user.auth_version,
-        session_id: ticket.session_id,
-        csrf_token: String::new(),
-    })
+    Ok((
+        PublicIdentity {
+            user_id: user.user_id,
+            username: user.username,
+            auth_version: user.auth_version,
+            session_id: ticket.session_id,
+            csrf_token: String::new(),
+        },
+        ticket.source_generation,
+    ))
 }
 
 pub async fn still_authorized(directory: &AccountDirectory, identity: &PublicIdentity) -> bool {

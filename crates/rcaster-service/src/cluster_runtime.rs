@@ -32,8 +32,9 @@ use crate::{
     coordinator_grpc::GrpcAdmissionClient,
     session_watch::SessionWatcher,
     source_claim::{
-        ClaimError, SourceClaimRequest, SourceRoute, activate_source_for_connection,
-        publish_active, release_source, release_source_for_connection,
+        ClaimError, SourceAdmissionSummary, SourceClaimRequest, SourceRoute,
+        activate_source_for_connection_with_summary, publish_active_with_summary, release_source,
+        release_source_for_connection,
     },
     source_watch::SourceWatcher,
 };
@@ -510,23 +511,37 @@ impl ClusterRuntime {
         permit: &ClusterSourcePermit,
         str_record: &StrRecord,
     ) -> Result<(), AdmissionError> {
+        self.activate_source_with_summary(permit, str_record, None)
+            .await
+    }
+
+    pub async fn activate_source_with_summary(
+        &mut self,
+        permit: &ClusterSourcePermit,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> Result<(), AdmissionError> {
         match permit {
-            ClusterSourcePermit::Local(permit) => {
-                publish_active(&mut self.client, &permit.claimed_source, str_record)
-                    .await
-                    .map_err(AdmissionError::Source)
-            }
+            ClusterSourcePermit::Local(permit) => publish_active_with_summary(
+                &mut self.client,
+                &permit.claimed_source,
+                str_record,
+                admission,
+            )
+            .await
+            .map_err(AdmissionError::Source),
             ClusterSourcePermit::Grpc {
                 mountpoint,
                 connection_id,
                 ..
-            } => activate_source_for_connection(
+            } => activate_source_for_connection_with_summary(
                 &mut self.client,
                 &self.options.cluster_id,
                 mountpoint,
                 connection_id,
                 &self.options.runtime_epoch,
                 str_record,
+                admission,
             )
             .await
             .map_err(AdmissionError::Source),
@@ -1246,12 +1261,22 @@ impl SharedClusterRuntime {
         permit: &ClusterSourcePermit,
         str_record: &StrRecord,
     ) -> Result<(), AdmissionError> {
+        self.activate_source_with_summary(permit, str_record, None)
+            .await
+    }
+
+    pub async fn activate_source_with_summary(
+        &self,
+        permit: &ClusterSourcePermit,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> Result<(), AdmissionError> {
         self.inner
             .lock()
             .await
             .as_mut()
             .ok_or(AdmissionError::CoordinatorUnavailable)?
-            .activate_source(permit, str_record)
+            .activate_source_with_summary(permit, str_record, admission)
             .await
     }
 
