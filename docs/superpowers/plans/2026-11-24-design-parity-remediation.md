@@ -490,6 +490,8 @@ git commit -m "fix: merge configured mountpoint STR metadata"
 
 ### Task 4: Source Health and Metrics
 
+**Status:** Complete locally for the planned core health warnings and low-cardinality metrics.
+
 **Files:**
 - Modify: `crates/rcaster-service/src/config.rs`
 - Modify: `crates/rcaster-service/src/hub.rs`
