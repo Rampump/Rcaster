@@ -315,6 +315,48 @@ fn resolves_tls_files_and_rejects_partial_tls_configuration() {
 }
 
 #[test]
+fn standalone_admin_uses_server_tls_without_a_cluster() {
+    let directory = TempDirectory::new();
+    let path = directory.path().join("caster.json");
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "admin_bind": "127.0.0.1:2103",
+            "account_db": "accounts.redb",
+            "tls_certificate": "server.crt",
+            "tls_private_key": "server.key",
+            "source_auth_require_tls": false
+        }"#,
+    )
+    .expect("write standalone admin config");
+    let private_key = directory.path().join("server.key");
+    fs::write(&private_key, "fixture").expect("write private key fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&private_key, fs::Permissions::from_mode(0o600))
+            .expect("protect private key fixture");
+    }
+    StandaloneConfig::load(&path).expect("standalone admin should load");
+
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "admin_bind": "127.0.0.1:2103",
+            "account_db": "accounts.redb",
+            "source_auth_require_tls": false
+        }"#,
+    )
+    .expect("write TLS-less standalone admin config");
+    assert!(matches!(
+        StandaloneConfig::load(&path),
+        Err(ConfigError::IncompleteTls)
+    ));
+}
+
+#[test]
 fn loads_and_validates_online_ocsp_responders() {
     let directory = TempDirectory::new();
     let path = directory.path().join("caster.json");

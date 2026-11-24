@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, error, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -496,6 +497,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
         let monitor_shutdown = shutdown_rx.clone();
         let monitor = tokio::spawn(async move {
             let mut shutdown = monitor_shutdown;
+            let mut source_warning_states = BTreeMap::<String, u8>::new();
             loop {
                 monitor_health.set_ready(match &monitor_runtime {
                     Some(runtime) => runtime.is_healthy().await,
@@ -534,6 +536,35 @@ async fn serve(args: &[String]) -> AppResult<()> {
                         .and_then(ReloadableTlsConfig::certificate_expiry),
                 );
                 monitor_health.set_hub_metrics(monitor_hub.metrics());
+                let active_sources = monitor_hub.active_sources();
+                for mountpoint in &active_sources {
+                    let Some(health) = monitor_hub.source_health(mountpoint) else {
+                        continue;
+                    };
+                    let previous = source_warning_states
+                        .insert(mountpoint.clone(), health.warning_codes)
+                        .unwrap_or_default();
+                    if previous == 0 && health.warning_codes != 0 {
+                        monitor_health.record_source_event(
+                            mountpoint,
+                            "health_alert",
+                            Some(&format!("warning_codes={}", health.warning_codes)),
+                            None,
+                            None,
+                        );
+                    } else if previous != 0 && health.warning_codes == 0 {
+                        monitor_health.record_source_event(
+                            mountpoint,
+                            "health_clear",
+                            None,
+                            None,
+                            None,
+                        );
+                    }
+                }
+                source_warning_states.retain(|mountpoint, _| {
+                    active_sources.iter().any(|active| active == mountpoint)
+                });
                 monitor_health.set_process_usage(process_usage());
                 let sessions = match &monitor_runtime {
                     Some(runtime) => runtime.session_count().await,
@@ -614,51 +645,142 @@ async fn serve(args: &[String]) -> AppResult<()> {
         })
     });
     let admin_task = if let Some(bind) = config.admin_bind.as_deref() {
-        let cluster = config
-            .cluster
-            .as_ref()
-            .ok_or("admin API requires cluster")?;
-        let tls = cluster
-            .coordinator_tls
-            .as_ref()
-            .ok_or("admin API requires coordinator_tls")?;
         let listener = TcpListener::bind(bind).await?;
         let address = listener.local_addr()?;
-        let upgrades = if let Some(upgrade) = &config.upgrade {
-            let policy = UpgradePolicy::new(&upgrade.trusted_public_keys, &upgrade.artifact_hosts)
-                .map_err(|error| format!("invalid upgrade policy: {error}"))?;
-            Some(UpgradeManager::new_with_approval(
-                etcd.as_ref()
-                    .ok_or("cluster etcd client unavailable")?
-                    .client(),
+        let (
+            cluster_id,
+            caster_id,
+            service_token,
+            admin_runtime,
+            admin_relays,
+            relay_tls,
+            upgrades,
+            reloadable_tls,
+        ) = if let Some(cluster) = config.cluster.as_ref() {
+            let tls = cluster
+                .coordinator_tls
+                .as_ref()
+                .ok_or("admin API requires coordinator_tls")?;
+            let upgrades = if let Some(upgrade) = &config.upgrade {
+                let policy =
+                    UpgradePolicy::new(&upgrade.trusted_public_keys, &upgrade.artifact_hosts)
+                        .map_err(|error| format!("invalid upgrade policy: {error}"))?;
+                Some(UpgradeManager::new_with_approval(
+                    etcd.as_ref()
+                        .ok_or("cluster etcd client unavailable")?
+                        .client(),
+                    cluster.cluster_id.clone(),
+                    policy,
+                    upgrade.require_approval,
+                ))
+            } else {
+                None
+            };
+            let reloadable_tls = match &tls.server_ocsp_responder {
+                Some(responder) => ReloadableTlsConfig::from_files_with_ocsp_responder(
+                    tls.certificate.clone(),
+                    tls.private_key.clone(),
+                    Some(tls.ca_certificate.clone()),
+                    config.admin_client_crl.clone(),
+                    tls.server_ocsp_response.clone(),
+                    responder.to_runtime_config(),
+                    Duration::from_secs(10),
+                )?,
+                None => match &tls.server_ocsp_response {
+                    Some(ocsp_response) => {
+                        ReloadableTlsConfig::from_files_with_client_crl_and_ocsp(
+                            tls.certificate.clone(),
+                            tls.private_key.clone(),
+                            Some(tls.ca_certificate.clone()),
+                            config.admin_client_crl.clone(),
+                            ocsp_response.clone(),
+                            Duration::from_secs(10),
+                        )?
+                    }
+                    None => ReloadableTlsConfig::from_files_with_client_crl(
+                        tls.certificate.clone(),
+                        tls.private_key.clone(),
+                        Some(tls.ca_certificate.clone()),
+                        config.admin_client_crl.clone(),
+                        Duration::from_secs(10),
+                    )?,
+                },
+            };
+            (
                 cluster.cluster_id.clone(),
-                policy,
-                upgrade.require_approval,
-            ))
+                cluster.caster_id.clone(),
+                tls.service_token.clone(),
+                cluster_runtime.clone(),
+                relay_manager.clone(),
+                Some(GrpcClientTls {
+                    ca_certificate_pem: fs::read_to_string(&tls.ca_certificate)?,
+                    certificate_pem: fs::read_to_string(&tls.certificate)?,
+                    private_key_pem: fs::read_to_string(&tls.private_key)?,
+                    server_name: tls.server_name.clone(),
+                    service_token: tls.service_token.clone(),
+                }),
+                upgrades,
+                reloadable_tls,
+            )
         } else {
-            None
+            let certificate = config
+                .tls_certificate
+                .clone()
+                .ok_or("standalone admin API requires tls_certificate")?;
+            let private_key = config
+                .tls_private_key
+                .clone()
+                .ok_or("standalone admin API requires tls_private_key")?;
+            let reloadable_tls = match (&config.tls_ocsp_responder, &config.tls_ocsp_response) {
+                (Some(responder), _) => ReloadableTlsConfig::from_files_with_ocsp_responder(
+                    certificate,
+                    private_key,
+                    None,
+                    None,
+                    config.tls_ocsp_response.clone(),
+                    responder.to_runtime_config(),
+                    Duration::from_secs(10),
+                )?,
+                (None, Some(ocsp_response)) => ReloadableTlsConfig::from_files_with_ocsp(
+                    certificate,
+                    private_key,
+                    None,
+                    ocsp_response.clone(),
+                    Duration::from_secs(10),
+                )?,
+                (None, None) => ReloadableTlsConfig::from_files(
+                    certificate,
+                    private_key,
+                    None,
+                    Duration::from_secs(10),
+                )?,
+            };
+            (
+                "standalone".to_owned(),
+                "standalone".to_owned(),
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                reloadable_tls,
+            )
         };
         let state = AdminState {
-            cluster_id: cluster.cluster_id.clone(),
-            caster_id: cluster.caster_id.clone(),
-            token: tls.service_token.clone(),
+            cluster_id,
+            caster_id,
+            token: service_token,
             ready: Arc::clone(&health_state),
             hub: Arc::clone(&hub),
-            runtime: cluster_runtime.clone(),
-            relays: relay_manager.clone(),
+            runtime: admin_runtime,
+            relays: admin_relays,
             near_mountpoint: config
                 .near
                 .as_ref()
                 .filter(|near| near.enabled)
                 .map(|near| near.mountpoint.clone()),
             accounts: account_directory.clone(),
-            relay_tls: Some(GrpcClientTls {
-                ca_certificate_pem: fs::read_to_string(&tls.ca_certificate)?,
-                certificate_pem: fs::read_to_string(&tls.certificate)?,
-                private_key_pem: fs::read_to_string(&tls.private_key)?,
-                server_name: tls.server_name.clone(),
-                service_token: tls.service_token.clone(),
-            }),
+            relay_tls,
             upgrades,
             proxy_protocol: proxy_protocol.clone(),
             maintenance_state: config.maintenance_state.clone(),
@@ -669,34 +791,6 @@ async fn serve(args: &[String]) -> AppResult<()> {
             websockets: Default::default(),
             connections: Arc::clone(&connections),
             auth_limiter: auth_limiter.clone(),
-        };
-        let reloadable_tls = match &tls.server_ocsp_responder {
-            Some(responder) => ReloadableTlsConfig::from_files_with_ocsp_responder(
-                tls.certificate.clone(),
-                tls.private_key.clone(),
-                Some(tls.ca_certificate.clone()),
-                config.admin_client_crl.clone(),
-                tls.server_ocsp_response.clone(),
-                responder.to_runtime_config(),
-                Duration::from_secs(10),
-            )?,
-            None => match &tls.server_ocsp_response {
-                Some(ocsp_response) => ReloadableTlsConfig::from_files_with_client_crl_and_ocsp(
-                    tls.certificate.clone(),
-                    tls.private_key.clone(),
-                    Some(tls.ca_certificate.clone()),
-                    config.admin_client_crl.clone(),
-                    ocsp_response.clone(),
-                    Duration::from_secs(10),
-                )?,
-                None => ReloadableTlsConfig::from_files_with_client_crl(
-                    tls.certificate.clone(),
-                    tls.private_key.clone(),
-                    Some(tls.ca_certificate.clone()),
-                    config.admin_client_crl.clone(),
-                    Duration::from_secs(10),
-                )?,
-            },
         };
         let task = tokio::spawn(serve_admin_mtls_reloadable(
             listener,

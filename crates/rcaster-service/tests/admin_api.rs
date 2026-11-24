@@ -258,6 +258,99 @@ async fn admin_routes_require_mtls_and_service_token() {
     server.await.expect("server task").expect("admin server");
 }
 
+#[tokio::test]
+async fn standalone_admin_login_lists_local_sources() {
+    let pki = TestPki::generate();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("admin listener");
+    let address = listener.local_addr().expect("admin address");
+    let hub = Arc::new(MountpointHub::new(8).expect("hub"));
+    let source = hub.claim_source("C63").expect("source");
+    source
+        .set_str_record(StrRecord::from_profile("C63", &DataProfile::default()))
+        .expect("activate source");
+    let user = User {
+        schema_version: 1,
+        mod_revision: 0,
+        user_id: "standalone-admin".to_owned(),
+        username: "standalone-admin".to_owned(),
+        password_hash: rcaster_service::account_auth::hash_password("standalone-secret")
+            .expect("password hash"),
+        auth_version: 1,
+        enabled: true,
+        ntrip_enabled: false,
+        web_enabled: true,
+        role: UserRole::Admin,
+        created_at: "2026-11-25T00:00:00Z".to_owned(),
+        updated_at: "2026-11-25T00:00:00Z".to_owned(),
+    };
+    let accounts = rcaster_service::account_directory::AccountDirectory::static_snapshot(
+        AccountSnapshot::new([user], std::iter::empty::<Mountpoint>())
+            .expect("standalone account snapshot"),
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_admin_mtls(
+        listener,
+        pki.server_tls(),
+        AdminState {
+            cluster_id: "standalone".to_owned(),
+            caster_id: "standalone".to_owned(),
+            token: "service-secret".to_owned(),
+            ready: Arc::new(HealthState::default()),
+            hub,
+            runtime: None,
+            relays: None,
+            near_mountpoint: None,
+            accounts,
+            relay_tls: None,
+            upgrades: None,
+            proxy_protocol: None,
+            maintenance_state: None,
+            listener_tls: None,
+            config_revision_retention: 200,
+            login_limiter: Default::default(),
+            audit: Default::default(),
+            websockets: Default::default(),
+            connections: Arc::new(ConnectionController::default()),
+            auth_limiter: Default::default(),
+        },
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let login = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/auth/login",
+        "",
+        "",
+        r#"{"username":"standalone-admin","password":"standalone-secret"}"#,
+    )
+    .await;
+    assert!(login.starts_with("HTTP/1.1 200 OK"), "{login}");
+    let cookie = response_header(&login, "set-cookie")
+        .and_then(|value| value.split(';').next())
+        .expect("admin cookie");
+    let sources = request_raw(
+        address,
+        &pki,
+        "GET",
+        "/admin/v1/sources",
+        "",
+        &format!("Cookie: {cookie}\r\n"),
+        "",
+    )
+    .await;
+    assert!(sources.starts_with("HTTP/1.1 200 OK"), "{sources}");
+    assert!(sources.contains("\"mountpoint\":\"C63\""), "{sources}");
+
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("admin task").expect("admin server");
+}
+
 async fn request(
     address: std::net::SocketAddr,
     pki: &TestPki,

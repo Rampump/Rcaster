@@ -644,6 +644,121 @@ async fn serve_loads_certificates_and_accepts_tls_source() {
 }
 
 #[tokio::test]
+async fn standalone_admin_tls_login_lists_local_sources() {
+    let directory = TempDirectory::new();
+    let database = directory.path().join("accounts.redb");
+    write_admin_accounts(&database);
+    let pki = TestPki::generate(directory.path());
+    let clear_port = available_port();
+    let config = directory.path().join("caster.json");
+    fs::write(
+        &config,
+        serde_json::to_vec_pretty(&json!({
+            "bind": format!("127.0.0.1:{clear_port}"),
+            "admin_bind": "127.0.0.1:0",
+            "account_db": database,
+            "tls_certificate": "server.crt",
+            "tls_private_key": "server.key",
+            "client_auth_require_tls": false,
+            "source_auth_require_tls": false,
+            "head_timeout_ms": 1000
+        }))
+        .expect("encode standalone admin config"),
+    )
+    .expect("write standalone admin config");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rcaster"));
+    command
+        .arg("serve")
+        .arg("--config")
+        .arg(&config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("start standalone admin");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut lines = BufReader::new(stdout).lines();
+    let admin_line = timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("admin listener startup timeout")
+        .expect("read stdout")
+        .expect("admin listener line");
+    let admin_address = admin_line
+        .strip_prefix("admin listening on ")
+        .expect("admin listener announcement")
+        .to_owned();
+    let mut roots = RootCertStore::empty();
+    roots
+        .add_parsable_certificates(pki.ca_der)
+        .0
+        .eq(&1)
+        .then_some(())
+        .expect("trusted test CA");
+    let connector = TlsConnector::from(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let tcp = TcpStream::connect(&admin_address)
+        .await
+        .expect("connect standalone admin");
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").expect("server name"), tcp)
+        .await
+        .expect("standalone admin TLS handshake");
+    let body = br#"{"username":"standalone-admin","password":"standalone-secret"}"#;
+    stream
+        .write_all(
+            format!(
+                "POST /admin/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("login request head");
+    stream.write_all(body).await.expect("login request body");
+    let mut login = Vec::new();
+    let _ = stream.read_to_end(&mut login).await;
+    let login = String::from_utf8(login).expect("UTF-8 login response");
+    assert!(login.starts_with("HTTP/1.1 200 OK"), "{login}");
+    let cookie = login
+        .lines()
+        .find_map(|line| line.strip_prefix("set-cookie: "))
+        .or_else(|| {
+            login
+                .lines()
+                .find_map(|line| line.strip_prefix("Set-Cookie: "))
+        })
+        .and_then(|value| value.split(';').next())
+        .expect("standalone admin cookie");
+
+    let tcp = TcpStream::connect(&admin_address)
+        .await
+        .expect("reconnect standalone admin");
+    let mut stream = connector
+        .connect(ServerName::try_from("localhost").expect("server name"), tcp)
+        .await
+        .expect("standalone admin TLS handshake");
+    stream
+        .write_all(
+            format!(
+                "GET /admin/v1/sources HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("sources request");
+    let mut sources = Vec::new();
+    let _ = stream.read_to_end(&mut sources).await;
+    let sources = String::from_utf8(sources).expect("UTF-8 sources response");
+    assert!(sources.starts_with("HTTP/1.1 200 OK"), "{sources}");
+    assert!(sources.contains("\"sources\":[]"), "{sources}");
+
+    child.kill().await.expect("stop standalone admin");
+    child.wait().await.expect("wait standalone admin");
+}
+
+#[tokio::test]
 async fn serve_starts_public_tls_without_ntrip_tls_listener() {
     let directory = TempDirectory::new();
     let database = directory.path().join("accounts.redb");
@@ -798,6 +913,30 @@ fn write_accounts(path: &Path) {
         .expect("open account store")
         .replace(&snapshot)
         .expect("write accounts");
+}
+
+fn write_admin_accounts(path: &Path) {
+    let (_, mut mountpoint) = account_records();
+    mountpoint.owner_user_id = "standalone-admin".to_owned();
+    let user = User {
+        schema_version: 1,
+        mod_revision: 1,
+        user_id: "standalone-admin".to_owned(),
+        username: "standalone-admin".to_owned(),
+        password_hash: hash_password("standalone-secret").expect("admin password hash"),
+        auth_version: 1,
+        enabled: true,
+        ntrip_enabled: false,
+        web_enabled: true,
+        role: UserRole::Admin,
+        created_at: "2026-11-25T00:00:00Z".to_owned(),
+        updated_at: "2026-11-25T00:00:00Z".to_owned(),
+    };
+    let snapshot = AccountSnapshot::new([user], [mountpoint]).expect("admin account snapshot");
+    AccountStore::open(path)
+        .expect("open account store")
+        .replace(&snapshot)
+        .expect("write admin accounts");
 }
 
 fn account_records() -> (User, Mountpoint) {

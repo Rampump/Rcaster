@@ -311,7 +311,7 @@ async fn live_crtk_sourcetable_models_near_candidates() {
 
 #[test]
 #[ignore = "offline CRTK.NET snapshot and synthetic motion paths"]
-fn offline_snapshot_matches_full_scan_and_motion_paths() {
+fn offline_snapshot_matches_full_scan_and_stationary_arrival_switches() {
     let candidates = load_offline_snapshot();
     assert!(candidates.len() > 100, "offline snapshot is too small");
     let index = NearIndex::new(&candidates);
@@ -422,6 +422,57 @@ fn offline_snapshot_matches_full_scan_and_motion_paths() {
             switches[0].1
         );
     }
+}
+
+#[test]
+fn moving_gga_crossing_is_a_known_gap_without_switches() {
+    let a = position(30.0, 120.0);
+    let b = position(30.018, 120.0);
+    let candidates = vec![
+        NearSource {
+            mountpoint: "A".to_owned(),
+            position: a,
+            format: DataFormat::Rtcm3,
+            usable_correction: true,
+        },
+        NearSource {
+            mountpoint: "B".to_owned(),
+            position: b,
+            format: DataFormat::Rtcm3,
+            usable_correction: true,
+        },
+    ];
+    let index = NearIndex::new(&candidates);
+    let mut selector = NearSelector::new(NearConfig::default());
+    let start = Instant::now();
+    assert_eq!(
+        selector
+            .update_indexed(&gga(30.0, 120.0, 0.9), &index, start)
+            .as_deref(),
+        Some("A")
+    );
+
+    let mut switches = 0;
+    for second in 1..=300 {
+        let latitude = 30.0 + 8.0 * second as f64 / 111_320.0;
+        if latitude > 30.018 + 0.002 {
+            break;
+        }
+        if selector
+            .update_indexed(
+                &gga(latitude, 120.0, 0.9),
+                &index,
+                start + Duration::from_secs(second),
+            )
+            .is_some()
+        {
+            switches += 1;
+        }
+    }
+    assert_eq!(
+        switches, 0,
+        "known gap resolved: update expected mobile switches"
+    );
 }
 
 fn load_offline_snapshot() -> Vec<NearSource> {

@@ -286,12 +286,6 @@ async fn handle(
         return serve_admin_websocket(stream, state, &headers, &query).await;
     }
     if method == "POST" && path == "/admin/v1/auth/login" {
-        if state.runtime.is_none() {
-            return Ok(response(
-                503,
-                json!({"code":"UNAVAILABLE","message":"cluster runtime unavailable"}),
-            ));
-        }
         let Ok(body) = serde_json::from_str::<Value>(body) else {
             return Ok(response(
                 400,
@@ -2222,11 +2216,26 @@ async fn handle(
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(100)
                 .clamp(1, 1000);
-            match state.audit.recent(limit.saturating_mul(4)).await {
+            let before = query.get("before").copied();
+            match state.audit.recent(1000).await {
                 Ok(events) => {
-                    let events = events
+                    let mut events = events
                         .into_iter()
                         .filter(|event| event.action.starts_with("source."))
+                        .collect::<Vec<_>>();
+                    if let Some(before) = before {
+                        if let Some(position) =
+                            events.iter().position(|event| event.request_id == before)
+                        {
+                            events.drain(..=position);
+                        } else {
+                            events.clear();
+                        }
+                    }
+                    let next_cursor =
+                        (events.len() > limit).then(|| events[limit - 1].request_id.clone());
+                    let events = events
+                        .into_iter()
                         .take(limit)
                         .map(|event| {
                             json!({
@@ -2241,7 +2250,11 @@ async fn handle(
                             })
                         })
                         .collect::<Vec<_>>();
-                    json!({"events": events, "limit": limit})
+                    json!({
+                        "events": events,
+                        "limit": limit,
+                        "next_cursor": next_cursor
+                    })
                 }
                 Err(_) => {
                     return Ok(response(

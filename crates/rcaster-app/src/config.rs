@@ -519,11 +519,10 @@ impl StandaloneConfig {
             return Err(ConfigError::InvalidBind);
         }
         if self.admin_bind.is_some()
-            && self
-                .cluster
-                .as_ref()
-                .and_then(|cluster| cluster.coordinator_tls.as_ref())
-                .is_none()
+            && match self.cluster.as_ref() {
+                Some(cluster) => cluster.coordinator_tls.is_none(),
+                None => self.tls_certificate.is_none() || self.tls_private_key.is_none(),
+            }
         {
             return Err(ConfigError::IncompleteTls);
         }

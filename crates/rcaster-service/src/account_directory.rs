@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     sync::{
         Arc, RwLock,
@@ -27,6 +28,13 @@ pub struct AccountDirectory {
     cluster_id: Option<String>,
     store: Option<Arc<Mutex<AccountStore>>>,
     blacklist: Arc<RwLock<Vec<BlacklistRule>>>,
+    local_admin_sessions: Arc<std::sync::Mutex<HashMap<String, LocalAdminSession>>>,
+}
+
+#[derive(Clone)]
+struct LocalAdminSession {
+    value: Vec<u8>,
+    expires_at: u64,
 }
 
 pub struct AccountWatcher {
@@ -107,6 +115,7 @@ impl AccountDirectory {
             cluster_id: None,
             store: None,
             blacklist: Arc::new(RwLock::new(Vec::new())),
+            local_admin_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -122,6 +131,7 @@ impl AccountDirectory {
             cluster_id: None,
             store: Some(Arc::new(Mutex::new(store))),
             blacklist: Arc::new(RwLock::new(blacklist)),
+            local_admin_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -138,6 +148,52 @@ impl AccountDirectory {
 
     pub fn is_writable(&self) -> bool {
         self.client.is_some() || self.store.is_some()
+    }
+
+    pub(crate) fn is_clustered(&self) -> bool {
+        self.client.is_some()
+    }
+
+    pub(crate) fn local_admin_session_put(
+        &self,
+        session_id: &str,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) {
+        self.local_admin_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                session_id.to_owned(),
+                LocalAdminSession { value, expires_at },
+            );
+    }
+
+    pub(crate) fn local_admin_session_get(&self, session_id: &str) -> Option<Vec<u8>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut sessions = self
+            .local_admin_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sessions
+            .get(session_id)
+            .is_some_and(|session| session.expires_at <= now)
+        {
+            sessions.remove(session_id);
+        }
+        sessions
+            .get(session_id)
+            .map(|session| session.value.clone())
+    }
+
+    pub(crate) fn local_admin_session_delete(&self, session_id: &str) {
+        self.local_admin_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
     }
 
     pub fn blacklist_rules(&self) -> Vec<BlacklistRule> {
@@ -643,6 +699,7 @@ impl AccountWatcher {
             cluster_id: Some(cluster_id.to_owned()),
             store: None,
             blacklist: Arc::new(RwLock::new(Vec::new())),
+            local_admin_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_directory = directory.clone();

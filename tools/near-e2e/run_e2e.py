@@ -721,10 +721,16 @@ def main() -> int:
             {point.station_id: point.mountpoint for point in cluster_points},
         )
         add(
-            "L2-04-one-switch",
-            [a.station_id, b.station_id],
-            [item[1] for item in seen],
-            f"move_duration={move_duration:.2f}s",
+            "L2-04-one-switch-fast-query",
+            True,
+            len(seen) == 2
+            and [item[1] for item in seen] == [a.station_id, b.station_id]
+            and seen[1][0] >= 3.0,
+            {
+                "stations": [item[1] for item in seen],
+                "switch_times_s": [round(item[0], 3) for item in seen],
+                "move_duration_s": move_duration,
+            },
         )
         evidence_logs["L2-04-one-switch"] = one_switch_log
 
@@ -760,10 +766,17 @@ def main() -> int:
             {point.station_id: point.mountpoint for point in cluster_points},
         )
         add(
-            "L2-05-two-switches",
-            [a.station_id, b.station_id, c.station_id],
-            [item[1] for item in seen],
-            "monotonic A->B->C",
+            "L2-05-two-switches-fast-query",
+            True,
+            [item[1] for item in seen]
+            == [a.station_id, b.station_id, c.station_id]
+            and seen[1][0] >= 3.0
+            and seen[2][0] >= seen[1][0] + 3.0,
+            {
+                "stations": [item[1] for item in seen],
+                "switch_times_s": [round(item[0], 3) for item in seen],
+                "monotonic": True,
+            },
         )
         evidence_logs["L2-05-two-switches"] = two_switches_log
         harness.stop_sources()
@@ -900,20 +913,21 @@ def main() -> int:
         closed_event = next(
             (item for item in drop_log if item.get("event") == "closed"), None
         )
-        disconnect_ok = (
-            bool(drop_seen) and drop_seen[-1][1] == drop_b.station_id
-        ) or (
-            closed_event is not None and float(closed_event["t"]) <= 10.5
-        )
         add(
-            "L2-10-active-disconnect",
-            True,
-            disconnect_ok,
+            "L2-10a-active-disconnect-failover",
+            drop_b.station_id,
+            drop_seen[-1][1] if drop_seen else None,
             {
                 "stations": [item[1] for item in drop_seen],
                 "closed": closed_event,
                 "sources": [p.station_id for p in drop_points],
             },
+        )
+        add(
+            "L2-10b-active-disconnect-close",
+            True,
+            closed_event is not None and float(closed_event["t"]) <= 10.5,
+            closed_event or {"event": "connection remained open"},
         )
         evidence_logs["L2-10-active-disconnect"] = drop_log
         harness.stop_sources()

@@ -265,14 +265,19 @@ pub async fn login(
         created_at: now,
         expires_at,
     };
-    let lease_id = directory.etcd_lease(ADMIN_SESSION_TTL_S).await?;
-    directory
-        .etcd_put(
-            &session_key(directory, &session_id)?,
-            serde_json::to_vec(&session).map_err(|_| AdminAuthError::Unavailable)?,
-            Some(lease_id),
-        )
-        .await?;
+    let session_value = serde_json::to_vec(&session).map_err(|_| AdminAuthError::Unavailable)?;
+    if directory.is_clustered() {
+        let lease_id = directory.etcd_lease(ADMIN_SESSION_TTL_S).await?;
+        directory
+            .etcd_put(
+                &session_key(directory, &session_id)?,
+                session_value,
+                Some(lease_id),
+            )
+            .await?;
+    } else {
+        directory.local_admin_session_put(&session_id, session_value, expires_at);
+    }
     Ok(IssuedSession {
         identity: AdminIdentity {
             user_id: user.user_id,
@@ -308,9 +313,13 @@ pub async fn logout(
     identity: &AdminIdentity,
 ) -> Result<(), AdminAuthError> {
     if let Some(session_id) = &identity.session_id {
-        directory
-            .etcd_delete(&session_key(directory, session_id)?)
-            .await?;
+        if directory.is_clustered() {
+            directory
+                .etcd_delete(&session_key(directory, session_id)?)
+                .await?;
+        } else {
+            directory.local_admin_session_delete(session_id);
+        }
     }
     Ok(())
 }
@@ -384,6 +393,9 @@ pub async fn create_api_token(
 pub async fn list_api_tokens(
     directory: &AccountDirectory,
 ) -> Result<Vec<ApiTokenView>, AdminAuthError> {
+    if !directory.is_clustered() {
+        return Ok(Vec::new());
+    }
     let prefix = api_token_prefix(directory)?;
     let last_used_prefix = api_token_last_used_prefix(directory)?;
     let last_used = directory
@@ -469,11 +481,17 @@ async fn authenticate_session(
     cookie: &str,
 ) -> Result<AdminIdentity, AdminAuthError> {
     let (session_id, secret) = split_token(cookie).ok_or(AdminAuthError::Invalid)?;
-    let stored = directory
-        .etcd_get(&session_key(directory, session_id)?)
-        .await?
-        .ok_or(AdminAuthError::Invalid)?
-        .0;
+    let stored = if directory.is_clustered() {
+        directory
+            .etcd_get(&session_key(directory, session_id)?)
+            .await?
+            .ok_or(AdminAuthError::Invalid)?
+            .0
+    } else {
+        directory
+            .local_admin_session_get(session_id)
+            .ok_or(AdminAuthError::Invalid)?
+    };
     let session: AdminSession =
         serde_json::from_slice(&stored).map_err(|_| AdminAuthError::Invalid)?;
     if session.schema_version != 1 || session.expires_at <= unix_time() {

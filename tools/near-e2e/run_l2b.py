@@ -47,22 +47,79 @@ def main() -> int:
         all_records = harness.all_records
         points = harness.start_sources(all_records, timeout=180)
         station_map = {point.station_id: point.mountpoint for point in points}
-        samples = [
-            all_records[round(index * (len(all_records) - 1) / 49)]
-            for index in range(50)
+        anchors = [
+            all_records[round(index * (len(all_records) - 1) / 24)]
+            for index in range(25)
         ]
+        pairs: list[tuple[dict, dict, float]] = []
+        for anchor in anchors:
+            nearest = min(
+                (
+                    (
+                        run_e2e.haversine_m(
+                            float(anchor["latitude"]),
+                            float(anchor["longitude"]),
+                            float(candidate["latitude"]),
+                            float(candidate["longitude"]),
+                        ),
+                        candidate,
+                    )
+                    for candidate in all_records
+                    if candidate is not anchor
+                ),
+                key=lambda item: item[0],
+            )
+            pairs.append((anchor, nearest[1], nearest[0]))
+        samples: list[dict] = []
+        for index, (left, right, distance) in enumerate(pairs[:15]):
+            latitude = (float(left["latitude"]) + float(right["latitude"])) / 2
+            longitude = (float(left["longitude"]) + float(right["longitude"])) / 2
+            samples.append(
+                {
+                    "label": f"midpoint:{left['mountpoint']}:{right['mountpoint']}",
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "pair_distance_m": distance,
+                }
+            )
+        for index, (left, right, distance) in enumerate(pairs[10:25]):
+            latitude = (float(left["latitude"]) + float(right["latitude"])) / 2
+            longitude = (float(left["longitude"]) + float(right["longitude"])) / 2
+            offset = ((index % 2) * 2 - 1) * 50.0 / 111_320.0
+            samples.append(
+                {
+                    "label": f"offset50:{left['mountpoint']}:{right['mountpoint']}:{index}",
+                    "latitude": latitude + offset,
+                    "longitude": longitude,
+                    "pair_distance_m": distance,
+                }
+            )
+        for index, (left, right, distance) in enumerate(pairs[:20]):
+            fraction = 0.25 if index % 2 == 0 else 0.75
+            latitude, longitude = run_e2e.interpolate(
+                (float(left["latitude"]), float(left["longitude"])),
+                (float(right["latitude"]), float(right["longitude"])),
+                fraction,
+            )
+            samples.append(
+                {
+                    "label": f"fraction{fraction}:{left['mountpoint']}:{right['mountpoint']}",
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "pair_distance_m": distance,
+                }
+            )
 
-        def check(record: dict) -> tuple[dict, list[dict]]:
-            query = harness.point_for(record)
+        def check(sample: dict) -> tuple[dict, list[dict]]:
             expected = run_e2e.nearest(
-                points, query.latitude, query.longitude
+                points, sample["latitude"], sample["longitude"]
             )
             log: list[dict] = []
             seen = run_e2e.collect_client(
                 harness.port,
-                lambda _t, point=query: (
-                    point.latitude,
-                    point.longitude,
+                lambda _t, query=sample: (
+                    query["latitude"],
+                    query["longitude"],
                     0.9,
                 ),
                 4.0,
@@ -70,12 +127,19 @@ def main() -> int:
                 station_map,
             )
             actual = seen[-1][1] if seen else None
+            matched = (
+                expected is None and actual is None
+            ) or (
+                expected is not None and actual == expected.station_id
+            )
             return (
                 {
-                    "query": query.mountpoint,
+                    "query": sample["label"],
+                    "latitude": sample["latitude"],
+                    "longitude": sample["longitude"],
                     "expected_station": expected.station_id if expected else None,
                     "actual_station": actual,
-                    "pass": expected is not None and actual == expected.station_id,
+                    "pass": matched,
                 },
                 log,
             )
