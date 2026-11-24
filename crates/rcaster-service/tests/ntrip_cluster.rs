@@ -27,6 +27,8 @@ use tokio::{
     sync::oneshot,
 };
 
+const RTCM3_1005: &str = "D300133ED0000236FDB80DDE08005B2BC108A7B98D3DD8AB37";
+
 struct TestAuthorizer;
 
 impl SourceAuthorizer for TestAuthorizer {
@@ -61,6 +63,131 @@ impl ClientAuthorizer for TestAuthorizer {
             source_expectation: None,
         })
     }
+}
+
+#[tokio::test]
+async fn uploaded_rtcm3_generates_active_etcd_str_record() {
+    let cluster = unique("ntrip-etcd-str");
+    let mut admin = connect().await;
+    publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, CoordinatorOptions::default())
+            .await
+            .expect("coordinator"),
+    );
+    let shared = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        ClusterRuntimeOptions {
+            cluster_id: cluster.clone(),
+            caster_id: "caster-etcd-str".to_owned(),
+            runtime_epoch: unique("epoch"),
+            relay_endpoint: "10.0.0.23:12102".to_owned(),
+            lease_ttl_s: 30,
+            keep_alive: true,
+        },
+    )
+    .await
+    .expect("runtime");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_ntrip(
+        listener,
+        Arc::new(MountpointHub::new(64).expect("hub")),
+        TestAuthorizer,
+        NtripServerConfig {
+            head_timeout: Duration::from_secs(1),
+            content_length_max_bytes: 1024,
+            client_auth_required: false,
+            session_limiter: Arc::new(
+                LocalSessionLimiter::new(SessionLimitConfig::default()).expect("limiter"),
+            ),
+            connection_limiter: Arc::new(ConnectionLimiter::new(100).expect("connections")),
+            cluster_runtime: Some(shared.clone()),
+            relay_manager: None,
+            source_admission: Some(SourceAdmissionConfig {
+                policy: AdmissionPolicy {
+                    mode: AdmissionMode::Enforce,
+                    allowed_formats: vec![DataFormat::Rtcm3],
+                    require_correction_data: true,
+                    min_valid_frames: 1,
+                    ..AdmissionPolicy::default()
+                },
+                max_bytes: 4096,
+                max_frames: 8,
+                timeout: Duration::from_secs(1),
+                read_timeout: Duration::from_secs(1),
+            }),
+            near: None,
+            accounts: None,
+            metrics: None,
+            connections: None,
+            proxy_protocol: None,
+            auth_login_limiter: None,
+        },
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut source = TcpStream::connect(address).await.expect("source");
+    source
+        .write_all(b"SOURCE secret /C66\r\nUser-Agent: rtcm-test\r\n\r\n")
+        .await
+        .expect("source request");
+    assert_eq!(read_http_head(&mut source).await, b"ICY 200 OK\r\n\r\n");
+    source
+        .write_all(&decode_hex(RTCM3_1005))
+        .await
+        .expect("position frame");
+    source
+        .write_all(&synthetic_rtcm3(1074))
+        .await
+        .expect("MSM frame");
+
+    let value = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let record = admin
+                .get(format!("/rcaster/{cluster}/runtime/sources/C66"), None)
+                .await
+                .expect("read runtime source");
+            if let Some(record) = record.kvs().first() {
+                let value: serde_json::Value =
+                    serde_json::from_slice(record.value()).expect("source record JSON");
+                if value["state"] == "ACTIVE" {
+                    break value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("etcd STR record");
+
+    assert_eq!(value["mountpoint"], "C66");
+    assert_eq!(value["caster_id"], "caster-etcd-str");
+    assert!(value["source_generation"].as_u64().unwrap_or_default() >= 1);
+    assert_eq!(value["str"]["mountpoint"], "C66");
+    assert_eq!(value["str"]["format"], "RTCM 3.3");
+    assert!(
+        value["str"]["format_details"]
+            .as_str()
+            .is_some_and(|details| details.contains("1005") && details.contains("1074"))
+    );
+    assert_ne!(value["str"]["latitude"], "0");
+    assert_ne!(value["str"]["longitude"], "0");
+
+    drop(source);
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("server join").expect("server");
+    shared.shutdown().await.expect("runtime shutdown");
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
 }
 
 #[tokio::test]
@@ -478,6 +605,7 @@ async fn rejected_source_sets_cluster_cooldown_for_reconnect() {
                     min_valid_frames: 1,
                     max_unknown_ratio: None,
                     min_observed_bytes: 0,
+                    ..AdmissionPolicy::default()
                 },
                 max_bytes: 4096,
                 max_frames: 8,
@@ -546,6 +674,42 @@ fn nmea_gga() -> String {
     let body = "GPGGA,000000,0000.0000,N,00000.0000,E,1,08,0.9,0.0,M,0.0,M,,";
     let checksum = body.bytes().fold(0_u8, |checksum, byte| checksum ^ byte);
     format!("${body}*{checksum:02X}\r\n")
+}
+
+fn decode_hex(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
+
+fn synthetic_rtcm3(message_number: u16) -> Vec<u8> {
+    let payload = [
+        (message_number >> 4) as u8,
+        ((message_number & 0x0F) as u8) << 4,
+    ];
+    let mut frame = vec![0xD3, 0, payload.len() as u8];
+    frame.extend_from_slice(&payload);
+    let crc = crc24q(&frame);
+    frame.extend_from_slice(&crc.to_be_bytes()[1..]);
+    frame
+}
+
+fn crc24q(data: &[u8]) -> u32 {
+    let mut crc = 0_u32;
+    for byte in data {
+        crc ^= u32::from(*byte) << 16;
+        for _ in 0..8 {
+            crc <<= 1;
+            if crc & 0x100_0000 != 0 {
+                crc ^= 0x1864CFB;
+            }
+        }
+    }
+    crc & 0xFF_FFFF
 }
 
 async fn read_http_head(stream: &mut TcpStream) -> Vec<u8> {

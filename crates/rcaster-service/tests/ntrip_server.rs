@@ -831,6 +831,7 @@ async fn source_admission_window_gates_fanout_until_accept() {
             min_valid_frames: 1,
             max_unknown_ratio: None,
             min_observed_bytes: 0,
+            ..AdmissionPolicy::default()
         },
         frame.len() as u64 + 16,
         Duration::from_secs(1),
@@ -875,6 +876,7 @@ async fn admission_preserves_partial_frame_after_accept() {
             min_valid_frames: 1,
             max_unknown_ratio: None,
             min_observed_bytes: 0,
+            ..AdmissionPolicy::default()
         },
         (frame.len() * 2) as u64,
         Duration::from_secs(1),
@@ -914,6 +916,7 @@ async fn fixed_length_source_uses_admission_window() {
             min_valid_frames: 1,
             max_unknown_ratio: None,
             min_observed_bytes: 0,
+            ..AdmissionPolicy::default()
         },
         (frame.len() * 2) as u64,
         Duration::from_secs(1),
@@ -958,6 +961,7 @@ async fn chunked_source_uses_admission_window() {
             min_valid_frames: 1,
             max_unknown_ratio: None,
             min_observed_bytes: 0,
+            ..AdmissionPolicy::default()
         },
         (frame.len() * 2) as u64,
         Duration::from_secs(1),
@@ -1008,6 +1012,7 @@ async fn admitted_stream_is_not_closed_by_window_timeout() {
             min_valid_frames: 1,
             max_unknown_ratio: None,
             min_observed_bytes: 0,
+            ..AdmissionPolicy::default()
         },
         (frame.len() * 2) as u64,
         Duration::from_millis(100),
@@ -1171,6 +1176,7 @@ async fn start_test_near_server() -> (
                 min_valid_frames: 1,
                 max_unknown_ratio: None,
                 min_observed_bytes: 0,
+                ..AdmissionPolicy::default()
             },
             max_bytes: 1024,
             max_frames: 8,

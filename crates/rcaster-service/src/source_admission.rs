@@ -78,6 +78,7 @@ impl SourceAdmissionWindow {
                         matches!(
                             violation,
                             AdmissionViolation::MissingCorrectionData
+                                | AdmissionViolation::NoObservationOrSsr
                                 | AdmissionViolation::ExpectedFormatMismatch(_)
                         )
                     });

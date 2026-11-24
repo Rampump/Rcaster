@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::SourceExpectation;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DataFormat {
     Rtcm3,
     Rtcm2,
@@ -25,8 +25,37 @@ pub struct AdmissionPolicy {
     pub expected_formats: Option<Vec<DataFormat>>,
     pub allowed_msm_versions: Option<Vec<u8>>,
     pub min_valid_frames: u64,
+    pub min_correction_frames: u64,
+    pub max_crc_error_ratio: Option<f64>,
+    pub require_base_position: bool,
+    pub require_msm: bool,
     pub max_unknown_ratio: Option<f64>,
     pub min_observed_bytes: u64,
+}
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            mode: AdmissionMode::Enforce,
+            allowed_formats: vec![
+                DataFormat::Rtcm3,
+                DataFormat::Rtcm2,
+                DataFormat::Binex,
+                DataFormat::Cmr,
+                DataFormat::Nmea,
+            ],
+            require_correction_data: false,
+            expected_formats: None,
+            allowed_msm_versions: None,
+            min_valid_frames: 1,
+            min_correction_frames: 1,
+            max_crc_error_ratio: Some(1.0),
+            require_base_position: false,
+            require_msm: false,
+            max_unknown_ratio: None,
+            min_observed_bytes: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +64,11 @@ pub enum AdmissionViolation {
     FormatNotAllowed(DataFormat),
     ExpectedFormatMismatch(DataFormat),
     MissingCorrectionData,
+    NoObservationOrSsr,
+    MixedCorrectionFormats,
+    CrcThresholdExceeded,
+    BasePositionMissing,
+    MsmRequiredMissing,
     MsmVersionNotAllowed(u8),
     UnknownDataRatioExceeded,
 }
@@ -149,6 +183,10 @@ pub struct DataProfile {
     pub unknown_bytes: u64,
     pub valid_frames: u64,
     pub crc_errors: u64,
+    pub correction_frames: u64,
+    pub correction_formats: BTreeSet<DataFormat>,
+    pub position_message_seen: bool,
+    pub msm_message_seen: bool,
     pub nmea_lines: u64,
     pub message_numbers: BTreeSet<u16>,
     pub msm_versions: BTreeSet<u8>,
@@ -400,6 +438,8 @@ impl ProtocolDemux {
 
     fn record_format_only(&mut self, format: DataFormat, message_number: Option<u16>) {
         self.profile.valid_frames = self.profile.valid_frames.saturating_add(1);
+        self.profile.correction_frames = self.profile.correction_frames.saturating_add(1);
+        self.profile.correction_formats.insert(format);
         if let Some(message_number) = message_number {
             self.profile.message_numbers.insert(message_number);
         }
@@ -412,6 +452,8 @@ impl ProtocolDemux {
         self.profile.message_numbers.insert(message_number);
         let correction = is_correction_message(message_number);
         if correction {
+            self.profile.correction_frames = self.profile.correction_frames.saturating_add(1);
+            self.profile.correction_formats.insert(DataFormat::Rtcm3);
             self.profile.has_correction_data = true;
             self.profile.primary_format = Some(DataFormat::Rtcm3);
         } else if self.profile.primary_format.is_none() {
@@ -420,6 +462,7 @@ impl ProtocolDemux {
         if (1071..=1137).contains(&message_number) {
             let version = (message_number % 10) as u8;
             if (1..=7).contains(&version) {
+                self.profile.msm_message_seen = true;
                 self.profile.msm_versions.insert(version);
                 if let Some(satellites) = unsigned_bits(payload, 73, 64) {
                     self.profile.satellite_count = satellites.count_ones() as u16;
@@ -441,6 +484,7 @@ impl ProtocolDemux {
         if matches!(message_number, 1005 | 1006)
             && let Some(position) = parse_rtcm3_position(payload)
         {
+            self.profile.position_message_seen = true;
             self.profile.position = Some(position);
         }
         if matches!(message_number, 1005 | 1006 | 1033)
@@ -948,8 +992,38 @@ impl AdmissionPolicy {
         {
             violations.push(AdmissionViolation::ExpectedFormatMismatch(format));
         }
-        if self.require_correction_data && !profile.has_correction_data {
+        if self.require_correction_data && profile.correction_frames == 0 {
+            violations.push(if profile.primary_format == Some(DataFormat::Rtcm3) {
+                AdmissionViolation::NoObservationOrSsr
+            } else {
+                AdmissionViolation::MissingCorrectionData
+            });
+        }
+        if profile.correction_frames > 0 && profile.correction_frames < self.min_correction_frames {
             violations.push(AdmissionViolation::MissingCorrectionData);
+        }
+        if profile.correction_formats.len() > 1 {
+            violations.push(AdmissionViolation::MixedCorrectionFormats);
+        }
+        let integrity_attempts = profile.valid_frames.saturating_add(profile.crc_errors);
+        if profile.valid_frames >= self.min_valid_frames
+            && integrity_attempts > 0
+            && profile.crc_errors as f64 / integrity_attempts as f64
+                > self.max_crc_error_ratio.unwrap_or(1.0)
+        {
+            violations.push(AdmissionViolation::CrcThresholdExceeded);
+        }
+        if self.require_base_position
+            && profile.primary_format == Some(DataFormat::Rtcm3)
+            && !profile.position_message_seen
+        {
+            violations.push(AdmissionViolation::BasePositionMissing);
+        }
+        if self.require_msm
+            && profile.primary_format == Some(DataFormat::Rtcm3)
+            && !profile.msm_message_seen
+        {
+            violations.push(AdmissionViolation::MsmRequiredMissing);
         }
         if let Some(allowed_versions) = &self.allowed_msm_versions {
             violations.extend(

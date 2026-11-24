@@ -478,6 +478,48 @@ fn loads_msm_version_restrictions() {
 }
 
 #[test]
+fn loads_advanced_source_admission_rules() {
+    let directory = TempDirectory::new();
+    let path = directory.path().join("caster.json");
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "account_db": "accounts.redb",
+            "client_auth_require_tls": false,
+            "source_auth_require_tls": false,
+            "source_admission": {
+                "mode": "enforce",
+                "allowed_formats": ["rtcm3"],
+                "require_correction_data": true,
+                "min_valid_frames": 3,
+                "min_correction_frames": 2,
+                "max_crc_error_ratio": 0.1,
+                "require_base_position": true,
+                "msm": {
+                    "require_any": true,
+                    "required_within_s": 30
+                },
+                "max_bytes": 65536,
+                "max_frames": 200,
+                "timeout_ms": 15000
+            }
+        }"#,
+    )
+    .expect("write advanced source admission config");
+
+    let admission = StandaloneConfig::load(&path)
+        .expect("load advanced source admission config")
+        .source_admission
+        .expect("source admission");
+    assert_eq!(admission.min_correction_frames, 2);
+    assert_eq!(admission.max_crc_error_ratio, Some(0.1));
+    assert!(admission.require_base_position);
+    assert!(admission.msm.require_any);
+    assert_eq!(admission.msm.required_within_s, 30);
+}
+
+#[test]
 fn rejects_invalid_msm_version_restrictions() {
     let directory = TempDirectory::new();
     let path = directory.path().join("caster.json");

@@ -151,6 +151,12 @@ pub struct SourceAdmissionConfigFile {
     #[serde(default)]
     pub msm: SourceMsmConfigFile,
     pub min_valid_frames: u64,
+    #[serde(default = "default_min_correction_frames")]
+    pub min_correction_frames: u64,
+    #[serde(default)]
+    pub max_crc_error_ratio: Option<f64>,
+    #[serde(default)]
+    pub require_base_position: bool,
     #[serde(default)]
     pub max_unknown_ratio: Option<f64>,
     #[serde(default)]
@@ -168,6 +174,10 @@ pub struct SourceMsmConfigFile {
     pub restrict_versions: bool,
     #[serde(default)]
     pub allowed_versions: Vec<u8>,
+    #[serde(default)]
+    pub require_any: bool,
+    #[serde(default = "default_msm_required_within_s")]
+    pub required_within_s: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -513,9 +523,14 @@ impl StandaloneConfig {
                     )
                 })
                 || admission.min_valid_frames == 0
+                || admission.min_correction_frames == 0
+                || admission
+                    .max_crc_error_ratio
+                    .is_some_and(|ratio| !(0.0..=1.0).contains(&ratio))
                 || admission
                     .max_unknown_ratio
                     .is_some_and(|ratio| !(0.0..=1.0).contains(&ratio))
+                || admission.msm.require_any && admission.msm.required_within_s == 0
                 || admission
                     .msm
                     .allowed_versions
@@ -818,6 +833,14 @@ fn default_cluster_lease_ttl_s() -> i64 {
 
 fn default_source_read_timeout_ms() -> u64 {
     30_000
+}
+
+fn default_min_correction_frames() -> u64 {
+    1
+}
+
+fn default_msm_required_within_s() -> u64 {
+    30
 }
 
 fn default_relay_max_relays() -> usize {

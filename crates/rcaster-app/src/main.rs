@@ -773,6 +773,10 @@ async fn serve(args: &[String]) -> AppResult<()> {
                         .restrict_versions
                         .then(|| admission.msm.allowed_versions.clone()),
                     min_valid_frames: admission.min_valid_frames,
+                    min_correction_frames: admission.min_correction_frames,
+                    max_crc_error_ratio: admission.max_crc_error_ratio,
+                    require_base_position: admission.require_base_position,
+                    require_msm: admission.msm.require_any,
                     max_unknown_ratio: admission.max_unknown_ratio,
                     min_observed_bytes: admission.min_observed_bytes,
                 },

@@ -27,7 +27,7 @@ fn enforce_rejects_missing_correction_data_after_window_finishes() {
     assert_eq!(
         window.finish(),
         WindowOutcome::Rejected {
-            violations: vec![AdmissionViolation::MissingCorrectionData]
+            violations: vec![AdmissionViolation::NoObservationOrSsr]
         }
     );
 }
@@ -94,7 +94,7 @@ fn observe_accepts_with_warning() {
         window.push(&decode_hex(RTCM3_1005)),
         WindowOutcome::Accepted {
             bytes: decode_hex(RTCM3_1005),
-            warnings: vec![AdmissionViolation::MissingCorrectionData]
+            warnings: vec![AdmissionViolation::NoObservationOrSsr]
         }
     );
 }
@@ -160,6 +160,7 @@ fn policy(mode: AdmissionMode, require_correction_data: bool) -> AdmissionPolicy
         min_valid_frames: 1,
         max_unknown_ratio: None,
         min_observed_bytes: 0,
+        ..AdmissionPolicy::default()
     }
 }
 

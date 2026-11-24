@@ -1,7 +1,7 @@
 use rcaster_core::account::SourceExpectation;
 use rcaster_core::protocol::{
-    AdmissionMode, AdmissionPolicy, AdmissionProgress, AdmissionViolation, DataFormat, GnssSystem,
-    ProtocolDemux, parse_nmea_gga,
+    AdmissionMode, AdmissionPolicy, AdmissionProgress, AdmissionViolation, DataFormat, DataProfile,
+    GnssSystem, ProtocolDemux, parse_nmea_gga,
 };
 
 const RTCM3_1005: &str = "D300133ED0000236FDB80DDE08005B2BC108A7B98D3DD8AB37";
@@ -30,6 +30,29 @@ fn decodes_rtcm3_frame_and_profile() {
     assert!(!profile.has_correction_data);
     assert!(profile.position.is_some());
     assert!(profile.station_id.is_some());
+}
+
+#[test]
+fn profile_counts_correction_frames_and_mixed_formats() {
+    let mut demux = ProtocolDemux::new();
+    demux.push(&synthetic_rtcm3(1074));
+    demux.push(&decode_hex(CMR_PLUS));
+
+    let profile = demux.profile();
+    assert_eq!(profile.correction_frames, 2);
+    assert!(profile.correction_formats.contains(&DataFormat::Rtcm3));
+    assert!(profile.correction_formats.contains(&DataFormat::Cmr));
+}
+
+#[test]
+fn profile_tracks_position_and_msm_evidence() {
+    let mut demux = ProtocolDemux::new();
+    demux.push(&decode_hex(RTCM3_1005));
+    demux.push(&synthetic_rtcm3(1074));
+
+    let profile = demux.profile();
+    assert!(profile.position_message_seen);
+    assert!(profile.msm_message_seen);
 }
 
 #[test]
@@ -765,7 +788,7 @@ fn enforce_rejects_source_without_correction_data() {
     assert_eq!(
         policy.evaluate(demux.profile()),
         AdmissionProgress::Rejected {
-            violations: vec![AdmissionViolation::MissingCorrectionData]
+            violations: vec![AdmissionViolation::NoObservationOrSsr]
         }
     );
 }
@@ -779,7 +802,7 @@ fn observe_accepts_with_warning() {
     assert_eq!(
         policy.evaluate(demux.profile()),
         AdmissionProgress::Accepted {
-            warnings: vec![AdmissionViolation::MissingCorrectionData]
+            warnings: vec![AdmissionViolation::NoObservationOrSsr]
         }
     );
 }
@@ -797,6 +820,7 @@ fn enforce_rejects_disallowed_primary_format() {
         min_valid_frames: 1,
         max_unknown_ratio: None,
         min_observed_bytes: 0,
+        ..AdmissionPolicy::default()
     };
 
     assert_eq!(
@@ -822,6 +846,7 @@ fn enforce_rejects_excessive_unknown_data() {
         min_valid_frames: 1,
         max_unknown_ratio: Some(0.1),
         min_observed_bytes: 1,
+        ..AdmissionPolicy::default()
     };
 
     assert_eq!(
@@ -830,6 +855,127 @@ fn enforce_rejects_excessive_unknown_data() {
             violations: vec![AdmissionViolation::UnknownDataRatioExceeded]
         }
     );
+}
+
+#[test]
+fn enforce_rejects_too_few_correction_frames() {
+    let policy = AdmissionPolicy {
+        min_valid_frames: 1,
+        min_correction_frames: 2,
+        ..AdmissionPolicy::default()
+    };
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Rtcm3),
+        valid_frames: 3,
+        correction_frames: 1,
+        has_correction_data: true,
+        ..DataProfile::default()
+    };
+
+    assert!(matches!(
+        policy.evaluate(&profile),
+        AdmissionProgress::Rejected { violations }
+            if violations.contains(&AdmissionViolation::MissingCorrectionData)
+    ));
+}
+
+#[test]
+fn enforce_rejects_high_crc_ratio() {
+    let policy = AdmissionPolicy {
+        min_valid_frames: 3,
+        max_crc_error_ratio: Some(0.1),
+        ..AdmissionPolicy::default()
+    };
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Rtcm3),
+        valid_frames: 4,
+        correction_frames: 4,
+        crc_errors: 2,
+        has_correction_data: true,
+        ..DataProfile::default()
+    };
+
+    assert!(matches!(
+        policy.evaluate(&profile),
+        AdmissionProgress::Rejected { violations }
+            if violations.contains(&AdmissionViolation::CrcThresholdExceeded)
+    ));
+}
+
+#[test]
+fn enforce_distinguishes_auxiliary_rtcm_from_nmea_only() {
+    let policy = AdmissionPolicy {
+        require_correction_data: true,
+        ..AdmissionPolicy::default()
+    };
+    let rtcm = DataProfile {
+        primary_format: Some(DataFormat::Rtcm3),
+        valid_frames: 3,
+        ..DataProfile::default()
+    };
+    let nmea = DataProfile {
+        primary_format: Some(DataFormat::Nmea),
+        valid_frames: 3,
+        ..DataProfile::default()
+    };
+
+    assert!(matches!(
+        policy.evaluate(&rtcm),
+        AdmissionProgress::Rejected { violations }
+            if violations.contains(&AdmissionViolation::NoObservationOrSsr)
+    ));
+    assert!(matches!(
+        policy.evaluate(&nmea),
+        AdmissionProgress::Rejected { violations }
+            if violations.contains(&AdmissionViolation::MissingCorrectionData)
+    ));
+}
+
+#[test]
+fn enforce_rejects_mixed_correction_formats() {
+    let policy = AdmissionPolicy {
+        require_correction_data: false,
+        ..AdmissionPolicy::default()
+    };
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Cmr),
+        valid_frames: 2,
+        correction_frames: 2,
+        correction_formats: [DataFormat::Rtcm3, DataFormat::Cmr].into_iter().collect(),
+        has_correction_data: true,
+        ..DataProfile::default()
+    };
+
+    assert!(matches!(
+        policy.evaluate(&profile),
+        AdmissionProgress::Rejected { violations }
+            if violations.contains(&AdmissionViolation::MixedCorrectionFormats)
+    ));
+}
+
+#[test]
+fn enforce_rejects_missing_base_position_and_msm() {
+    let policy = AdmissionPolicy {
+        require_correction_data: false,
+        require_base_position: true,
+        require_msm: true,
+        ..AdmissionPolicy::default()
+    };
+    let profile = DataProfile {
+        primary_format: Some(DataFormat::Rtcm3),
+        valid_frames: 2,
+        correction_frames: 2,
+        correction_formats: [DataFormat::Rtcm3].into_iter().collect(),
+        has_correction_data: true,
+        ..DataProfile::default()
+    };
+
+    assert!(matches!(
+        policy.evaluate(&profile),
+        AdmissionProgress::Rejected { violations }
+            if violations.contains(&AdmissionViolation::BasePositionMissing)
+                && violations.contains(&AdmissionViolation::MsmRequiredMissing)
+    ));
 }
 
 fn decode_hex(value: &str) -> Vec<u8> {
@@ -956,5 +1102,6 @@ fn policy(
         min_valid_frames,
         max_unknown_ratio: None,
         min_observed_bytes: 0,
+        ..AdmissionPolicy::default()
     }
 }
