@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-24 23:29 CST
+Status date: 2026-11-25 00:13 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -8,8 +8,8 @@ Deployed soak release:
 Deployed soak source code commit:
 `9bdc2f8`
 
-Local remediation commit:
-`18d795e` (committed locally, not pushed or deployed)
+Local remediation code commit:
+`7cd7ced` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -29,7 +29,7 @@ not be described as final production acceptance.
 
 | Design section | Current status | Authoritative evidence | Remaining proof |
 |---|---|---|---|
-| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. A live CRTK.NET test models 1,302 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. | More receiver models; real CMR/CMR+ capture; public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
+| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The latest CRTK.NET run models 1,298 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. | More receiver models; real CMR/CMR+ capture; public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
 | 18.2 Consistency and ownership | Verified | `source_fencing`, `user_admission`, `revision_admission`, `config_revision`, `cluster_runtime`, `blacklist_write`, `account_directory`, `connections` and `upgrade` integration tests cover races, stale revisions, generation/connection fencing, owner commands and cleanup. Live cluster ownership was checked at 3/2/3/2 across four nodes. | Re-run the same assertions after the 72-hour run exits to prove no orphan state remains. |
 | 18.3 Capacity | Verified | Target-node probes completed 10 sources/8,000 subscribers, 1 source/10,000 subscribers and 10,000 mountpoints. Coordinator spikes achieved about 1,000 admissions/s. A local four-Caster cluster with 500 sources and 100 cross-node relay subscribers ran 30 seconds: 16,872,000 source bytes and 3,373,032 subscriber bytes. | The frozen soak remains the long-duration stability run, not a capacity proof gap. |
 | 18.4 Stability | Pending | Pre-runs showed zero restarts and bounded RSS/FD. The current frozen candidate is running four local and one cross-region soak units. | Successful completion of all five 259,200-second runs, final RSS/FD curves, zero restart, empty stderr and clean post-run state. |
@@ -42,6 +42,39 @@ not be described as final production acceptance.
 | 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download and slot switching. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
 | 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. The admin dashboard now exposes source filters, health/history charts, NEAR clients, maintenance, config apply/reload, versions, audit and operation/upgrade lookup. Inline JavaScript is parse-checked. | Public web is not exposed on this test deployment (`public_bind=null`); external DNS/LB, real tile service, large-map behavior and production monitor load remain unverified. |
+
+## Operational Completeness Follow-up
+
+The 2026-11-25 audit added:
+
+- Previewed batch operations for `users.disable`, `users.delete`,
+  `mountpoints.disable`, `mountpoints.change_owner` and `sessions.drop`.
+- A preview digest covering target revisions, source generations and session
+  caster/epoch identities, with a 409 response when state drifts before start.
+- Background operation execution, per-target success/failure records, idempotent
+  reruns and `/retry` for failed or partially failed operations.
+- `operations:write` and `cluster:admin` scopes; cancellation by the creator or
+  cluster administrators only.
+- Dashboard controls for previewing, starting and looking up batch operations.
+- Source Health warning/age/change metrics, backlog kicks, public monitor
+  viewer/busy/start-limit metrics, and relay STARTING/failure/idle-close metrics.
+
+Remaining implementation gaps are operation lease binding/background adoption
+after an admin Caster exits, the reserved local Source event interface, and a
+separate relay slow-consumer counter. These are tracked in
+`docs/superpowers/plans/2026-11-24-operational-completeness.md`.
+
+Final current-tree verification on 2026-11-25:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test --workspace --all-features --locked`: pass.
+- All ignored external integrations rerun independently: RTKLIB fixtures and
+  `str2str`, real BINEX, HAProxy PROXY v2, etcd rotation/failover/snapshot
+  restore and live CRTK.NET NEAR all pass.
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D
+  warnings`: pass.
+- Release build: pass; `target/release/rcaster` SHA-256
+  `338033D913FA43874CE1B6832EBD132D6465DF83A5A109A05C537583E822EAFE`.
 
 ## Local Design-Parity Remediation
 
