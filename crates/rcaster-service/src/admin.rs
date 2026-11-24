@@ -3,7 +3,12 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::{
-    collections::BTreeMap, future::Future, io, sync::Arc, time::Duration, time::SystemTime,
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    io,
+    sync::Arc,
+    time::Duration,
+    time::SystemTime,
     time::UNIX_EPOCH,
 };
 
@@ -1935,12 +1940,26 @@ async fn handle(
                 }
             }
         }
-        "/admin/v1/cluster/status" => json!({
-            "cluster_id": state.cluster_id,
-            "caster_id": state.caster_id,
-            "ready": state.ready.is_ready(),
-            "active_sources": state.hub.active_sources().len(),
-        }),
+        "/admin/v1/cluster/status" => {
+            let local_sources = state.hub.active_sources();
+            let mut cluster_sources = local_sources.iter().cloned().collect::<BTreeSet<_>>();
+            if let Some(runtime) = &state.runtime {
+                cluster_sources.extend(
+                    runtime
+                        .sourcetable_records()
+                        .await
+                        .into_iter()
+                        .map(|record| record.mountpoint),
+                );
+            }
+            json!({
+                "cluster_id": state.cluster_id,
+                "caster_id": state.caster_id,
+                "ready": state.ready.is_ready(),
+                "local_active_sources": local_sources.len(),
+                "cluster_active_sources": cluster_sources.len(),
+            })
+        }
         "/admin/v1/sources" => match sources(state, &query).await {
             Ok(sources) => sources,
             Err(message) => {
@@ -3029,7 +3048,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 <section><h3>Relays</h3><table><thead><tr><th>Mountpoint</th><th>Subscribers</th></tr></thead><tbody id="relays"></tbody></table></section>
 <section><h3>Users</h3><p><input id="user-id" aria-label="User ID" placeholder="user id"><input id="user-name" aria-label="Username" placeholder="username"><input id="user-password" aria-label="Password" type="password" placeholder="password (blank to keep)"><select id="user-role" aria-label="Role"><option value="user">user</option><option value="admin">admin</option></select><label><input id="user-enabled" type="checkbox" checked> enabled</label><button onclick="saveUser()">Save user</button></p><table><thead><tr><th>Username</th><th>Role</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="users"></tbody></table></section>
 <section><h3>Mountpoints</h3><p><input id="mount-name" aria-label="Mountpoint" placeholder="mountpoint"><input id="mount-owner" aria-label="Owner user ID" placeholder="owner user id"><input id="mount-password" aria-label="NTRIP1 upload password" type="password" placeholder="upload password (blank to keep)"><input id="mount-region" aria-label="Region" placeholder="region"><label><input id="mount-enabled" type="checkbox" checked> enabled</label><label><input id="mount-advertise" type="checkbox" checked> advertise</label><button onclick="saveMount()">Save mountpoint</button></p><table><thead><tr><th>Mountpoint</th><th>Owner</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="mountpoints"></tbody></table></section>
-<section><h3>API tokens</h3><p><input id="api-token-name" aria-label="Token name" placeholder="token name"><select id="api-token-scope" aria-label="Scope"><option value="read">read only</option><option value="write" selected>read + write</option></select><input id="api-token-expiry" aria-label="Expiry seconds" type="number" min="0" placeholder="expiry seconds (optional)"><button onclick="createApiToken()">Create token</button></p><pre id="api-token-secret"></pre><table><thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Scopes</th><th>Expires</th><th>Action</th></tr></thead><tbody id="api-tokens"></tbody></table></section>
+<section id="api-tokens-section"><h3>API tokens</h3><p><input id="api-token-name" aria-label="Token name" placeholder="token name"><select id="api-token-scope" aria-label="Scope"><option value="read">read only</option><option value="write" selected>read + write</option></select><input id="api-token-expiry" aria-label="Expiry seconds" type="number" min="0" placeholder="expiry seconds (optional)"><button onclick="createApiToken()">Create token</button></p><pre id="api-token-secret"></pre><table><thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Scopes</th><th>Expires</th><th>Action</th></tr></thead><tbody id="api-tokens"></tbody></table></section>
 <section><h3>Blacklist</h3><p><input id="bl-id" aria-label="Rule ID" placeholder="rule id"><input id="bl-cidr" aria-label="CIDR" placeholder="CIDR"><input id="bl-quota" aria-label="Quota" type="number" value="0" style="width:90px"><input id="bl-description" aria-label="Description" placeholder="description"><button onclick="addBlacklist()">Add rule</button></p><table><thead><tr><th>ID</th><th>CIDR</th><th>Quota</th><th>Enabled</th></tr></thead><tbody id="blacklist"></tbody></table></section>
 <section><h3>Sessions</h3><table><thead><tr><th>Type</th><th>User</th><th>Mountpoint</th><th>Caster</th></tr></thead><tbody id="sessions"></tbody></table></section>
 <section><h3>Source cooldowns</h3><table><thead><tr><th>Mountpoint</th><th>Source IP</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead><tbody id="cooldowns"></tbody></table></section>
@@ -3043,7 +3062,7 @@ async function api(path,options={}){const method=options.method||'GET';const hea
 function row(cells){const tr=document.createElement('tr');for(const value of cells){const td=document.createElement('td');td.textContent=value??'';tr.append(td)}return tr}
 async function login(){try{const result=await api('/admin/v1/auth/login',{method:'POST',body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});csrfToken=result.csrf_token;document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=result.username;await load();}catch(e){status.textContent=String(e)}}
 async function logout(){try{await api('/admin/v1/auth/logout',{method:'POST'});csrfToken='';document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent='Signed out';}catch(e){status.textContent=String(e)}}
-async function load(){try{status.textContent='Loading...';const session=await api('/admin/v1/auth/session');csrfToken=(await api('/admin/v1/auth/csrf')).csrf_token;document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=session.username||session.kind;const c=await api('/admin/v1/cluster/status');document.getElementById('cluster').textContent=JSON.stringify(c,null,2);const s=await api('/admin/v1/sources');document.getElementById('sources').replaceChildren(...s.sources.map(sourceRow));const r=await api('/admin/v1/relays');document.getElementById('relays').replaceChildren(...r.relays.map(x=>row([x.mountpoint,x.subscribers])));const u=await api('/admin/v1/users');document.getElementById('users').replaceChildren(...u.users.map(userRow));const m=await api('/admin/v1/mountpoints');document.getElementById('mountpoints').replaceChildren(...m.mountpoints.map(mountRow));const b=await api('/admin/v1/blacklist');document.getElementById('blacklist').replaceChildren(...b.rules.map(blacklistRow));const ss=await api('/admin/v1/sessions');document.getElementById('sessions').replaceChildren(...ss.sessions.map(sessionRow));const cd=await api('/admin/v1/source-cooldowns');document.getElementById('cooldowns').replaceChildren(...cd.cooldowns.map(cooldownRow));const at=await api('/admin/v1/api-tokens');document.getElementById('api-tokens').replaceChildren(...at.tokens.map(apiTokenRow));status.textContent='Connected';}catch(e){document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent=String(e)}}
+async function load(){try{status.textContent='Loading...';const session=await api('/admin/v1/auth/session');const service=session.kind==='service';csrfToken=service?'':((await api('/admin/v1/auth/csrf')).csrf_token||'');document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=session.username||session.kind;document.getElementById('api-tokens-section').hidden=service;const c=await api('/admin/v1/cluster/status');document.getElementById('cluster').textContent=JSON.stringify(c,null,2);const s=await api('/admin/v1/sources');document.getElementById('sources').replaceChildren(...s.sources.map(sourceRow));const r=await api('/admin/v1/relays');document.getElementById('relays').replaceChildren(...r.relays.map(x=>row([x.mountpoint,x.subscribers])));const u=await api('/admin/v1/users');document.getElementById('users').replaceChildren(...u.users.map(userRow));const m=await api('/admin/v1/mountpoints');document.getElementById('mountpoints').replaceChildren(...m.mountpoints.map(mountRow));const b=await api('/admin/v1/blacklist');document.getElementById('blacklist').replaceChildren(...b.rules.map(blacklistRow));const ss=await api('/admin/v1/sessions');document.getElementById('sessions').replaceChildren(...ss.sessions.map(sessionRow));const cd=await api('/admin/v1/source-cooldowns');document.getElementById('cooldowns').replaceChildren(...cd.cooldowns.map(cooldownRow));if(!service){const at=await api('/admin/v1/api-tokens');document.getElementById('api-tokens').replaceChildren(...at.tokens.map(apiTokenRow));}status.textContent=service?'Connected (service read-only)':'Connected';}catch(e){document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent=String(e)}}
 function sourceRow(source){const tr=row([source.mountpoint,source.format,source.identifier]);const td=document.createElement('td');const health=document.createElement('button');health.textContent='Health';health.onclick=()=>showSourceHealth(source.mountpoint);const live=document.createElement('button');live.textContent='Live';live.onclick=()=>monitorSource(source.mountpoint);const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSource(source.mountpoint);td.append(health,live,disconnect);tr.append(td);return tr}
 function sessionRow(session){const tr=row([session.session_type,session.user_id,session.mountpoint,session.caster_id]);const td=document.createElement('td');const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSession(session.session_id);td.append(disconnect);tr.append(td);return tr}
 function cooldownRow(cooldown){const tr=row([cooldown.mountpoint,cooldown.source_ip,cooldown.reason,cooldown.expires_at]);const td=document.createElement('td');const clear=document.createElement('button');clear.textContent='Clear';clear.onclick=()=>clearCooldown(cooldown.fingerprint);td.append(clear);tr.append(td);return tr}

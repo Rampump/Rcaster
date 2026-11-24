@@ -95,6 +95,8 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("saveUser"));
     assert!(page.contains("saveMount"));
     assert!(page.contains("createApiToken"));
+    assert!(page.contains("id=\"api-tokens-section\""));
+    assert!(page.contains("session.kind==='service'"));
     assert!(page.contains("disconnectSource"));
     assert!(page.contains("disconnectSession"));
     assert!(page.contains("monitorSource"));
@@ -111,6 +113,22 @@ async fn admin_routes_require_mtls_and_service_token() {
     let response = request(address, &pki, "/admin/v1/cluster/status", "Bearer secret").await;
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.contains("\"cluster_id\":\"cluster\""));
+    let cluster_status = response_body(&response);
+    assert_eq!(cluster_status["local_active_sources"], 1);
+    assert_eq!(cluster_status["cluster_active_sources"], 1);
+    assert!(cluster_status.get("active_sources").is_none());
+    let session = request(address, &pki, "/admin/v1/auth/session", "Bearer secret").await;
+    assert_eq!(response_body(&session)["kind"], "service");
+    assert!(
+        request(address, &pki, "/admin/v1/auth/csrf", "Bearer secret")
+            .await
+            .starts_with("HTTP/1.1 403 Forbidden")
+    );
+    assert!(
+        request(address, &pki, "/admin/v1/api-tokens", "Bearer secret")
+            .await
+            .starts_with("HTTP/1.1 403 Forbidden")
+    );
     assert!(
         request_fragmented_get(address, &pki, "/admin/v1/cluster/status", "Bearer secret")
             .await
