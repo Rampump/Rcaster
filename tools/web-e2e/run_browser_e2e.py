@@ -112,7 +112,7 @@ class Cdp:
             )
         )
         while True:
-            message = json.loads(self.websocket.recv())
+            message = json.loads(self.websocket.recv(timeout=20))
             if message.get("id") == request_id:
                 if "error" in message:
                     raise RuntimeError(json.dumps(message["error"]))
@@ -190,6 +190,74 @@ def browser_problems(page: Cdp) -> tuple[list[str], list[str]]:
                 if not expected_resource_error(url, response["status"]):
                     network_errors.append(f"{response['status']} {url}")
     return console_errors, network_errors
+
+
+def exercise_admin(page: Cdp, clustered: bool) -> dict:
+    page.wait_for("document.querySelector('#username')")
+    page.evaluate(
+        "(() => {"
+        "document.getElementById('username').value='browser-admin';"
+        "document.getElementById('password').value='admin-secret';"
+        "return login();"
+        "})()"
+    )
+    page.wait_for("!document.getElementById('account').hidden")
+    checks = {
+        "admin_login": page.evaluate(
+            "document.getElementById('account-name').textContent"
+        )
+    }
+    page.evaluate("loadSources()")
+    page.wait_for("document.getElementById('sources').textContent.includes('C63')")
+    checks["admin_source_filter"] = page.evaluate(
+        "document.getElementById('sources').textContent"
+    )
+    page.evaluate("showSourceHealth('C63')")
+    page.wait_for(
+        "document.getElementById('source-health')"
+        ".textContent.includes('\"packets\"')"
+    )
+    checks["source_health"] = page.evaluate(
+        "(() => {"
+        "const value=JSON.parse(document.getElementById('source-health').textContent);"
+        "return {health:value.health,position_available:"
+        "value.profile.position_available,valid_frames:value.profile.valid_frames,"
+        "message_numbers:value.profile.message_numbers};"
+        "})()"
+    )
+    page.evaluate("showSourceHistory('C63')")
+    page.wait_for(
+        "document.getElementById('source-health')"
+        ".textContent.includes('\"points\"')"
+    )
+    page.evaluate("loadOperationalViews()")
+    if clustered:
+        page.wait_for(
+            "document.getElementById('config-status')"
+            ".textContent.includes('\"generation\"')"
+            " && document.getElementById('config-json').value.length > 25"
+        )
+        operation_result = "NOT_FOUND"
+    else:
+        page.wait_for(
+            "document.getElementById('config-status')"
+            ".textContent.includes('\"available\"')"
+            " && document.querySelector('#config-revisions')"
+            ".textContent.includes('Config history unavailable')"
+        )
+        operation_result = "UNAVAILABLE"
+    page.evaluate(
+        "(() => {"
+        "document.getElementById('operation-id').value='missing';"
+        "return loadOperation();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('operation')"
+        f".textContent.includes('{operation_result}')"
+    )
+    checks["admin_health_history_config_operation"] = True
+    return checks
 
 
 def expected_resource_error(url: str, status: int) -> bool:
@@ -539,64 +607,11 @@ def run_test(temp: Path, clustered: bool) -> dict:
             assert config_status["available"] is True
             assert config_status["generation"] == 1
             result["checks"]["cluster_mtls_admin_config"] = config_status
-        else:
+        if not clustered:
             admin = new_page(debug_port, f"https://127.0.0.1:{admin_port}/admin/")
-            admin.wait_for("document.querySelector('#username')")
-            admin.evaluate(
-                "(() => {"
-                "document.getElementById('username').value='browser-admin';"
-                "document.getElementById('password').value='admin-secret';"
-                "return login();"
-                "})()"
-            )
-            admin.wait_for("!document.getElementById('account').hidden")
-            result["checks"]["admin_login"] = admin.evaluate(
-                "document.getElementById('account-name').textContent"
-            )
-            admin.evaluate("loadSources()")
-            admin.wait_for(
-                "document.getElementById('sources').textContent.includes('C63')"
-            )
-            result["checks"]["admin_source_filter"] = admin.evaluate(
-                "document.getElementById('sources').textContent"
-            )
-            admin.evaluate("showSourceHealth('C63')")
-            admin.wait_for(
-                "document.getElementById('source-health')"
-                ".textContent.includes('\"packets\"')"
-            )
-            result["checks"]["source_health"] = admin.evaluate(
-                "(() => {"
-                "const value=JSON.parse(document.getElementById('source-health').textContent);"
-                "return {health:value.health,position_available:"
-                "value.profile.position_available,valid_frames:value.profile.valid_frames,"
-                "message_numbers:value.profile.message_numbers};"
-                "})()"
-            )
-            admin.evaluate("showSourceHistory('C63')")
-            admin.wait_for(
-                "document.getElementById('source-health')"
-                ".textContent.includes('\"points\"')"
-            )
-            admin.evaluate("loadOperationalViews()")
-            admin.wait_for(
-                "document.getElementById('config-status')"
-                ".textContent.includes('\"available\"')"
-                " && document.querySelector('#config-revisions')"
-                ".textContent.includes('Config history unavailable')"
-            )
-            admin.evaluate(
-                "(() => {"
-                "document.getElementById('operation-id').value='missing';"
-                "return loadOperation();"
-                "})()"
-            )
-            admin.wait_for(
-                "document.getElementById('operation').textContent.includes('UNAVAILABLE')"
-            )
-            result["checks"]["admin_health_history_config_operation"] = True
-            if source.error:
-                result["checks"]["source_error"] = source.error
+            result["checks"].update(exercise_admin(admin, clustered))
+        if source.error:
+            result["checks"]["source_error"] = source.error
 
         public = new_page(debug_port, f"https://127.0.0.1:{public_port}/")
         public.wait_for(
