@@ -171,6 +171,37 @@ fn hub_metrics_aggregate_sources_subscribers_and_integrity() {
     assert_eq!(metrics.crc_errors, 1);
 }
 
+#[test]
+fn hub_metrics_include_source_health_and_disconnect_counters() {
+    let hub = MountpointHub::new(16).expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1001),
+            position: Some(position(30.0, 120.0)),
+            ..DataProfile::default()
+        })
+        .expect("first profile");
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1002),
+            position: Some(position(30.01, 120.01)),
+            ..DataProfile::default()
+        })
+        .expect("changed profile");
+    hub.record_health_snapshots();
+    hub.record_backlog_kick();
+
+    let metrics = hub.metrics();
+    assert_eq!(metrics.station_id_changes, 1);
+    assert_eq!(metrics.base_position_jumps, 1);
+    assert_eq!(metrics.backlog_kicks, 1);
+    assert_eq!(metrics.source_health_warning_sources, 1);
+    assert_eq!(metrics.station_id_warning_sources, 1);
+    assert_eq!(metrics.base_position_jump_sources, 1);
+}
+
 #[tokio::test]
 async fn source_health_warns_on_high_crc_ratio() {
     let hub = MountpointHub::new(16).expect("hub");

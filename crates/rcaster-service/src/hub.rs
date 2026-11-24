@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, MutexGuard, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -77,6 +77,9 @@ struct HubInner {
     limits: RwLock<HubLimits>,
     history_seed: Mutex<HashMap<String, Vec<StreamHistoryPoint>>>,
     source_revision: AtomicUsize,
+    station_id_changes: AtomicU64,
+    base_position_jumps: AtomicU64,
+    backlog_kicks: AtomicU64,
 }
 
 struct SourceState {
@@ -144,6 +147,9 @@ impl MountpointHub {
                 limits: RwLock::new(HubLimits::default()),
                 history_seed: Mutex::new(HashMap::new()),
                 source_revision: AtomicUsize::new(0),
+                station_id_changes: AtomicU64::new(0),
+                base_position_jumps: AtomicU64::new(0),
+                backlog_kicks: AtomicU64::new(0),
             }),
             buffer_events,
         })
@@ -355,6 +361,10 @@ impl MountpointHub {
         }
     }
 
+    pub fn record_backlog_kick(&self) {
+        self.inner.backlog_kicks.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn source_history(&self, mountpoint: &str, limit: usize) -> Vec<StreamHistoryPoint> {
         self.inner
             .sources()
@@ -369,12 +379,21 @@ impl MountpointHub {
 
     pub fn metrics(&self) -> HubMetrics {
         let sources = self.inner.sources();
+        let now = Instant::now();
         let mut rtcm3_sources = 0;
         let mut rtcm2_sources = 0;
         let mut binex_sources = 0;
         let mut cmr_sources = 0;
         let mut nmea_sources = 0;
         let mut unknown_sources = 0;
+        let mut source_health_warning_sources = 0;
+        let mut no_data_warning_sources = 0;
+        let mut no_correction_warning_sources = 0;
+        let mut high_crc_warning_sources = 0;
+        let mut low_valid_frame_ratio_sources = 0;
+        let mut station_id_warning_sources = 0;
+        let mut base_position_jump_sources = 0;
+        let mut max_source_packet_age_seconds = 0;
         for source in sources
             .values()
             .filter(|source| source.str_record.is_some())
@@ -391,6 +410,36 @@ impl MountpointHub {
                 Some(DataFormat::Nmea) => nmea_sources += 1,
                 None => unknown_sources += 1,
             }
+            if source.latched_warnings != 0 {
+                source_health_warning_sources += 1;
+            }
+            if source.latched_warnings & NO_DATA_WARNING != 0 {
+                no_data_warning_sources += 1;
+            }
+            if source.latched_warnings & NO_CORRECTION_WARNING != 0 {
+                no_correction_warning_sources += 1;
+            }
+            if source.latched_warnings & HIGH_CRC_WARNING != 0 {
+                high_crc_warning_sources += 1;
+            }
+            if source.latched_warnings & LOW_VALID_FRAME_RATIO_WARNING != 0 {
+                low_valid_frame_ratio_sources += 1;
+            }
+            if source.latched_warnings & STATION_ID_CHANGED_WARNING != 0 {
+                station_id_warning_sources += 1;
+            }
+            if source.latched_warnings & BASE_POSITION_JUMP_WARNING != 0 {
+                base_position_jump_sources += 1;
+            }
+            max_source_packet_age_seconds = max_source_packet_age_seconds.max(
+                source
+                    .last_packet
+                    .map_or_else(
+                        || now.duration_since(source.started_at),
+                        |last_packet| now.duration_since(last_packet),
+                    )
+                    .as_secs(),
+            );
         }
         HubMetrics {
             active_sources: sources
@@ -428,6 +477,17 @@ impl MountpointHub {
             cmr_sources,
             nmea_sources,
             unknown_sources,
+            source_health_warning_sources,
+            no_data_warning_sources,
+            no_correction_warning_sources,
+            high_crc_warning_sources,
+            low_valid_frame_ratio_sources,
+            station_id_warning_sources,
+            base_position_jump_sources,
+            max_source_packet_age_seconds,
+            station_id_changes: self.inner.station_id_changes.load(Ordering::Relaxed),
+            base_position_jumps: self.inner.base_position_jumps.load(Ordering::Relaxed),
+            backlog_kicks: self.inner.backlog_kicks.load(Ordering::Relaxed),
         }
     }
 
@@ -608,11 +668,17 @@ impl SourceLease {
                 && previous.station_id != profile.station_id
             {
                 source.pending_warnings |= STATION_ID_CHANGED_WARNING;
+                self.inner
+                    .station_id_changes
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if let (Some(previous), Some(current)) = (previous.position, profile.position)
                 && distance_m(previous, current) > thresholds.base_position_jump_m
             {
                 source.pending_warnings |= BASE_POSITION_JUMP_WARNING;
+                self.inner
+                    .base_position_jumps
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         let now = Instant::now();
@@ -668,6 +734,17 @@ pub struct HubMetrics {
     pub cmr_sources: usize,
     pub nmea_sources: usize,
     pub unknown_sources: usize,
+    pub source_health_warning_sources: usize,
+    pub no_data_warning_sources: usize,
+    pub no_correction_warning_sources: usize,
+    pub high_crc_warning_sources: usize,
+    pub low_valid_frame_ratio_sources: usize,
+    pub station_id_warning_sources: usize,
+    pub base_position_jump_sources: usize,
+    pub max_source_packet_age_seconds: u64,
+    pub station_id_changes: u64,
+    pub base_position_jumps: u64,
+    pub backlog_kicks: u64,
 }
 
 pub const NO_DATA_WARNING: u8 = 1;

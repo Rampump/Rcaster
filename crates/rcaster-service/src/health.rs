@@ -50,6 +50,17 @@ pub struct HealthState {
     sources_cmr: AtomicUsize,
     sources_nmea: AtomicUsize,
     sources_unknown: AtomicUsize,
+    source_health_warning_sources: AtomicUsize,
+    no_data_warning_sources: AtomicUsize,
+    no_correction_warning_sources: AtomicUsize,
+    high_crc_warning_sources: AtomicUsize,
+    low_valid_frame_ratio_sources: AtomicUsize,
+    station_id_warning_sources: AtomicUsize,
+    base_position_jump_sources: AtomicUsize,
+    max_source_packet_age_seconds: AtomicU64,
+    station_id_changes: AtomicU64,
+    base_position_jumps: AtomicU64,
+    backlog_kicks: AtomicU64,
     near_queries: AtomicU64,
     near_queries_limited: AtomicU64,
     near_gga_rate_limited: AtomicU64,
@@ -116,6 +127,28 @@ impl HealthState {
             .store(metrics.nmea_sources, Ordering::Release);
         self.sources_unknown
             .store(metrics.unknown_sources, Ordering::Release);
+        self.source_health_warning_sources
+            .store(metrics.source_health_warning_sources, Ordering::Release);
+        self.no_data_warning_sources
+            .store(metrics.no_data_warning_sources, Ordering::Release);
+        self.no_correction_warning_sources
+            .store(metrics.no_correction_warning_sources, Ordering::Release);
+        self.high_crc_warning_sources
+            .store(metrics.high_crc_warning_sources, Ordering::Release);
+        self.low_valid_frame_ratio_sources
+            .store(metrics.low_valid_frame_ratio_sources, Ordering::Release);
+        self.station_id_warning_sources
+            .store(metrics.station_id_warning_sources, Ordering::Release);
+        self.base_position_jump_sources
+            .store(metrics.base_position_jump_sources, Ordering::Release);
+        self.max_source_packet_age_seconds
+            .store(metrics.max_source_packet_age_seconds, Ordering::Release);
+        self.station_id_changes
+            .store(metrics.station_id_changes, Ordering::Release);
+        self.base_position_jumps
+            .store(metrics.base_position_jumps, Ordering::Release);
+        self.backlog_kicks
+            .store(metrics.backlog_kicks, Ordering::Release);
     }
 
     pub fn set_sessions(&self, sessions: usize) {
@@ -308,6 +341,20 @@ impl HealthState {
             self.sources_cmr.load(Ordering::Acquire),
             self.sources_nmea.load(Ordering::Acquire),
             self.sources_unknown.load(Ordering::Acquire),
+        ));
+        metrics.push_str(&format!(
+            "# HELP rcaster_source_health_alerting_sources Active local sources with at least one latched health warning.\n# TYPE rcaster_source_health_alerting_sources gauge\nrcaster_source_health_alerting_sources {}\n# HELP rcaster_source_health_warnings Active local sources by latched health warning.\n# TYPE rcaster_source_health_warnings gauge\nrcaster_source_health_warnings{{reason=\"no_data\"}} {}\nrcaster_source_health_warnings{{reason=\"no_correction\"}} {}\nrcaster_source_health_warnings{{reason=\"high_crc\"}} {}\nrcaster_source_health_warnings{{reason=\"low_valid_frame_ratio\"}} {}\nrcaster_source_health_warnings{{reason=\"station_id_changed\"}} {}\nrcaster_source_health_warnings{{reason=\"base_position_jump\"}} {}\n# HELP rcaster_source_max_packet_age_seconds Oldest live-source packet age.\n# TYPE rcaster_source_max_packet_age_seconds gauge\nrcaster_source_max_packet_age_seconds {}\n# HELP rcaster_source_station_id_changes_total Source station ID changes.\n# TYPE rcaster_source_station_id_changes_total counter\nrcaster_source_station_id_changes_total {}\n# HELP rcaster_source_position_jumps_total Source base-position jumps.\n# TYPE rcaster_source_position_jumps_total counter\nrcaster_source_position_jumps_total {}\n# HELP rcaster_backlog_kicks_total Subscribers disconnected for exceeding their broadcast backlog.\n# TYPE rcaster_backlog_kicks_total counter\nrcaster_backlog_kicks_total {}\n",
+            self.source_health_warning_sources.load(Ordering::Acquire),
+            self.no_data_warning_sources.load(Ordering::Acquire),
+            self.no_correction_warning_sources.load(Ordering::Acquire),
+            self.high_crc_warning_sources.load(Ordering::Acquire),
+            self.low_valid_frame_ratio_sources.load(Ordering::Acquire),
+            self.station_id_warning_sources.load(Ordering::Acquire),
+            self.base_position_jump_sources.load(Ordering::Acquire),
+            self.max_source_packet_age_seconds.load(Ordering::Acquire),
+            self.station_id_changes.load(Ordering::Relaxed),
+            self.base_position_jumps.load(Ordering::Relaxed),
+            self.backlog_kicks.load(Ordering::Relaxed),
         ));
         metrics.push_str(&format!(
             "# HELP rcaster_auth_failure_fallback_total Shared authentication limiter failures that fell back to node-local protection.\n# TYPE rcaster_auth_failure_fallback_total counter\nrcaster_auth_failure_fallback_total {}\n",

@@ -72,6 +72,17 @@ async fn live_is_independent_and_ready_reflects_state() {
         cmr_sources: 0,
         nmea_sources: 0,
         unknown_sources: 0,
+        source_health_warning_sources: 2,
+        no_data_warning_sources: 1,
+        no_correction_warning_sources: 1,
+        high_crc_warning_sources: 1,
+        low_valid_frame_ratio_sources: 1,
+        station_id_warning_sources: 1,
+        base_position_jump_sources: 1,
+        max_source_packet_age_seconds: 17,
+        station_id_changes: 3,
+        base_position_jumps: 4,
+        backlog_kicks: 5,
     });
     state.set_sessions(4);
     state.set_config_generation(7);
@@ -112,6 +123,15 @@ async fn live_is_independent_and_ready_reflects_state() {
     assert!(metrics.contains("rcaster_source_crc_errors_total 2"));
     assert!(metrics.contains("rcaster_sources_by_format{format=\"rtcm3\"} 2"));
     assert!(metrics.contains("rcaster_sources_by_format{format=\"rtcm2\"} 1"));
+    assert!(metrics.contains("rcaster_source_health_alerting_sources 2"));
+    assert!(metrics.contains("rcaster_source_health_warnings{reason=\"no_data\"} 1"));
+    assert!(metrics.contains("rcaster_source_health_warnings{reason=\"no_correction\"} 1"));
+    assert!(metrics.contains("rcaster_source_health_warnings{reason=\"high_crc\"} 1"));
+    assert!(metrics.contains("rcaster_source_health_warnings{reason=\"low_valid_frame_ratio\"} 1"));
+    assert!(metrics.contains("rcaster_source_max_packet_age_seconds 17"));
+    assert!(metrics.contains("rcaster_source_station_id_changes_total 3"));
+    assert!(metrics.contains("rcaster_source_position_jumps_total 4"));
+    assert!(metrics.contains("rcaster_backlog_kicks_total 5"));
     assert!(metrics.contains("rcaster_config_generation 7"));
     assert!(metrics.contains("rcaster_auth_failure_fallback_total 3"));
     assert!(metrics.contains("rcaster_process_resident_memory_bytes 123456"));

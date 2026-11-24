@@ -583,7 +583,7 @@ where
                         stream_near(stream, hub, config, near, request.headers.get("ntrip-gga"))
                             .await
                     } else {
-                        stream_single_source(stream, receiver.expect("ordinary source")).await
+                        stream_single_source(stream, receiver.expect("ordinary source"), &hub).await
                     }
                 };
                 return if let Some(cancellation) = &mut cancellation {
@@ -1469,6 +1469,7 @@ where
 async fn stream_single_source<S>(
     mut stream: S,
     mut receiver: tokio::sync::broadcast::Receiver<Arc<[u8]>>,
+    hub: &MountpointHub,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1479,6 +1480,7 @@ where
             packet = receiver.recv() => match packet {
                 Ok(packet) => stream.write_all(&packet).await?,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    hub.record_backlog_kick();
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
                         "subscriber exceeded its backlog",
