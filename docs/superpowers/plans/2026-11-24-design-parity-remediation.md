@@ -57,7 +57,7 @@
 - Produces: `AdmissionViolation::{MixedCorrectionFormats, NoObservationOrSsr, BasePositionMissing, MsmRequiredMissing, CrcThresholdExceeded}`.
 - Produces: `AdmissionPolicy::{min_correction_frames, max_crc_error_ratio, require_base_position, require_msm}`.
 
-- [ ] **Step 1: Add failing profile-counter tests**
+- [x] **Step 1: Add failing profile-counter tests**
 
 ```rust
 #[test]
@@ -80,7 +80,7 @@ fn profile_tracks_position_and_msm_evidence() {
 }
 ```
 
-- [ ] **Step 2: Run the profile tests and verify RED**
+- [x] **Step 2: Run the profile tests and verify RED**
 
 Run:
 
@@ -90,7 +90,7 @@ cargo test -p rcaster-core --test protocol_demux profile_counts_correction_frame
 
 Expected: compile failure because `correction_frames` does not exist.
 
-- [ ] **Step 3: Add the profile fields and parser updates**
+- [x] **Step 3: Add the profile fields and parser updates**
 
 ```rust
 pub struct DataProfile {
@@ -104,7 +104,7 @@ pub struct DataProfile {
 
 `record_format_only` increments `correction_frames` and inserts the correction format. `record_rtcm3` does the same only for `is_correction_message(message_number)`. Parsing 1005/1006 sets `position_message_seen`; parsing an MSM message sets `msm_message_seen`.
 
-- [ ] **Step 4: Run the profile tests and verify GREEN**
+- [x] **Step 4: Run the profile tests and verify GREEN**
 
 Run:
 
@@ -114,7 +114,7 @@ cargo test -p rcaster-core --test protocol_demux profile_ --locked
 
 Expected: both profile tests pass.
 
-- [ ] **Step 5: Add failing policy tests**
+- [x] **Step 5: Add failing policy tests**
 
 ```rust
 #[test]
@@ -160,7 +160,7 @@ fn enforce_distinguishes_auxiliary_only_rtcm_from_nmea_only() {
 }
 ```
 
-- [ ] **Step 6: Run the policy tests and verify RED**
+- [x] **Step 6: Run the policy tests and verify RED**
 
 Run:
 
@@ -170,7 +170,7 @@ cargo test -p rcaster-core --test protocol_demux enforce_rejects_too_few_correct
 
 Expected: compile failure because the new policy fields and violation do not exist.
 
-- [ ] **Step 7: Implement immediate policy rules**
+- [x] **Step 7: Implement immediate policy rules**
 
 ```rust
 if self.require_correction_data && profile.correction_frames == 0 {
@@ -210,7 +210,7 @@ if self.require_msm
 }
 ```
 
-- [ ] **Step 8: Run all core protocol tests and verify GREEN**
+- [x] **Step 8: Run all core protocol tests and verify GREEN**
 
 Run:
 
@@ -220,7 +220,7 @@ cargo test -p rcaster-core --test protocol_demux --locked
 
 Expected: 0 failures.
 
-- [ ] **Step 9: Add config compatibility tests**
+- [x] **Step 9: Add config compatibility tests**
 
 ```rust
 #[test]
@@ -254,7 +254,7 @@ fn source_validation_accepts_advanced_rtcm_rules() {
 }
 ```
 
-- [ ] **Step 10: Implement config fields and runtime mapping**
+- [x] **Step 10: Implement config fields and runtime mapping**
 
 Add defaults that accept old configs:
 
@@ -269,7 +269,7 @@ pub require_base_position: bool,
 
 Add `require_any` and `required_within_s` to `SourceMsmConfigFile`. Validate ratios in `0.0..=1.0`; validate `required_within_s` only when `require_any=true`. Map the fields into `AdmissionPolicy` in `main.rs`.
 
-- [ ] **Step 11: Run config and admission tests**
+- [x] **Step 11: Run config and admission tests**
 
 Run:
 
@@ -280,7 +280,7 @@ cargo test -p rcaster-service --test source_admission_window --locked
 
 Expected: all pass.
 
-- [ ] **Step 12: Commit locally**
+- [x] **Step 12: Commit locally**
 
 ```powershell
 git add crates/rcaster-core/src/protocol.rs crates/rcaster-core/tests/protocol_demux.rs crates/rcaster-app/src/config.rs crates/rcaster-app/src/main.rs crates/rcaster-app/tests/standalone_config.rs
@@ -417,7 +417,7 @@ git commit -m "fix: keep unknown sources visible in observe mode"
 - Consumes: detected `DataProfile`.
 - Produces: `MountpointStrConfig` and `StrRecord::from_profile_and_mountpoint`.
 
-- [ ] **Step 1: Add failing STR merge tests**
+- [x] **Step 1: Add failing STR merge tests**
 
 ```rust
 #[test]
@@ -441,13 +441,13 @@ fn detected_rtcm3_position_overrides_configured_position() {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 ```powershell
 cargo test -p rcaster-core --test str_record configured_str_fields_survive_when_profile_has_no_device_data --locked
 ```
 
-- [ ] **Step 3: Add typed Mountpoint STR fields**
+- [x] **Step 3: Add typed Mountpoint STR fields**
 
 Add serializable optional fields:
 
@@ -465,7 +465,7 @@ pub struct MountpointStrConfig {
 
 Add `latitude: Option<f64>`, `longitude: Option<f64>`, `coverage_radius_m: Option<f64>` and `str_fields: Option<MountpointStrConfig>` to `Mountpoint` with `#[serde(default)]`.
 
-- [ ] **Step 4: Implement merge precedence**
+- [x] **Step 4: Implement merge precedence**
 
 Use this precedence:
 
@@ -475,11 +475,11 @@ Use this precedence:
 
 Use configured identity fields as defaults; detected format, message details, generator, nav-system and bitrate override when known. Do not emit RTCM-specific fields for format-only sources.
 
-- [ ] **Step 5: Extend admin mountpoint CRUD and public map**
+- [x] **Step 5: Extend admin mountpoint CRUD and public map**
 
 Accept and return the new fields in mountpoint POST/PATCH/GET. Include `coverage_radius_m` in map feature properties and omit stations with no configured or detected position.
 
-- [ ] **Step 6: Run STR, admin and public tests**
+- [x] **Step 6: Run STR, admin and public tests**
 
 ```powershell
 cargo test -p rcaster-core --test str_record --locked
@@ -487,7 +487,7 @@ cargo test -p rcaster-service --test admin_api --locked
 cargo test -p rcaster-service --test public_api --locked
 ```
 
-- [ ] **Step 7: Commit locally**
+- [x] **Step 7: Commit locally**
 
 ```powershell
 git add crates/rcaster-core/src/account.rs crates/rcaster-core/src/str_record.rs crates/rcaster-service/src/admin.rs crates/rcaster-service/src/ntrip_server.rs crates/rcaster-service/src/public.rs
@@ -511,7 +511,7 @@ git commit -m "fix: merge configured mountpoint STR metadata"
 - Produces: warning bits for observation stale, station change and position jump.
 - Produces: low-cardinality Prometheus counters/gauges.
 
-- [ ] **Step 1: Add failing health tests**
+- [x] **Step 1: Add failing health tests**
 
 ```rust
 #[test]
@@ -533,11 +533,11 @@ fn source_health_warns_when_base_position_jumps() {
 }
 ```
 
-- [ ] **Step 2: Implement config-thresholded health**
+- [x] **Step 2: Implement config-thresholded health**
 
 Add defaults for `alert_clear_s`, `station_id_change_alert`, `base_position_jump_m`, `valid_frame_ratio_min`, `short_window_s` and `long_window_s`. Track last station ID, last position and contiguous warning/clear durations in source state.
 
-- [ ] **Step 3: Add failing metrics tests**
+- [x] **Step 3: Add failing metrics tests**
 
 ```rust
 assert!(metrics.contains("rcaster_sources_by_format{format=\"rtcm3\"}"));
@@ -545,18 +545,18 @@ assert!(metrics.contains("rcaster_source_rejections_total{reason=\"mixed_correct
 assert!(metrics.contains("rcaster_monitor_busy_total"));
 ```
 
-- [ ] **Step 4: Implement core low-cardinality metrics**
+- [x] **Step 4: Implement core low-cardinality metrics**
 
 Add only fixed labels: format, validation result, rejection reason, relay state and monitor state. Do not label by username, mountpoint, session ID or IP.
 
-- [ ] **Step 5: Run hub and health tests**
+- [x] **Step 5: Run hub and health tests**
 
 ```powershell
 cargo test -p rcaster-service --test mountpoint_hub --locked
 cargo test -p rcaster-service --test health --locked
 ```
 
-- [ ] **Step 6: Commit locally**
+- [x] **Step 6: Commit locally**
 
 ```powershell
 git add crates/rcaster-service/src/config.rs crates/rcaster-service/src/hub.rs crates/rcaster-service/src/health.rs crates/rcaster-app/src/main.rs
