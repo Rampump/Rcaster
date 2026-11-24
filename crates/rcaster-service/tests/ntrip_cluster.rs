@@ -1,4 +1,5 @@
 use std::{
+    fs,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -110,7 +111,7 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
             relay_manager: None,
             source_admission: Some(SourceAdmissionConfig {
                 policy: AdmissionPolicy {
-                    mode: AdmissionMode::Enforce,
+                    mode: AdmissionMode::Observe,
                     allowed_formats: vec![DataFormat::Rtcm3],
                     require_correction_data: true,
                     min_valid_frames: 1,
@@ -118,8 +119,8 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
                 },
                 max_bytes: 4096,
                 max_frames: 8,
-                timeout: Duration::from_secs(1),
-                read_timeout: Duration::from_secs(1),
+                timeout: Duration::from_millis(150),
+                read_timeout: Duration::from_secs(2),
             }),
             near: None,
             accounts: None,
@@ -139,14 +140,19 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
         .await
         .expect("source request");
     assert_eq!(read_http_head(&mut source).await, b"ICY 200 OK\r\n\r\n");
-    source
-        .write_all(&decode_hex(RTCM3_1005))
-        .await
-        .expect("position frame");
-    source
-        .write_all(&synthetic_rtcm3(1074))
-        .await
-        .expect("MSM frame");
+    if let Some(capture) = std::env::var_os("RCASTER_SERIAL_CAPTURE") {
+        let capture = fs::read(capture).expect("read serial capture");
+        source.write_all(&capture).await.expect("serial capture");
+    } else {
+        source
+            .write_all(&decode_hex(RTCM3_1005))
+            .await
+            .expect("position frame");
+        source
+            .write_all(&synthetic_rtcm3(1074))
+            .await
+            .expect("MSM frame");
+    }
 
     let value = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -180,6 +186,40 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
     assert_ne!(value["str"]["latitude"], "0");
     assert_ne!(value["str"]["longitude"], "0");
 
+    let mut unknown_source = TcpStream::connect(address).await.expect("unknown source");
+    unknown_source
+        .write_all(b"SOURCE secret /C67\r\nUser-Agent: unknown-test\r\n\r\n")
+        .await
+        .expect("unknown source request");
+    assert_eq!(
+        read_http_head(&mut unknown_source).await,
+        b"ICY 200 OK\r\n\r\n"
+    );
+    unknown_source
+        .write_all(b"not-a-gnss-protocol")
+        .await
+        .expect("unknown data");
+    let unknown_value = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let record = admin
+                .get(format!("/rcaster/{cluster}/runtime/sources/C67"), None)
+                .await
+                .expect("read unknown source");
+            if let Some(record) = record.kvs().first() {
+                let value: serde_json::Value =
+                    serde_json::from_slice(record.value()).expect("unknown source JSON");
+                if value["state"] == "ACTIVE" {
+                    break value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unknown source remains active");
+    assert_eq!(unknown_value["str"]["format"], "UNKNOWN");
+
+    drop(unknown_source);
     drop(source);
     shutdown_tx.send(()).expect("shutdown");
     server.await.expect("server join").expect("server");

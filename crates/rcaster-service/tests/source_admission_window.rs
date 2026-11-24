@@ -90,11 +90,34 @@ fn source_expectation_waits_for_correction_after_leading_nmea() {
 fn observe_accepts_with_warning() {
     let mut window = SourceAdmissionWindow::new(policy(AdmissionMode::Observe, true), 1024, 8);
 
+    assert_eq!(window.push(&decode_hex(RTCM3_1005)), WindowOutcome::Pending);
     assert_eq!(
-        window.push(&decode_hex(RTCM3_1005)),
+        window.finish(),
         WindowOutcome::Accepted {
             bytes: decode_hex(RTCM3_1005),
             warnings: vec![AdmissionViolation::NoObservationOrSsr]
+        }
+    );
+}
+
+#[test]
+fn observe_accepts_unknown_stream_after_window_closes() {
+    let mut window = SourceAdmissionWindow::new(
+        AdmissionPolicy {
+            mode: AdmissionMode::Observe,
+            require_correction_data: false,
+            ..AdmissionPolicy::default()
+        },
+        1024,
+        8,
+    );
+
+    assert_eq!(window.push(b"unknown-stream"), WindowOutcome::Pending);
+    assert_eq!(
+        window.finish(),
+        WindowOutcome::Accepted {
+            bytes: Vec::new(),
+            warnings: vec![AdmissionViolation::NoValidFrames]
         }
     );
 }

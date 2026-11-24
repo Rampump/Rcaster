@@ -1,5 +1,5 @@
 use rcaster_core::protocol::{
-    AdmissionPolicy, AdmissionProgress, AdmissionViolation, ProtocolDemux,
+    AdmissionMode, AdmissionPolicy, AdmissionProgress, AdmissionViolation, ProtocolDemux,
 };
 use std::time::Duration;
 
@@ -64,6 +64,12 @@ impl SourceAdmissionWindow {
                 }
             }
             AdmissionProgress::Accepted { warnings } => {
+                if self.should_wait_for_correction(&warnings)
+                    && profile.total_bytes < self.max_bytes
+                    && profile.valid_frames < self.max_frames
+                {
+                    return WindowOutcome::Pending;
+                }
                 let outcome = WindowOutcome::Accepted {
                     bytes: std::mem::take(&mut self.accepted_bytes),
                     warnings,
@@ -72,17 +78,7 @@ impl SourceAdmissionWindow {
                 outcome
             }
             AdmissionProgress::Rejected { violations } => {
-                let waiting_for_correction = self.policy.require_correction_data
-                    && !profile.has_correction_data
-                    && violations.iter().all(|violation| {
-                        matches!(
-                            violation,
-                            AdmissionViolation::MissingCorrectionData
-                                | AdmissionViolation::NoObservationOrSsr
-                                | AdmissionViolation::ExpectedFormatMismatch(_)
-                        )
-                    });
-                if waiting_for_correction
+                if self.should_wait_for_correction(&violations)
                     && profile.total_bytes < self.max_bytes
                     && profile.valid_frames < self.max_frames
                 {
@@ -93,6 +89,19 @@ impl SourceAdmissionWindow {
                 outcome
             }
         }
+    }
+
+    fn should_wait_for_correction(&self, violations: &[AdmissionViolation]) -> bool {
+        self.policy.require_correction_data
+            && violations.iter().all(|violation| {
+                matches!(
+                    violation,
+                    AdmissionViolation::MissingCorrectionData
+                        | AdmissionViolation::NoObservationOrSsr
+                        | AdmissionViolation::ExpectedFormatMismatch(_)
+                )
+            })
+            && self.demux.profile().correction_frames < self.policy.min_correction_frames
     }
 
     pub fn finish(&mut self) -> WindowOutcome {
@@ -106,6 +115,18 @@ impl SourceAdmissionWindow {
                 warnings,
             },
             AdmissionProgress::Rejected { violations } => WindowOutcome::Rejected { violations },
+            AdmissionProgress::Pending if self.policy.mode == AdmissionMode::Observe => {
+                let warnings = (profile.valid_frames == 0)
+                    .then_some(AdmissionViolation::NoValidFrames)
+                    .into_iter()
+                    .collect();
+                let outcome = WindowOutcome::Accepted {
+                    bytes: std::mem::take(&mut self.accepted_bytes),
+                    warnings,
+                };
+                self.outcome = Some(outcome.clone());
+                outcome
+            }
             AdmissionProgress::Pending => WindowOutcome::Rejected {
                 violations: vec![AdmissionViolation::NoValidFrames],
             },

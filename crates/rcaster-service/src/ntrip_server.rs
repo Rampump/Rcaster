@@ -905,11 +905,16 @@ where
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "source read timed out"))??
         } else {
-            timeout_at(admission_deadline, stream.read(&mut buffer))
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "source admission timed out")
-                })??
+            match timeout_at(admission_deadline, stream.read(&mut buffer)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    admission.finish(source, permit).await?;
+                    if admission.is_admitted() {
+                        continue;
+                    }
+                    return Ok(());
+                }
+            }
         };
         if read == 0 {
             return admission.finish(source, permit).await;
@@ -1151,6 +1156,7 @@ impl AdmissionFeed {
             } else {
                 publish(source, bytes)?;
             }
+            self.demux = Some(self.window.take_demux());
         }
         Ok(())
     }
