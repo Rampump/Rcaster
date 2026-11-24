@@ -65,8 +65,8 @@ Implement the section 12.9 state machine for:
 - [x] Idempotent already-disabled handling and revision-CAS user updates.
 - [x] Require `admin:write` plus `operations:write`.
 - [x] Allow only the creator or `cluster:admin` scope to cancel.
-- [ ] Bind operation records to a coordinator lease and adopt them after a
-  coordinator restart.
+- [x] Bind active operation ownership to a renewable etcd lease and adopt
+  stale queued/running records after the owner exits.
 - [x] Add `users.delete`.
 - [x] Add `mountpoints.disable`.
 - [x] Add owner migration.
@@ -82,14 +82,18 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 
 ## Task 13: Source Event Interface
 
-**Status:** Pending.
+**Status:** In progress.
 
-- [ ] Define a bounded local JSONL source event sink.
-- [ ] Emit accepted, rejected, disconnected, owner-changed and health-alert
-  events with source generation and connection ID.
-- [ ] Expose a paginated read-only admin event query.
-- [ ] Rotate and retain events independently from business etcd state.
-- [ ] Verify that no event write occurs on the packet hot path.
+- [x] Reuse the bounded local JSONL audit sink for source events.
+- [x] Emit accepted and rejected source events.
+- [x] Expose a read-only admin source-event query.
+- [x] Rotate and retain source events independently from business etcd state.
+- [x] Verify that no event write occurs on the packet hot path.
+- [x] Emit disconnected and owner-changed events.
+- [x] Add source generation/connection IDs where a cluster source permit is
+  available.
+- [ ] Emit health-alert transition events.
+- [ ] Add cursor pagination beyond the bounded recent-event limit.
 
 ## Task 14: Browser-Level Web Verification
 

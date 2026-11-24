@@ -1310,6 +1310,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             accounts.clone(),
             cluster.clone(),
             "caster-admin".to_owned(),
+            None,
         );
         assert_eq!(
             recovery

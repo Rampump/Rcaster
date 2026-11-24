@@ -717,6 +717,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
                     account_directory.clone(),
                     cluster.cluster_id.clone(),
                     cluster.caster_id.clone(),
+                    Some(Arc::clone(&health_state)),
                 );
                 let mut shutdown = shutdown_rx.clone();
                 Some(tokio::spawn(async move {

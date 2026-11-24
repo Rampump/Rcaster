@@ -124,6 +124,16 @@ impl Drop for ClusterSourceHold {
 }
 
 impl SessionHold {
+    fn source_generation(&self) -> Option<u64> {
+        match self {
+            Self::ClusterSource(hold) => hold
+                .permit
+                .as_ref()
+                .map(crate::cluster_runtime::ClusterSourcePermit::source_generation),
+            _ => None,
+        }
+    }
+
     async fn ensure_source_publishing(&self) -> io::Result<()> {
         if let Self::ClusterSource(hold) = self
             && !hold.runtime.lease_is_healthy().await
@@ -785,12 +795,13 @@ where
         }
         Err(_) => return send_status(&mut stream, version, 503, Some(5)).await,
     };
+    let source_connection_id = connection_id();
     let _permit = if let Some(runtime) = &config.cluster_runtime {
         match runtime
             .admit_source_with_metadata(
                 &context.user.user_id,
                 request.mountpoint(),
-                &connection_id(),
+                &source_connection_id,
                 config.session_limiter.max_sessions(&context.user.username),
                 Some(ntrip_version_name(version)),
                 context.software.clone(),
@@ -858,6 +869,7 @@ where
                 config.cluster_runtime.clone(),
                 context.remote_ip,
                 configured_mountpoint.clone(),
+                source_connection_id.clone(),
             )
             .await
         } else {
@@ -872,6 +884,13 @@ where
             _permit.activate_source(&record).await?;
             if let Some(metrics) = &config.metrics {
                 metrics.source_accepted();
+                metrics.record_source_event(
+                    source.mountpoint(),
+                    "accepted",
+                    None,
+                    _permit.source_generation(),
+                    Some(&source_connection_id),
+                );
             }
             send_data_success(&mut stream, version).await?;
             forward_source_body(&mut stream, &source, &_permit, request.body(), buffered).await
@@ -884,11 +903,23 @@ where
             std::future::pending::<()>().await;
         }
     };
-    tokio::select! {
+    let result = tokio::select! {
         result = operation => result,
         _ = cancellation => Ok(()),
         _ = wait_for_lease_loss(lease_health) => Ok(()),
+    };
+    if source.is_active()
+        && let Some(metrics) = &config.metrics
+    {
+        metrics.record_source_event(
+            source.mountpoint(),
+            "disconnected",
+            result.as_ref().err().map(ToString::to_string).as_deref(),
+            _permit.source_generation(),
+            Some(&source_connection_id),
+        );
     }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -904,6 +935,7 @@ async fn forward_admitted_body<S>(
     runtime: Option<SharedClusterRuntime>,
     source_ip: IpAddr,
     configured_mountpoint: Option<Mountpoint>,
+    connection_id: String,
 ) -> io::Result<()>
 where
     S: AsyncRead + Unpin,
@@ -917,6 +949,7 @@ where
         runtime,
         source_ip,
         configured_mountpoint,
+        connection_id,
     );
     match framing {
         BodyFraming::Stream => {
@@ -1091,6 +1124,7 @@ struct AdmissionFeed {
     runtime: Option<SharedClusterRuntime>,
     source_ip: IpAddr,
     configured_mountpoint: Option<Mountpoint>,
+    connection_id: String,
     str_refresh: bool,
     last_str: Option<StrRecord>,
     last_admission: Option<SourceAdmissionSummary>,
@@ -1114,6 +1148,7 @@ impl AdmissionFeed {
         runtime: Option<SharedClusterRuntime>,
         source_ip: IpAddr,
         configured_mountpoint: Option<Mountpoint>,
+        connection_id: String,
     ) -> Self {
         let str_refresh = config.str_refresh;
         Self {
@@ -1127,6 +1162,7 @@ impl AdmissionFeed {
             str_refresh,
             last_str: None,
             last_admission: None,
+            connection_id,
         }
     }
 
@@ -1204,7 +1240,13 @@ impl AdmissionFeed {
                 self.last_admission = Some(admission);
                 if let Some(metrics) = &self.metrics {
                     metrics.source_accepted();
-                    metrics.record_source_event(source.mountpoint(), "accepted", None, None, None);
+                    metrics.record_source_event(
+                        source.mountpoint(),
+                        "accepted",
+                        None,
+                        permit.source_generation(),
+                        Some(&self.connection_id),
+                    );
                 }
                 if self.window.profile().has_correction_data {
                     publish_correction(source, bytes)?;
@@ -1224,8 +1266,8 @@ impl AdmissionFeed {
                         source.mountpoint(),
                         "rejected",
                         Some(&format!("{violations:?}")),
-                        None,
-                        None,
+                        permit.source_generation(),
+                        Some(&self.connection_id),
                     );
                 }
                 Ok(false)
@@ -1262,7 +1304,7 @@ impl AdmissionFeed {
                             "accepted",
                             None,
                             None,
-                            None,
+                            Some(&self.connection_id),
                         );
                     }
                     if self.window.profile().has_correction_data {
@@ -1282,8 +1324,8 @@ impl AdmissionFeed {
                             source.mountpoint(),
                             "rejected",
                             Some(&format!("{violations:?}")),
-                            None,
-                            None,
+                            permit.source_generation(),
+                            Some(&self.connection_id),
                         );
                     }
                     return Ok(());
@@ -1297,8 +1339,8 @@ impl AdmissionFeed {
                             source.mountpoint(),
                             "rejected",
                             Some("NoValidFrames"),
-                            None,
-                            None,
+                            permit.source_generation(),
+                            Some(&self.connection_id),
                         );
                     }
                     return Ok(());

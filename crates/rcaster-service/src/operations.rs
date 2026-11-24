@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,6 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     account_directory::{AccountDirectory, AccountDirectoryError},
     cluster_runtime::SharedClusterRuntime,
+    health::HealthState,
 };
 
 const MAX_TARGETS: usize = 500;
@@ -97,6 +99,7 @@ pub struct OperationManager {
     accounts: AccountDirectory,
     cluster_id: String,
     caster_id: String,
+    health: Option<Arc<HealthState>>,
 }
 
 impl OperationManager {
@@ -105,12 +108,14 @@ impl OperationManager {
         accounts: AccountDirectory,
         cluster_id: String,
         caster_id: String,
+        health: Option<Arc<HealthState>>,
     ) -> Self {
         Self {
             runtime,
             accounts,
             cluster_id,
             caster_id,
+            health,
         }
     }
 
@@ -680,12 +685,14 @@ impl OperationManager {
             accounts: self.accounts.clone(),
             cluster_id: self.cluster_id.clone(),
             caster_id: self.caster_id.clone(),
+            health: self.health.clone(),
         };
         let keepalive_manager = Self {
             runtime: self.runtime.clone(),
             accounts: self.accounts.clone(),
             cluster_id: self.cluster_id.clone(),
             caster_id: self.caster_id.clone(),
+            health: self.health.clone(),
         };
         let operation_id = operation.operation_id.clone();
         tokio::spawn(async move {
@@ -881,12 +888,30 @@ impl OperationManager {
             .upsert_mountpoint(updated, Some(target.revision))
             .await
         {
-            Ok(revision) => TargetResult {
-                target: target.mountpoint.clone(),
-                status: "succeeded".to_owned(),
-                reason: None,
-                revision: Some(revision),
-            },
+            Ok(revision) => {
+                if let Some(health) = &self.health {
+                    health.record_source_event(
+                        &target.mountpoint,
+                        "owner_changed",
+                        Some(&format!(
+                            "{} -> {}",
+                            snapshot
+                                .mountpoint(&target.mountpoint)
+                                .map(|mountpoint| mountpoint.owner_user_id.as_str())
+                                .unwrap_or_default(),
+                            target.owner_user_id
+                        )),
+                        None,
+                        None,
+                    );
+                }
+                TargetResult {
+                    target: target.mountpoint.clone(),
+                    status: "succeeded".to_owned(),
+                    reason: None,
+                    revision: Some(revision),
+                }
+            }
             Err(AccountDirectoryError::Conflict) => failed_owner(target, "STALE_REVISION"),
             Err(error) => failed_owner(target, &error.to_string()),
         }

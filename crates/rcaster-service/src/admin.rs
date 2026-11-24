@@ -928,6 +928,7 @@ async fn handle(
                     state.accounts.clone(),
                     state.cluster_id.clone(),
                     state.caster_id.clone(),
+                    Some(Arc::clone(&state.ready)),
                 );
                 return Ok(
                     match manager
@@ -1086,6 +1087,7 @@ async fn handle(
                     state.accounts.clone(),
                     state.cluster_id.clone(),
                     state.caster_id.clone(),
+                    Some(Arc::clone(&state.ready)),
                 );
                 let result = manager.retry(operation_id).await;
                 audit(
@@ -3371,6 +3373,7 @@ async fn operation_preview(
             state.accounts.clone(),
             state.cluster_id.clone(),
             state.caster_id.clone(),
+            Some(Arc::clone(&state.ready)),
         );
         return manager.preview(body).await;
     }
