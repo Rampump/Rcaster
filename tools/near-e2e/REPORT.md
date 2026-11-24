@@ -37,38 +37,38 @@ cargo test -p rcaster-service --test near \
   --locked -- --ignored --nocapture
 ```
 
-Result: partial.
+Result: pass.
 
 - 200 deterministic random query points matched a full Haversine scan.
 - 10 synthetic paths switched once in order after reaching the destination and
   remaining stationary through the observation window.
-- A separate 8 m/s continuous-crossing test records the current known gap:
-  switching never occurs while the client is moving because each >4 m GGA
-  resets the observation.
+- A separate 8 m/s continuous-crossing test switches once after three seconds
+  of cumulative progress toward the selected target.
 
 ## L2a real NTRIP socket verification
 
 Evidence:
 
-- `tools/near-e2e/runs/20261125-020131/summary.json`
-- `tools/near-e2e/runs/20261125-020131/*.jsonl`
-- `tools/near-e2e/runs/20261125-020131/metrics.json`
-- `tools/near-e2e/runs/20261125-020131/metrics-clean.json`
-- `tools/near-e2e/runs/20261125-020131/str-table.txt`
+- `tools/near-e2e/runs/20261125-030830/summary.json`
+- `tools/near-e2e/runs/20261125-030830/*.jsonl`
+- `tools/near-e2e/runs/20261125-030830/metrics.json`
+- `tools/near-e2e/runs/20261125-030830/metrics-clean.json`
+- `tools/near-e2e/runs/20261125-030830/str-table.txt`
 
 | Case | Expected | Actual | Result |
 |---|---|---|---|
 | L2-01 static 20 | 20/20 selected and delivered | 20/20 | PASS |
 | L2-02 99/101 km | 99 km receives; 101 km receives no station | same | PASS |
 | L2-03 hysteresis | no switch under jitter | no switch | PASS |
-| L2-04 A->B, 1 s query cadence | A then B, first switch not before 3 s | A then B at 10.153 s | PASS |
-| L2-05 A->B->C, 1 s query cadence | ordered A, B, C | A, B at 10.088 s, C at 22.154 s | PASS |
+| L2-04 A->B, 1 s query cadence | A then B, first switch not before 3 s | A then B at 6.052 s | PASS |
+| L2-05 A->B->C, 1 s query cadence | ordered A, B, C | A, B at 6.036 s, C at 18.103 s | PASS |
 | L2-06 60 km jump | rejected, station stays A | rejected, station A | PASS |
 | L2-07 GGA burst | rate limiter increments, station unchanged | same | PASS |
 | L2-08 HDOP 2.6 | invalid, no switch | station A | PASS |
 | L2-09 position TTL | stale source excluded | no station after TTL | PASS |
-| L2-10a source disconnect failover | switch to second source | connection used first source, then closed | FAIL / KNOWN GAP |
-| L2-10b source disconnect close | close within 10 s if failover unavailable | closed at 2.001 s | PASS |
+| L2-10a source disconnect failover | switch to second source | stations 2 then 577, connection stayed open | PASS |
+| L2-10b failover keeps client | no client disconnect after failover | no close event | PASS |
+| L2-10c no alternative source | close within 10 s | closed at 12.002 s, 10 s after source loss | PASS |
 | L2-11 20 clients | 20/20 independent selections | 20/20 | PASS |
 | STR coordinates | no uploaded `0,0` coordinate | 0 rows | PASS |
 | Cleanup | active sources 0, stderr 0 bytes | same | PASS |
@@ -88,10 +88,10 @@ No mountpoint coordinate override was required.
 
 Evidence:
 
-- `tools/near-e2e/runs/20261125-020419-l2b/summary.json`
-- `tools/near-e2e/runs/20261125-020419-l2b/l2b.jsonl`
-- `tools/near-e2e/runs/20261125-020419-l2b/metrics.json`
-- `tools/near-e2e/runs/20261125-020419-l2b/cleanup-metrics.json`
+- `tools/near-e2e/runs/20261125-031140-l2b/summary.json`
+- `tools/near-e2e/runs/20261125-031140-l2b/l2b.jsonl`
+- `tools/near-e2e/runs/20261125-031140-l2b/metrics.json`
+- `tools/near-e2e/runs/20261125-031140-l2b/cleanup-metrics.json`
 
 Result: pass.
 
@@ -126,18 +126,15 @@ RTCM3 1005 station ID. Two sparse-region samples correctly returned no source.
 
 ## Conclusion
 
-The local standalone data path passes for quasi-static and 1-second-query
-operation:
+The local standalone data path passes for quasi-static, moving, failover and
+1-second-query operation:
 
 `GGA input -> spatial selection -> source switch -> selected source RTCM data`
 
-The following requested behavior is **not yet complete**:
+Continuous movement, active-source failover and the no-alternative timeout are
+now covered. Under production-default recompute intervals, a stationary client
+can still take roughly 5–10 seconds to complete a switch; that remains a
+documented latency characteristic rather than an unverified failure.
 
-- Continuous moving-client switches while the client remains in motion.
-- NEAR failover to the next source when the currently served source
-  disconnects; current behavior closes the client connection.
-- Production-default 5–10 second switching latency as a stated guarantee.
-
-Therefore this evidence must be reported as **partial**, not complete NEAR
-acceptance. It also does not replace the separate dual-node relay case or the
-external Soak, CMR, DNS/LB, or rolling-upgrade acceptance tests.
+This evidence does not replace the external Soak, real CMR, DNS/LB, receiver
+compatibility, or rolling-upgrade acceptance tests.

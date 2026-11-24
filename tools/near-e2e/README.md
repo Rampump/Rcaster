@@ -36,8 +36,8 @@ cargo test -p rcaster-service --test near \
 
 This checks 200 deterministic random queries against a full Haversine scan and
 10 stationary-arrival paths with the production `NearIndex` and
-`NearSelector`. A separate normal test records the current moving-client
-switching gap; see `REPORT.md`.
+`NearSelector`. A separate normal test covers continuous moving-client
+switching.
 
 ## L2a real socket verification
 
@@ -63,6 +63,7 @@ The harness imports one owner and all snapshot mountpoints, rewrites RTCM3
 - invalid HDOP
 - stale source position TTL
 - active source disconnect
+- active source failover and no-alternative timeout
 - 20 concurrent clients
 - non-zero STR coordinates
 - source cleanup and empty stderr

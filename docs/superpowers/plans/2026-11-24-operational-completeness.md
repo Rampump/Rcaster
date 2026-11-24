@@ -30,7 +30,7 @@ found these remaining gaps:
 
 ## Task 11: Expand Operational Metrics
 
-**Status:** In progress.
+**Status:** Complete.
 
 - [x] Expose active Source Health warning sources by fixed reason.
 - [x] Expose the maximum live-source packet age.
@@ -39,9 +39,10 @@ found these remaining gaps:
 - [x] Add health endpoint and Hub regression tests.
 - [x] Add public monitor/viewer/busy counters.
 - [x] Add relay STARTING/failure/idle-close counters.
-- [ ] Add relay slow-consumer counters.
-- [ ] Add parser queue/drop/framing/resynchronization counters.
-- [ ] Add etcd watch-lag, admission-latency and lease-remaining gauges.
+- [x] Add relay slow-consumer counters.
+- [x] Add parser queue/drop/framing/resynchronization counters.
+- [x] Add etcd watch-lag, admission-latency and lease-remaining gauges.
+- [x] Add NEAR query latency, moving-switch and disconnect/failover paths.
 
 Verification:
 
@@ -51,7 +52,7 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 
 ## Task 12: Previewed Batch Operations
 
-**Status:** In progress.
+**Status:** Complete.
 
 Implement the section 12.9 state machine for:
 
@@ -82,7 +83,7 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 
 ## Task 13: Source Event Interface
 
-**Status:** In progress.
+**Status:** Complete.
 
 - [x] Reuse the bounded local JSONL audit sink for source events.
 - [x] Emit accepted and rejected source events.
@@ -97,18 +98,29 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 
 ## Task 14: Browser-Level Web Verification
 
-**Status:** Pending.
+**Status:** Complete.
 
-- [ ] Start an isolated local standalone and clustered test instance.
-- [ ] Exercise admin login, source filtering, health, history, config and
+- [x] Start an isolated local standalone and clustered test instance.
+- [x] Exercise admin login, source filtering, health, history, config and
   operation lookup.
-- [ ] Exercise public directory, map, login, ticket and monitor WebSocket.
-- [ ] Capture console errors and failed network requests.
-- [ ] Keep the test independent of the soak deployment.
+- [x] Exercise public directory, map, login, ticket and monitor WebSocket.
+- [x] Capture console errors and failed network requests.
+- [x] Keep the test independent of the soak deployment.
+
+Evidence:
+
+- `tools/web-e2e/run_browser_e2e.py`
+- `tools/web-e2e/runs/20261125-031411/result.json`
+- Standalone: real admin login/source/health/history/config and public
+  login/ticket/WebSocket flows pass with no unexpected browser or network
+  errors.
+- Clustered: local etcd, mTLS admin configuration, RTCM3 STR publication and
+  public login/ticket/WebSocket pass on the same isolated host.
 
 ## Task 15: Final External Acceptance
 
-**Status:** Blocked by explicitly protected external environments.
+**Status:** Pending. Blocked by explicitly protected external environments and
+the user's instruction not to touch the soak servers.
 
 - [ ] Complete the 72-hour soak without touching the current frozen run.
 - [ ] Execute a signed rolling upgrade and rollback across four real nodes.
