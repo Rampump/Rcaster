@@ -739,6 +739,38 @@ Final result files are `/tmp/rcaster-final-soak-72h.json` on each node and
 processes exit normally after 259,200 seconds. No further production code or
 node configuration changes are part of this acceptance window.
 
+### Frontend Follow-Up and Acceptance Restart
+
+The handoff audit found two remaining administrative UI defects. A service
+token could authenticate, but the page requested the account-only CSRF and API
+token endpoints and replaced the entire view with a 403 error. The dashboard
+now detects `session.kind=service`, skips those two requests, and hides API
+token management while preserving both backend 403 responses. The ambiguous
+cluster status field was replaced with `local_active_sources` and a
+de-duplicated `cluster_active_sources`.
+
+The frontend changes passed the complete all-feature workspace suite
+(319 passed, 8 ignored, 0 failed), all-feature Clippy with warnings denied, and
+the release build. All eight external integrations were rerun successfully:
+etcd client certificate rotation, leader failover, full quorum recovery,
+snapshot restore to a ready Caster, HAProxy PROXY v2, RTKLIB `str2str`, official
+RTCM2/RTCM3 fixtures, and the 17.6 MB BINEX stream.
+
+Release `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
+was deployed to all four Casters and the 101 coordinator. The 134 and 139 nodes
+now also bind their admin listener to loopback port 5758. All four admin pages
+were exercised through mTLS with the service token and returned 200; each page
+contained the service-mode branch, hid API token management, and reported ready.
+CSRF and API-token management remained 403.
+
+The 04:24 window was stopped at 20:09:11–13 CST after about 15 hours 45 minutes
+and retained as a development pre-run. The new 72-hour acceptance window
+started on all four local units and the cross-region unit at
+2026-11-24 20:12:42 CST and is expected to finish at
+2026-11-27 20:12:42 CST. Startup verification showed zero restarts, empty
+stderr, four ready Casters, 10 cluster sources, 60 sessions, and
+`cluster_active_sources=10` on every node.
+
 ### Repository and CI
 
 The source is published to both

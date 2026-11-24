@@ -165,6 +165,36 @@ affected mountpoint.
    Recovered snapshots never restore old source claims, sessions, locks,
    admin sessions, monitor tickets, or upgrade state.
 
+## Admin Dashboard Access
+
+All four deployment nodes bind the administrative HTTPS listener to
+`127.0.0.1:5758`. Do not expose that port publicly. Use an SSH tunnel from the
+operator workstation:
+
+```bash
+ssh -N -L 15758:127.0.0.1:5758 root@NODE_ADDRESS
+```
+
+Open `https://127.0.0.1:15758/admin/` with a client certificate trusted by
+`/etc/rcaster/pki/ca.crt`, then sign in with an enabled administrator account.
+The service token can be used for read-only status checks from the node:
+
+```bash
+cfg=/etc/rcaster/caster.json
+pki=/etc/rcaster/pki
+token=$(jq -r '.cluster.coordinator_tls.service_token' "$cfg")
+curl --cacert "$pki/ca.crt" \
+  --cert "$pki/node.crt" \
+  --key "$pki/node.key" \
+  -H "Authorization: Bearer $token" \
+  https://127.0.0.1:5758/admin/v1/cluster/status
+```
+
+`local_active_sources` is the count held by this node. `cluster_active_sources`
+is the de-duplicated source count visible across the cluster. Service-token
+access is read-only for token management: `/admin/v1/auth/csrf` and
+`/admin/v1/api-tokens` intentionally return 403.
+
 ## Cross-Node Relay Soak
 
 Use this drill after the Caster Config, account directory, TLS certificates,
