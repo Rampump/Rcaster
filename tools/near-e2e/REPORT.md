@@ -49,19 +49,19 @@ Result: pass.
 
 Evidence:
 
-- `tools/near-e2e/runs/20261125-030830/summary.json`
-- `tools/near-e2e/runs/20261125-030830/*.jsonl`
-- `tools/near-e2e/runs/20261125-030830/metrics.json`
-- `tools/near-e2e/runs/20261125-030830/metrics-clean.json`
-- `tools/near-e2e/runs/20261125-030830/str-table.txt`
+- `tools/near-e2e/runs/20261125-032725/summary.json`
+- `tools/near-e2e/runs/20261125-032725/*.jsonl`
+- `tools/near-e2e/runs/20261125-032725/metrics.json`
+- `tools/near-e2e/runs/20261125-032725/metrics-clean.json`
+- `tools/near-e2e/runs/20261125-032725/str-table.txt`
 
 | Case | Expected | Actual | Result |
 |---|---|---|---|
 | L2-01 static 20 | 20/20 selected and delivered | 20/20 | PASS |
 | L2-02 99/101 km | 99 km receives; 101 km receives no station | same | PASS |
 | L2-03 hysteresis | no switch under jitter | no switch | PASS |
-| L2-04 A->B, 1 s query cadence | A then B, first switch not before 3 s | A then B at 6.052 s | PASS |
-| L2-05 A->B->C, 1 s query cadence | ordered A, B, C | A, B at 6.036 s, C at 18.103 s | PASS |
+| L2-04 A->B, 1 s query cadence | A then B, first switch not before 3 s | A then B at 6.102 s | PASS |
+| L2-05 A->B->C, 1 s query cadence | ordered A, B, C | A, B at 6.087 s, C at 18.154 s | PASS |
 | L2-06 60 km jump | rejected, station stays A | rejected, station A | PASS |
 | L2-07 GGA burst | rate limiter increments, station unchanged | same | PASS |
 | L2-08 HDOP 2.6 | invalid, no switch | station A | PASS |
@@ -88,10 +88,10 @@ No mountpoint coordinate override was required.
 
 Evidence:
 
-- `tools/near-e2e/runs/20261125-031140-l2b/summary.json`
-- `tools/near-e2e/runs/20261125-031140-l2b/l2b.jsonl`
-- `tools/near-e2e/runs/20261125-031140-l2b/metrics.json`
-- `tools/near-e2e/runs/20261125-031140-l2b/cleanup-metrics.json`
+- `tools/near-e2e/runs/20261125-033036-l2b/summary.json`
+- `tools/near-e2e/runs/20261125-033036-l2b/l2b.jsonl`
+- `tools/near-e2e/runs/20261125-033036-l2b/metrics.json`
+- `tools/near-e2e/runs/20261125-033036-l2b/cleanup-metrics.json`
 
 Result: pass.
 
@@ -120,9 +120,10 @@ RTCM3 1005 station ID. Two sparse-region samples correctly returned no source.
   `max_validating_sources * source_admission.max_bytes`; the harness sets an
   explicit 1 GiB bound.
 - The L2 switching evidence uses `min/max_recompute_interval_ms=1000`. Under
-  production defaults, a stationary client can wait for the 5-second maximum
-  recompute interval and then complete the 3-second observation window, so the
-  expected practical switch latency is roughly 5–10 seconds.
+  production defaults, a stationary client can wait up to the 5-second maximum
+  recompute interval to start observation. Once the 3-second window completes,
+  the observation itself triggers the next query, bounding the practical
+  switch latency to roughly 5–8 seconds.
 
 ## Conclusion
 
@@ -133,7 +134,7 @@ The local standalone data path passes for quasi-static, moving, failover and
 
 Continuous movement, active-source failover and the no-alternative timeout are
 now covered. Under production-default recompute intervals, a stationary client
-can still take roughly 5–10 seconds to complete a switch; that remains a
+can still take roughly 5–8 seconds to complete a switch; that remains a
 documented latency characteristic rather than an unverified failure.
 
 This evidence does not replace the external Soak, real CMR, DNS/LB, receiver

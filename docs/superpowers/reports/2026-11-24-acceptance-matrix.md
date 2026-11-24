@@ -29,7 +29,7 @@ not be described as final production acceptance.
 
 | Design section | Current status | Authoritative evidence | Remaining proof |
 |---|---|---|---|
-| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, moving and failover NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The standalone L2 test proves quasi-static and moving selection, 99/101 km boundaries, hysteresis, jump/rate/HDOP/TTL handling, active-source failover, no-alternative timeout and 50/50 non-station full-table samples. | More receiver models and real CMR/CMR+ capture remain external-compatibility proof. Production-default query cadence still implies roughly 5–10 seconds for some stationary switches. |
+| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, moving and failover NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The standalone L2 test proves quasi-static and moving selection, 99/101 km boundaries, hysteresis, jump/rate/HDOP/TTL handling, active-source failover, no-alternative timeout and 50/50 non-station full-table samples. | More receiver models and real CMR/CMR+ capture remain external-compatibility proof. Production-default query cadence still implies roughly 5–8 seconds for some stationary switches. |
 | 18.2 Consistency and ownership | Verified | `source_fencing`, `user_admission`, `revision_admission`, `config_revision`, `cluster_runtime`, `blacklist_write`, `account_directory`, `connections` and `upgrade` integration tests cover races, stale revisions, generation/connection fencing, owner commands and cleanup. Live cluster ownership was checked at 3/2/3/2 across four nodes. | Re-run the same assertions after the 72-hour run exits to prove no orphan state remains. |
 | 18.3 Capacity | Verified | Target-node probes completed 10 sources/8,000 subscribers, 1 source/10,000 subscribers and 10,000 mountpoints. Coordinator spikes achieved about 1,000 admissions/s. A local four-Caster cluster with 500 sources and 100 cross-node relay subscribers ran 30 seconds: 16,872,000 source bytes and 3,373,032 subscriber bytes. | The frozen soak remains the long-duration stability run, not a capacity proof gap. |
 | 18.4 Stability | Pending | Pre-runs showed zero restarts and bounded RSS/FD. The current frozen candidate is running four local and one cross-region soak units. | Successful completion of all five 259,200-second runs, final RSS/FD curves, zero restart, empty stderr and clean post-run state. |
@@ -76,7 +76,7 @@ Final current-tree verification on 2026-11-25:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `84F9005CA74405EA731E0FD9044166189F63C76F95F5BD1616699DC857D5AEBA`.
+  `49854056127AB4462CC8937504780DB1DCAC022205406E6EAF760CD04092E103`.
 - The full ignored integration suite was rerun after the source lifecycle
   changes. One initial leader-failover attempt hit a temporary etcd startup
   race; the failing test then passed alone and the complete ignored suite
@@ -91,7 +91,7 @@ Final current-tree verification on 2026-11-25:
   all L2a static/boundary/hysteresis/switch/rate/jump/HDOP/TTL/failover/
   no-alternative-timeout/concurrency checks, and the 1,301-source / 50
   non-station-query L2b sample pass.
-- Browser validation: `tools/web-e2e/runs/20261125-031411/result.json`.
+- Browser validation: `tools/web-e2e/runs/20261125-032719/result.json`.
   Standalone admin/public browser flows and clustered etcd/mTLS/public flows
   pass with no unexpected console or network failures.
 
