@@ -409,6 +409,36 @@ fn deterministic_random_streams_keep_demux_memory_bounded() {
 }
 
 #[test]
+#[ignore = "extended deterministic fuzz campaign"]
+fn extended_deterministic_fuzz_campaign_keeps_demux_bounded() {
+    for seed in 0..4096_u64 {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let mut demux = ProtocolDemux::new();
+        for _ in 0..256 {
+            let length = (state as usize % 1024) + 1;
+            let mut chunk = vec![0_u8; length];
+            for byte in &mut chunk {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            demux.push(&chunk);
+            assert!(
+                demux.buffered_bytes() <= 8192,
+                "seed {seed} buffered {} bytes",
+                demux.buffered_bytes()
+            );
+        }
+        let profile = demux.profile();
+        assert!(
+            profile.crc_errors <= profile.total_bytes,
+            "seed {seed} produced impossible CRC counters"
+        );
+    }
+}
+
+#[test]
 fn profile_tracks_framing_resync_and_pending_drops() {
     let valid = decode_hex(RTCM3_1005);
     let mut demux = ProtocolDemux::new();
