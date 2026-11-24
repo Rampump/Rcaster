@@ -34,6 +34,7 @@ use rcaster_service::{
     hub::{HealthThresholds, HubLimits, MountpointHub},
     maintenance,
     ntrip_server::{NtripServerConfig, NtripTlsAcceptor, serve_ntrip, serve_ntrip_tls},
+    operations::OperationManager,
     proxy_protocol::ProxyProtocolConfig,
     public::{PublicMapTiles, PublicState, serve_public_tls_reloadable},
     recovery::prepare_restored_cluster,
@@ -591,6 +592,14 @@ async fn serve(args: &[String]) -> AppResult<()> {
         })
         .transpose()?
         .unwrap_or_default();
+    health_state.set_source_event_log(
+        audit.clone(),
+        config
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.caster_id.clone())
+            .unwrap_or_else(|| "standalone".to_owned()),
+    );
     let audit_task = config.audit_log.as_ref().map(|_| {
         let audit = audit.clone();
         let mut shutdown = shutdown_rx.clone();
@@ -697,6 +706,33 @@ async fn serve(args: &[String]) -> AppResult<()> {
         ));
         println!("admin listening on {address}");
         Some(task)
+    } else {
+        None
+    };
+    let operation_recovery_task = if config.admin_bind.is_some() {
+        match (cluster_runtime.clone(), config.cluster.as_ref()) {
+            (Some(runtime), Some(cluster)) => {
+                let manager = OperationManager::new(
+                    runtime,
+                    account_directory.clone(),
+                    cluster.cluster_id.clone(),
+                    cluster.caster_id.clone(),
+                );
+                let mut shutdown = shutdown_rx.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        if let Err(error) = manager.recover_stale_operations().await {
+                            eprintln!("rcaster: operation recovery failed: {error:?}");
+                        }
+                        tokio::select! {
+                            _ = shutdown.changed() => return,
+                            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        }
     } else {
         None
     };
@@ -912,6 +948,9 @@ async fn serve(args: &[String]) -> AppResult<()> {
     }
     if let Some(task) = admin_task {
         task.await??;
+    }
+    if let Some(task) = operation_recovery_task {
+        task.await?;
     }
     if let Some(task) = public_task {
         task.await??;

@@ -927,6 +927,7 @@ async fn handle(
                     runtime.clone(),
                     state.accounts.clone(),
                     state.cluster_id.clone(),
+                    state.caster_id.clone(),
                 );
                 return Ok(
                     match manager
@@ -1084,6 +1085,7 @@ async fn handle(
                     runtime.clone(),
                     state.accounts.clone(),
                     state.cluster_id.clone(),
+                    state.caster_id.clone(),
                 );
                 let result = manager.retry(operation_id).await;
                 audit(
@@ -2212,6 +2214,41 @@ async fn handle(
                 }
             }
         }
+        "/admin/v1/source-events" => {
+            let limit = query
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, 1000);
+            match state.audit.recent(limit.saturating_mul(4)).await {
+                Ok(events) => {
+                    let events = events
+                        .into_iter()
+                        .filter(|event| event.action.starts_with("source."))
+                        .take(limit)
+                        .map(|event| {
+                            json!({
+                                "event_id": event.request_id,
+                                "mountpoint": event.target,
+                                "event": event.action.trim_start_matches("source."),
+                                "caster_id": event.details.get("caster_id"),
+                                "source_generation": event.details.get("source_generation"),
+                                "connection_id": event.details.get("connection_id"),
+                                "reason": event.details.get("reason"),
+                                "timestamp": event.timestamp,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    json!({"events": events, "limit": limit})
+                }
+                Err(_) => {
+                    return Ok(response(
+                        503,
+                        json!({"code":"UNAVAILABLE","message":"source event log unavailable"}),
+                    ));
+                }
+            }
+        }
         "/admin/v1/cluster/status" => {
             let local_sources = state.hub.active_sources();
             let mut cluster_sources = local_sources.iter().cloned().collect::<BTreeSet<_>>();
@@ -3333,6 +3370,7 @@ async fn operation_preview(
             runtime.clone(),
             state.accounts.clone(),
             state.cluster_id.clone(),
+            state.caster_id.clone(),
         );
         return manager.preview(body).await;
     }
@@ -3447,6 +3485,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 <section><h3>Blacklist</h3><p class="write-control"><input id="bl-id" aria-label="Rule ID" placeholder="rule id"><input id="bl-cidr" aria-label="CIDR" placeholder="CIDR"><input id="bl-quota" aria-label="Quota" type="number" value="0" style="width:90px"><input id="bl-description" aria-label="Description" placeholder="description"><button onclick="addBlacklist()">Add rule</button></p><table><thead><tr><th>ID</th><th>CIDR</th><th>Quota</th><th>Enabled</th></tr></thead><tbody id="blacklist"></tbody></table></section>
 <section><h3>Sessions</h3><table><thead><tr><th>Type</th><th>User</th><th>Mountpoint</th><th>Caster</th></tr></thead><tbody id="sessions"></tbody></table></section>
 <section><h3>Source cooldowns</h3><table><thead><tr><th>Mountpoint</th><th>Source IP</th><th>Reason</th><th>Expires</th><th>Action</th></tr></thead><tbody id="cooldowns"></tbody></table></section>
+<section><h3>Source events</h3><table><thead><tr><th>Timestamp</th><th>Mountpoint</th><th>Event</th><th>Reason</th><th>Caster</th></tr></thead><tbody id="source-events"></tbody></table></section>
 <section><h3>NEAR clients</h3><table><thead><tr><th>Type</th><th>User</th><th>Mountpoint</th><th>Current source</th><th>Caster</th></tr></thead><tbody id="near-clients"></tbody></table></section>
 <section><h3>Maintenance</h3><pre id="maintenance">-</pre><button class="write-control" onclick="setMaintenance(true)">Enter maintenance</button><button class="write-control" onclick="setMaintenance(false)">Leave maintenance</button></section>
 <section><h3>Configuration</h3><pre id="config-status">-</pre><textarea id="config-json" aria-label="Caster configuration JSON" spellcheck="false"></textarea><p class="write-control"><button onclick="saveConfig()">Apply config</button><button onclick="reloadConfig()">Reload config</button></p><table><thead><tr><th>Generation</th><th>Revision</th><th>Source health</th></tr></thead><tbody id="config-revisions"></tbody></table></section>
@@ -3472,7 +3511,7 @@ async function loadSources(){const params=new URLSearchParams();const fields=[['
 function sourceRow(source){const admission=source.admission||{};const tr=row([source.mountpoint,source.format,source.format_details,source.caster_id,admission.validation_result||'',(admission.msm_versions||[]).join(',')]);const td=document.createElement('td');const health=document.createElement('button');health.textContent='Health';health.onclick=()=>showSourceHealth(source.mountpoint);const history=document.createElement('button');history.textContent='History';history.onclick=()=>showSourceHistory(source.mountpoint);const live=document.createElement('button');live.textContent='Live';live.onclick=()=>monitorSource(source.mountpoint);td.append(health,history,live);if(!serviceReadOnly){const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSource(source.mountpoint);td.append(disconnect)}tr.append(td);return tr}
 async function showSourceHistory(mountpoint){try{const result=await api('/admin/v1/streams/'+encodeURIComponent(mountpoint)+'/history?limit=120');document.getElementById('source-health').textContent=JSON.stringify(result,null,2);drawHistory(result.points||[]);status.textContent='History loaded for '+mountpoint}catch(e){status.textContent=String(e)}}
 function drawHistory(points){const canvas=document.getElementById('history-chart');const ctx=canvas.getContext('2d');ctx.clearRect(0,0,canvas.width,canvas.height);ctx.fillStyle='#f8fafc';ctx.fillRect(0,0,canvas.width,canvas.height);if(!points.length){ctx.fillStyle='#475569';ctx.fillText('No history points',12,24);return}const values=points.map(point=>point.bitrate_bps||0);const max=Math.max(1,...values);ctx.strokeStyle='#2563eb';ctx.lineWidth=2;ctx.beginPath();values.forEach((value,index)=>{const x=12+(canvas.width-24)*index/Math.max(1,values.length-1);const y=canvas.height-12-(canvas.height-24)*value/max;if(index===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)});ctx.stroke();ctx.fillStyle='#475569';ctx.fillText('bitrate max '+max+' bps',12,16)}
-async function loadOperationalViews(){const near=await api('/admin/v1/near/clients');document.getElementById('near-clients').replaceChildren(...near.clients.map(client=>row([client.session_type,client.user_id,client.mountpoint,client.near_current_mountpoint,client.caster_id])));const maintenance=await api('/admin/v1/maintenance');document.getElementById('maintenance').textContent=JSON.stringify(maintenance,null,2);const configStatus=await api('/admin/v1/config/status');document.getElementById('config-status').textContent=JSON.stringify(configStatus,null,2);if(configStatus.available&&document.activeElement!==document.getElementById('config-json')){const raw=await api('/admin/v1/config');document.getElementById('config-json').value=JSON.stringify(raw.config,null,2)}try{const revisions=await api('/admin/v1/config/revisions?limit=20');document.getElementById('config-revisions').replaceChildren(...revisions.revisions.map(configRevisionRow))}catch{document.getElementById('config-revisions').replaceChildren(row(['-','-','Config history unavailable']))}const versions=await api('/admin/v1/versions');document.getElementById('versions-summary').textContent=JSON.stringify({caster_version:versions.caster_version,config_schema:versions.config_schema,local_caster_id:versions.local_caster_id,tls_certificate_expires_at:versions.tls_certificate_expires_at},null,2);document.getElementById('versions').replaceChildren(...versions.nodes.map(versionRow));const audit=await api('/admin/v1/audit?limit=50');document.getElementById('audit').replaceChildren(...audit.events.map(event=>row([event.timestamp,event.actor,event.action,event.target,event.result])))}
+async function loadOperationalViews(){const near=await api('/admin/v1/near/clients');document.getElementById('near-clients').replaceChildren(...near.clients.map(client=>row([client.session_type,client.user_id,client.mountpoint,client.near_current_mountpoint,client.caster_id])));const maintenance=await api('/admin/v1/maintenance');document.getElementById('maintenance').textContent=JSON.stringify(maintenance,null,2);const configStatus=await api('/admin/v1/config/status');document.getElementById('config-status').textContent=JSON.stringify(configStatus,null,2);if(configStatus.available&&document.activeElement!==document.getElementById('config-json')){const raw=await api('/admin/v1/config');document.getElementById('config-json').value=JSON.stringify(raw.config,null,2)}try{const revisions=await api('/admin/v1/config/revisions?limit=20');document.getElementById('config-revisions').replaceChildren(...revisions.revisions.map(configRevisionRow))}catch{document.getElementById('config-revisions').replaceChildren(row(['-','-','Config history unavailable']))}const versions=await api('/admin/v1/versions');document.getElementById('versions-summary').textContent=JSON.stringify({caster_version:versions.caster_version,config_schema:versions.config_schema,local_caster_id:versions.local_caster_id,tls_certificate_expires_at:versions.tls_certificate_expires_at},null,2);document.getElementById('versions').replaceChildren(...versions.nodes.map(versionRow));const sourceEvents=await api('/admin/v1/source-events?limit=50');document.getElementById('source-events').replaceChildren(...sourceEvents.events.map(event=>row([event.timestamp,event.mountpoint,event.event,event.reason??'',event.caster_id??''])));const audit=await api('/admin/v1/audit?limit=50');document.getElementById('audit').replaceChildren(...audit.events.map(event=>row([event.timestamp,event.actor,event.action,event.target,event.result])))}
 function configRevisionRow(revision){return row([revision.config.generation,revision.revision,JSON.stringify(revision.config.source_health)])}
 function versionRow(version){return row([version.caster_id,version.software_version,version.healthy,version.maintenance,version.started_at])}
 async function setMaintenance(enabled){try{await api('/admin/v1/maintenance',{method:'POST',body:JSON.stringify({maintenance:enabled})});status.textContent='Maintenance '+(enabled?'enabled':'disabled');await load()}catch(e){status.textContent=String(e)}}

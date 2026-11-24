@@ -1204,6 +1204,7 @@ impl AdmissionFeed {
                 self.last_admission = Some(admission);
                 if let Some(metrics) = &self.metrics {
                     metrics.source_accepted();
+                    metrics.record_source_event(source.mountpoint(), "accepted", None, None, None);
                 }
                 if self.window.profile().has_correction_data {
                     publish_correction(source, bytes)?;
@@ -1219,6 +1220,13 @@ impl AdmissionFeed {
                     .await;
                 if let Some(metrics) = &self.metrics {
                     metrics.source_rejected_with_reasons(&violations);
+                    metrics.record_source_event(
+                        source.mountpoint(),
+                        "rejected",
+                        Some(&format!("{violations:?}")),
+                        None,
+                        None,
+                    );
                 }
                 Ok(false)
             }
@@ -1249,6 +1257,13 @@ impl AdmissionFeed {
                     self.last_admission = Some(admission);
                     if let Some(metrics) = &self.metrics {
                         metrics.source_accepted();
+                        metrics.record_source_event(
+                            source.mountpoint(),
+                            "accepted",
+                            None,
+                            None,
+                            None,
+                        );
                     }
                     if self.window.profile().has_correction_data {
                         publish_correction(source, bytes)?;
@@ -1263,6 +1278,13 @@ impl AdmissionFeed {
                         .await;
                     if let Some(metrics) = &self.metrics {
                         metrics.source_rejected_with_reasons(&violations);
+                        metrics.record_source_event(
+                            source.mountpoint(),
+                            "rejected",
+                            Some(&format!("{violations:?}")),
+                            None,
+                            None,
+                        );
                     }
                     return Ok(());
                 }
@@ -1271,6 +1293,13 @@ impl AdmissionFeed {
                         .await;
                     if let Some(metrics) = &self.metrics {
                         metrics.source_rejected_with_reasons(&[AdmissionViolation::NoValidFrames]);
+                        metrics.record_source_event(
+                            source.mountpoint(),
+                            "rejected",
+                            Some("NoValidFrames"),
+                            None,
+                            None,
+                        );
                     }
                     return Ok(());
                 }

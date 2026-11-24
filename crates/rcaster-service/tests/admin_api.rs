@@ -110,6 +110,7 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("monitorSource"));
     assert!(page.contains("clearCooldown"));
     assert!(page.contains("Source cooldowns"));
+    assert!(page.contains("Source events"));
     assert!(page.contains("loadSources"));
     assert!(page.contains("showSourceHistory"));
     assert!(page.contains("drawHistory"));
@@ -472,6 +473,9 @@ async fn admin_writes_blacklist_with_revision_cas() {
     ));
     let audit_path = std::env::temp_dir().join(format!("{cluster}.audit.jsonl"));
     let audit = rcaster_service::audit::AuditLog::open(&audit_path).expect("audit log");
+    let health = Arc::new(HealthState::default());
+    health.set_source_event_log(audit.clone(), "caster-admin".to_owned());
+    health.record_source_event("C63", "accepted", None, Some(7), Some("connection-7"));
     let maintenance_path = std::env::temp_dir().join(format!("{cluster}.maintenance"));
     let _ = fs::remove_file(&maintenance_path);
     let server = tokio::spawn(serve_admin_mtls(
@@ -481,7 +485,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
             cluster_id: cluster.clone(),
             caster_id: "caster-admin".to_owned(),
             token: "secret".to_owned(),
-            ready: Arc::new(HealthState::default()),
+            ready: Arc::clone(&health),
             hub,
             runtime: Some(runtime.clone()),
             relays: None,
@@ -1157,6 +1161,20 @@ async fn admin_writes_blacklist_with_revision_cas() {
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
+            let events = request(address, &pki, "/admin/v1/source-events?limit=10", auth).await;
+            if events.contains("\"mountpoint\":\"C63\"")
+                && events.contains("\"event\":\"accepted\"")
+                && events.contains("\"connection_id\":\"connection-7\"")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("source event write");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
             let audit = request(address, &pki, "/admin/v1/audit?limit=100", auth).await;
             if audit.contains("\"action\":\"user.create\"")
                 && audit.contains("\"action\":\"api_token.create\"")
@@ -1226,6 +1244,111 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .contains("\"generation\":2")
     );
     Box::pin(async {
+        accounts
+            .upsert_user(
+                User {
+                    schema_version: 1,
+                    mod_revision: 1,
+                    user_id: "recover-user".to_owned(),
+                    username: "recover-user".to_owned(),
+                    password_hash: rcaster_service::account_auth::hash_password("recover-secret")
+                        .expect("recover password hash"),
+                    auth_version: 1,
+                    enabled: true,
+                    ntrip_enabled: false,
+                    web_enabled: false,
+                    role: UserRole::User,
+                    created_at: "2026-11-24T00:00:00Z".to_owned(),
+                    updated_at: "2026-11-24T00:00:00Z".to_owned(),
+                },
+                None,
+            )
+            .await
+            .expect("recover user");
+        let recover_revision = accounts
+            .snapshot()
+            .user_by_id("recover-user")
+            .expect("recover user snapshot")
+            .mod_revision;
+        let stale_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(30);
+        etcd.put(
+            format!("/rcaster/{cluster}/runtime/operations/op_recover"),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "operation_id": "op_recover",
+                "action": "users.disable",
+                "status": "RUNNING",
+                "owner_caster_id": "dead-caster",
+                "created_by": "admin-api",
+                "request_id": "request-recover",
+                "preview_digest": "stale",
+                "targets": [{
+                    "target": "recover-user",
+                    "username": "recover-user",
+                    "revision": recover_revision,
+                    "already_disabled": false
+                }],
+                "affected_mountpoints": [],
+                "affected_sources": [],
+                "affected_sessions": [],
+                "owner_targets": [],
+                "results": [],
+                "created_at": stale_time,
+                "updated_at": stale_time
+            }))
+            .expect("recover operation JSON"),
+            None,
+        )
+        .await
+        .expect("stale operation");
+        let recovery = rcaster_service::operations::OperationManager::new(
+            runtime.clone(),
+            accounts.clone(),
+            cluster.clone(),
+            "caster-admin".to_owned(),
+        );
+        assert_eq!(
+            recovery
+                .recover_stale_operations()
+                .await
+                .expect("recover stale operation"),
+            1
+        );
+        let recovered_operation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let operation = response_body(
+                    &request(
+                        address,
+                        &pki,
+                        "/admin/v1/operations/op_recover",
+                        auth,
+                    )
+                    .await,
+                );
+                if matches!(
+                    operation["status"].as_str(),
+                    Some("SUCCEEDED" | "PARTIAL" | "FAILED" | "CANCELED")
+                ) {
+                    break operation;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("recovered operation completion");
+        assert_eq!(
+            recovered_operation["status"], "SUCCEEDED",
+            "{recovered_operation}"
+        );
+        assert_eq!(recovered_operation["owner_caster_id"], "caster-admin");
+        let recovered_user = response_body(
+            &request(address, &pki, "/admin/v1/users/recover-user", auth).await,
+        );
+        assert_eq!(recovered_user["user"]["enabled"], false);
     accounts
         .upsert_user(
             User {

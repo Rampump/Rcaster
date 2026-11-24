@@ -308,6 +308,25 @@ impl AccountDirectory {
             .ok_or(AccountDirectoryError::InvalidRecord)
     }
 
+    pub(crate) async fn etcd_keep_alive_once(
+        &self,
+        lease_id: i64,
+    ) -> Result<(), AccountDirectoryError> {
+        let (client, _) = self.writable()?;
+        let (mut keeper, _stream) = client.lock().await.lease_keep_alive(lease_id).await?;
+        keeper.keep_alive().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn etcd_revoke_lease(
+        &self,
+        lease_id: i64,
+    ) -> Result<(), AccountDirectoryError> {
+        let (client, _) = self.writable()?;
+        client.lock().await.lease_revoke(lease_id).await?;
+        Ok(())
+    }
+
     pub(crate) async fn etcd_put_if_revision(
         &self,
         key: &str,

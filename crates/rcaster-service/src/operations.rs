@@ -13,6 +13,7 @@ use crate::{
 };
 
 const MAX_TARGETS: usize = 500;
+const OPERATION_LEASE_TTL_S: i64 = 30;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct TargetRevision {
@@ -66,6 +67,8 @@ struct BatchOperation {
     operation_id: String,
     action: String,
     status: String,
+    #[serde(default)]
+    owner_caster_id: String,
     created_by: String,
     request_id: String,
     preview_digest: String,
@@ -93,6 +96,7 @@ pub struct OperationManager {
     runtime: SharedClusterRuntime,
     accounts: AccountDirectory,
     cluster_id: String,
+    caster_id: String,
 }
 
 impl OperationManager {
@@ -100,11 +104,13 @@ impl OperationManager {
         runtime: SharedClusterRuntime,
         accounts: AccountDirectory,
         cluster_id: String,
+        caster_id: String,
     ) -> Self {
         Self {
             runtime,
             accounts,
             cluster_id,
+            caster_id,
         }
     }
 
@@ -192,6 +198,7 @@ impl OperationManager {
             operation_id: operation_id.clone(),
             action: action.to_owned(),
             status: "QUEUED".to_owned(),
+            owner_caster_id: self.caster_id.clone(),
             created_by: actor,
             request_id,
             preview_digest: current_digest,
@@ -204,9 +211,11 @@ impl OperationManager {
             created_at: now,
             updated_at: now,
         };
+        let lease_id = self.acquire_operation_lease(&operation).await?;
         self.put(&operation).await?;
-        let worker_operation = operation.clone();
-        self.spawn_run(worker_operation);
+        self.put_lease_key(&operation.operation_id, &self.caster_id, lease_id)
+            .await?;
+        self.spawn_run(operation.clone(), lease_id);
         Ok(serde_json::to_value(operation).unwrap_or(Value::Null))
     }
 
@@ -219,11 +228,69 @@ impl OperationManager {
             ));
         }
         operation.status = "QUEUED".to_owned();
+        operation.owner_caster_id = self.caster_id.clone();
         operation.results.clear();
         operation.updated_at = unix_time();
+        let lease_id = self.acquire_operation_lease(&operation).await?;
         self.put(&operation).await?;
-        self.spawn_run(operation.clone());
+        self.put_lease_key(&operation.operation_id, &self.caster_id, lease_id)
+            .await?;
+        self.spawn_run(operation.clone(), lease_id);
         Ok(serde_json::to_value(operation).unwrap_or(Value::Null))
+    }
+
+    pub async fn recover_stale_operations(&self) -> Result<usize, (u16, String)> {
+        let prefix = format!("/rcaster/{}/runtime/operations/", self.cluster_id);
+        let records = self
+            .accounts
+            .etcd_list(&prefix)
+            .await
+            .map_err(|error| (503, error.to_string()))?;
+        let now = unix_time();
+        let mut recovered = 0;
+        for (_, value, revision) in records {
+            let Ok(mut operation) = serde_json::from_slice::<BatchOperation>(&value) else {
+                continue;
+            };
+            if !matches!(operation.status.as_str(), "QUEUED" | "RUNNING")
+                || now.saturating_sub(operation.updated_at) < 5
+                || self
+                    .accounts
+                    .etcd_get(&self.lease_key(&operation.operation_id))
+                    .await
+                    .map_err(|error| (503, error.to_string()))?
+                    .is_some()
+            {
+                continue;
+            }
+            let lease_id = self.acquire_operation_lease(&operation).await?;
+            operation.owner_caster_id = self.caster_id.clone();
+            operation.status = "QUEUED".to_owned();
+            operation.updated_at = now;
+            let replaced = self
+                .accounts
+                .etcd_put_if_revision(
+                    &self.operation_key(&operation.operation_id),
+                    serde_json::to_vec(&operation).map_err(|error| (500, error.to_string()))?,
+                    revision,
+                )
+                .await
+                .map_err(|error| (503, error.to_string()))?;
+            if !replaced {
+                let _ = self.accounts.etcd_revoke_lease(lease_id).await;
+                continue;
+            }
+            if let Err(error) = self
+                .put_lease_key(&operation.operation_id, &self.caster_id, lease_id)
+                .await
+            {
+                let _ = self.accounts.etcd_revoke_lease(lease_id).await;
+                return Err(error);
+            }
+            self.spawn_run(operation, lease_id);
+            recovered += 1;
+        }
+        Ok(recovered)
     }
 
     async fn preview_disable_users(&self, body: &Value) -> Result<Preview, (u16, String)> {
@@ -481,6 +548,11 @@ impl OperationManager {
     }
 
     async fn run(&self, mut operation: BatchOperation) {
+        let current = match self.load(&operation.operation_id).await {
+            Ok(current) if current.owner_caster_id == self.caster_id => current,
+            _ => return,
+        };
+        operation = current;
         operation.status = "RUNNING".to_owned();
         operation.updated_at = unix_time();
         if self.put(&operation).await.is_err() {
@@ -490,7 +562,12 @@ impl OperationManager {
             "users.disable" | "users.delete" => {
                 for target in operation.targets.clone() {
                     let current = match self.load(&operation.operation_id).await {
-                        Ok(current) if current.status == "CANCELED" => return,
+                        Ok(current)
+                            if current.status == "CANCELED"
+                                || current.owner_caster_id != self.caster_id =>
+                        {
+                            return;
+                        }
                         Ok(current) => current,
                         Err(_) => return,
                     };
@@ -510,7 +587,12 @@ impl OperationManager {
             "mountpoints.disable" => {
                 for target in operation.affected_mountpoints.clone() {
                     let current = match self.load(&operation.operation_id).await {
-                        Ok(current) if current.status == "CANCELED" => return,
+                        Ok(current)
+                            if current.status == "CANCELED"
+                                || current.owner_caster_id != self.caster_id =>
+                        {
+                            return;
+                        }
                         Ok(current) => current,
                         Err(_) => return,
                     };
@@ -526,7 +608,12 @@ impl OperationManager {
             "mountpoints.change_owner" => {
                 for target in operation.owner_targets.clone() {
                     let current = match self.load(&operation.operation_id).await {
-                        Ok(current) if current.status == "CANCELED" => return,
+                        Ok(current)
+                            if current.status == "CANCELED"
+                                || current.owner_caster_id != self.caster_id =>
+                        {
+                            return;
+                        }
                         Ok(current) => current,
                         Err(_) => return,
                     };
@@ -542,7 +629,12 @@ impl OperationManager {
             "sessions.drop" => {
                 for target in operation.affected_sessions.clone() {
                     let current = match self.load(&operation.operation_id).await {
-                        Ok(current) if current.status == "CANCELED" => return,
+                        Ok(current)
+                            if current.status == "CANCELED"
+                                || current.owner_caster_id != self.caster_id =>
+                        {
+                            return;
+                        }
                         Ok(current) => current,
                         Err(_) => return,
                     };
@@ -582,12 +674,47 @@ impl OperationManager {
         let _ = self.put(&operation).await;
     }
 
-    fn spawn_run(&self, operation: BatchOperation) {
+    fn spawn_run(&self, operation: BatchOperation, lease_id: i64) {
         let manager = Self {
             runtime: self.runtime.clone(),
             accounts: self.accounts.clone(),
             cluster_id: self.cluster_id.clone(),
+            caster_id: self.caster_id.clone(),
         };
+        let keepalive_manager = Self {
+            runtime: self.runtime.clone(),
+            accounts: self.accounts.clone(),
+            cluster_id: self.cluster_id.clone(),
+            caster_id: self.caster_id.clone(),
+        };
+        let operation_id = operation.operation_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    (OPERATION_LEASE_TTL_S / 3) as u64,
+                ))
+                .await;
+                let Ok(operation) = keepalive_manager.load(&operation_id).await else {
+                    return;
+                };
+                if operation.owner_caster_id != keepalive_manager.caster_id
+                    || matches!(
+                        operation.status.as_str(),
+                        "SUCCEEDED" | "PARTIAL" | "FAILED" | "CANCELED"
+                    )
+                {
+                    return;
+                }
+                if keepalive_manager
+                    .accounts
+                    .etcd_keep_alive_once(lease_id)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
         tokio::spawn(async move {
             manager.run(operation).await;
         });
@@ -800,6 +927,46 @@ impl OperationManager {
             "/rcaster/{}/runtime/operations/{operation_id}",
             self.cluster_id
         )
+    }
+
+    fn lease_key(&self, operation_id: &str) -> String {
+        format!(
+            "/rcaster/{}/runtime/operation-leases/{operation_id}",
+            self.cluster_id
+        )
+    }
+
+    async fn acquire_operation_lease(
+        &self,
+        operation: &BatchOperation,
+    ) -> Result<i64, (u16, String)> {
+        if operation.owner_caster_id.is_empty() {
+            return Err((500, "operation owner is missing".to_owned()));
+        }
+        self.accounts
+            .etcd_lease(OPERATION_LEASE_TTL_S)
+            .await
+            .map_err(|error| (503, error.to_string()))
+    }
+
+    async fn put_lease_key(
+        &self,
+        operation_id: &str,
+        owner_caster_id: &str,
+        lease_id: i64,
+    ) -> Result<(), (u16, String)> {
+        let value = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "owner_caster_id": owner_caster_id,
+            "created_at": unix_time(),
+        }))
+        .map_err(|error| (500, error.to_string()))?;
+        self.accounts
+            .etcd_put(&self.lease_key(operation_id), value, Some(lease_id))
+            .await
+            .map(|_| ())
+            .map_err(|error| (503, error.to_string()))
     }
 
     async fn put(&self, operation: &BatchOperation) -> Result<(), (u16, String)> {

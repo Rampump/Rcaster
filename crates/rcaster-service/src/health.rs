@@ -2,7 +2,7 @@ use std::{
     future::Future,
     io,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime},
@@ -17,7 +17,10 @@ use tokio::{
 
 use rcaster_core::protocol::AdmissionViolation;
 
-use crate::hub::HubMetrics;
+use crate::{
+    audit::{AuditEvent, AuditLog},
+    hub::HubMetrics,
+};
 
 #[derive(Default)]
 pub struct HealthState {
@@ -85,6 +88,8 @@ pub struct HealthState {
     blacklist_healthy: AtomicBool,
     source_watch_healthy: AtomicBool,
     account_watch_healthy: AtomicBool,
+    source_event_log: Mutex<Option<AuditLog>>,
+    source_event_caster_id: Mutex<String>,
 }
 
 impl HealthState {
@@ -202,6 +207,69 @@ impl HealthState {
             .store(health[3], Ordering::Release);
         self.account_watch_healthy
             .store(health[4], Ordering::Release);
+    }
+
+    pub fn set_source_event_log(&self, log: AuditLog, caster_id: String) {
+        *self
+            .source_event_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(log);
+        *self
+            .source_event_caster_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = caster_id;
+    }
+
+    pub fn record_source_event(
+        &self,
+        mountpoint: &str,
+        event: &str,
+        reason: Option<&str>,
+        source_generation: Option<u64>,
+        connection_id: Option<&str>,
+    ) {
+        let log = self
+            .source_event_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(log) = log else {
+            return;
+        };
+        let caster_id = self
+            .source_event_caster_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let request_id = format!(
+            "evt_{}",
+            rand::random::<[u8; 16]>()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        log.record(AuditEvent {
+            timestamp: SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            request_id,
+            actor: "source-watcher".to_owned(),
+            source_ip: None,
+            action: format!("source.{event}"),
+            target: mountpoint.to_owned(),
+            result: if event == "rejected" {
+                "failure".to_owned()
+            } else {
+                "success".to_owned()
+            },
+            details: serde_json::json!({
+                "caster_id": caster_id,
+                "source_generation": source_generation,
+                "connection_id": connection_id,
+                "reason": reason,
+            }),
+        });
     }
 
     pub fn source_accepted(&self) {
