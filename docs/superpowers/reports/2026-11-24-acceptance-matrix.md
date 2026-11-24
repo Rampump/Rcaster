@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-25 00:13 CST
+Status date: 2026-11-25 01:27 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`7cd7ced` (committed locally, not pushed or deployed)
+`858da08` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -29,7 +29,7 @@ not be described as final production acceptance.
 
 | Design section | Current status | Authoritative evidence | Remaining proof |
 |---|---|---|---|
-| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The latest CRTK.NET run models 1,298 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. | More receiver models; real CMR/CMR+ capture; public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
+| 18.1 Functional behavior | Partial | Workspace and service integration tests cover NTRIP1/2 authentication, source admission, private source-table filtering, source fencing, local and cross-node relay, NEAR switching, previewed user/mountpoint/session batch operations, admin sessions/CSRF/API scopes, WebSocket lifecycle and optional RTKLIB isolation. The live compatibility matrix records the real CH340 base, RTKLIB, u-center, BNC and Lefebure. The latest CRTK.NET run models 1,294 public RTCM3 STR candidates and matches 26 sampled NEAR queries against a full scan. The committed offline snapshot adds a full standalone L2 test: 1,301 local sources, 11 real socket cases and 50/50 full-table sample matches. | More receiver models; real CMR/CMR+ capture; public-monitor and management UI paths still rely on API/HTML assertions rather than full browser E2E. |
 | 18.2 Consistency and ownership | Verified | `source_fencing`, `user_admission`, `revision_admission`, `config_revision`, `cluster_runtime`, `blacklist_write`, `account_directory`, `connections` and `upgrade` integration tests cover races, stale revisions, generation/connection fencing, owner commands and cleanup. Live cluster ownership was checked at 3/2/3/2 across four nodes. | Re-run the same assertions after the 72-hour run exits to prove no orphan state remains. |
 | 18.3 Capacity | Verified | Target-node probes completed 10 sources/8,000 subscribers, 1 source/10,000 subscribers and 10,000 mountpoints. Coordinator spikes achieved about 1,000 admissions/s. A local four-Caster cluster with 500 sources and 100 cross-node relay subscribers ran 30 seconds: 16,872,000 source bytes and 3,373,032 subscriber bytes. | The frozen soak remains the long-duration stability run, not a capacity proof gap. |
 | 18.4 Stability | Pending | Pre-runs showed zero restarts and bounded RSS/FD. The current frozen candidate is running four local and one cross-region soak units. | Successful completion of all five 259,200-second runs, final RSS/FD curves, zero restart, empty stderr and clean post-run state. |
@@ -59,9 +59,11 @@ The 2026-11-25 audit added:
 - Source Health warning/age/change metrics, backlog kicks, public monitor
   viewer/busy/start-limit metrics, and relay STARTING/failure/idle-close metrics.
 
-Remaining implementation gaps are operation lease binding/background adoption
-after an admin Caster exits, the reserved local Source event interface, and a
-separate relay slow-consumer counter. These are tracked in
+Operation lease binding/background adoption and lifecycle Source events are now
+implemented locally. Remaining gaps are health-alert transition events, cursor
+pagination, a separate relay slow-consumer counter, parser
+queue/framing/resynchronization counters, and etcd watch-lag/admission-latency/
+lease-remaining gauges. These are tracked in
 `docs/superpowers/plans/2026-11-24-operational-completeness.md`.
 
 Final current-tree verification on 2026-11-25:
@@ -74,7 +76,14 @@ Final current-tree verification on 2026-11-25:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `338033D913FA43874CE1B6832EBD132D6465DF83A5A109A05C537583E822EAFE`.
+  `F8294D435DB7059E0637360EC59CCB8D181C331A7C7948EF51E25729A543C8BC`.
+- The full ignored integration suite was rerun after the source lifecycle
+  changes. One initial leader-failover attempt hit a temporary etcd startup
+  race; the failing test then passed alone and the complete ignored suite
+  passed on the next run.
+- NEAR validation report:
+  `tools/near-e2e/REPORT.md`. L1, all 11 L2a cases, cleanup checks and the
+  1,301-source / 50-query L2b sample pass.
 
 ## Local Design-Parity Remediation
 
