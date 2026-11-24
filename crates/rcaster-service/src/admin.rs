@@ -46,6 +46,7 @@ use crate::{
     health::HealthState,
     hub::MountpointHub,
     maintenance,
+    operations::OperationManager,
     proxy_protocol::{ProxyProtocolConfig, resolve_client_ip},
     relay::RelayManager,
     relay_grpc::RelayGrpcClient,
@@ -455,12 +456,14 @@ async fn handle(
             &["admin:read"][..]
         } else if path.starts_with("/admin/v1/upgrades") {
             &["upgrade:write"][..]
+        } else if path.starts_with("/admin/v1/operations") {
+            &["admin:write", "operations:write"][..]
         } else {
             &["admin:write"][..]
         };
         if !required
             .iter()
-            .any(|required| identity.scopes.iter().any(|scope| scope == required))
+            .all(|required| identity.scopes.iter().any(|scope| scope == required))
         {
             return Ok(response(
                 403,
@@ -662,7 +665,13 @@ async fn handle(
                             .map(str::to_owned)
                             .collect::<Vec<_>>()
                     })
-                    .unwrap_or_else(|| vec!["admin:read".to_owned(), "admin:write".to_owned()]);
+                    .unwrap_or_else(|| {
+                        vec![
+                            "admin:read".to_owned(),
+                            "admin:write".to_owned(),
+                            "operations:write".to_owned(),
+                        ]
+                    });
                 let expires_in_s = body
                     .get("expires_in_s")
                     .and_then(Value::as_u64)
@@ -894,7 +903,7 @@ async fn handle(
                     json!({"code":"BAD_REQUEST","message":"invalid JSON body"}),
                 ));
             };
-            return Ok(match operation_preview(runtime, &body).await {
+            return Ok(match operation_preview(state, runtime, &body).await {
                 Ok(value) => response(200, value),
                 Err((status, message)) => response(
                     status,
@@ -909,7 +918,47 @@ async fn handle(
                     json!({"code":"BAD_REQUEST","message":"invalid JSON body"}),
                 ));
             };
-            let preview = match operation_preview(runtime, &body).await {
+            let action = body
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if action != "config.rollback" {
+                let manager = OperationManager::new(
+                    runtime.clone(),
+                    state.accounts.clone(),
+                    state.cluster_id.clone(),
+                );
+                return Ok(
+                    match manager
+                        .start(
+                            &body,
+                            upgrade_actor(&access).to_owned(),
+                            REQUEST_ID
+                                .try_with(Clone::clone)
+                                .unwrap_or_else(|_| random_request_id()),
+                        )
+                        .await
+                    {
+                        Ok(operation) => {
+                            audit(
+                                state,
+                                source_ip,
+                                access_actor(&access),
+                                "operation.create",
+                                operation["operation_id"].as_str().unwrap_or("operation"),
+                                "accepted",
+                                json!({"action": action}),
+                            );
+                            response(202, operation)
+                        }
+                        Err((status, message)) => response(
+                            status,
+                            json!({"code":"INVALID_OPERATION","message":message}),
+                        ),
+                    },
+                );
+            }
+            let preview = match operation_preview(state, runtime, &body).await {
                 Ok(value) => value,
                 Err((status, message)) => {
                     return Ok(response(
@@ -958,6 +1007,10 @@ async fn handle(
                 "operation_id": operation_id,
                 "type": "config.rollback",
                 "status": status,
+                "created_by": upgrade_actor(&access),
+                "request_id": REQUEST_ID
+                    .try_with(Clone::clone)
+                    .unwrap_or_else(|_| random_request_id()),
                 "target_generation": target_generation,
                 "config_generation": result.as_ref().ok().map(|snapshot| snapshot.config.generation),
                 "config_revision": result.as_ref().ok().map(|snapshot| snapshot.revision),
@@ -1014,9 +1067,15 @@ async fn handle(
                     json!({"code":"UNAVAILABLE","message":"operation record is corrupt"}),
                 ));
             };
+            if !operation_cancel_allowed(&access, &operation) {
+                return Ok(response(
+                    403,
+                    json!({"code":"FORBIDDEN","message":"operation cancellation is not permitted"}),
+                ));
+            }
             if matches!(
                 operation["status"].as_str(),
-                Some("SUCCEEDED" | "FAILED" | "CANCELED")
+                Some("SUCCEEDED" | "PARTIAL" | "FAILED" | "CANCELED")
             ) {
                 return Ok(response(
                     409,
@@ -3010,6 +3069,14 @@ fn upgrade_actor(access: &Access) -> &str {
     }
 }
 
+fn operation_cancel_allowed(access: &Access, operation: &Value) -> bool {
+    let Access::Admin(identity) = access else {
+        return false;
+    };
+    operation["created_by"].as_str() == Some(identity.user_id.as_str())
+        || identity.scopes.iter().any(|scope| scope == "cluster:admin")
+}
+
 struct SourceEntry {
     record: rcaster_core::str_record::StrRecord,
     caster_id: String,
@@ -3223,17 +3290,23 @@ async fn stream_summary(state: &AdminState, mountpoint: &str) -> Option<Value> {
 }
 
 async fn operation_preview(
+    state: &AdminState,
     runtime: &SharedClusterRuntime,
     body: &Value,
-) -> Result<Value, (u16, &'static str)> {
+) -> Result<Value, (u16, String)> {
     if body.get("action").and_then(Value::as_str) != Some("config.rollback") {
-        return Err((400, "only config.rollback is supported"));
+        let manager = OperationManager::new(
+            runtime.clone(),
+            state.accounts.clone(),
+            state.cluster_id.clone(),
+        );
+        return manager.preview(body).await;
     }
     let Some(target_generation) = body.get("generation").and_then(Value::as_u64) else {
-        return Err((400, "generation is required"));
+        return Err((400, "generation is required".to_owned()));
     };
     let Some(current) = runtime.config_snapshot().await else {
-        return Err((503, "config unavailable"));
+        return Err((503, "config unavailable".to_owned()));
     };
     let Some(target) = runtime
         .config_revisions(500)
@@ -3245,7 +3318,7 @@ async fn operation_preview(
                 .find(|revision| revision.config.generation == target_generation)
         })
     else {
-        return Err((404, "target config revision not found"));
+        return Err((404, "target config revision not found".to_owned()));
     };
     Ok(json!({
         "action": "config.rollback",
@@ -3345,6 +3418,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 <section><h3>Configuration</h3><pre id="config-status">-</pre><textarea id="config-json" aria-label="Caster configuration JSON" spellcheck="false"></textarea><p class="write-control"><button onclick="saveConfig()">Apply config</button><button onclick="reloadConfig()">Reload config</button></p><table><thead><tr><th>Generation</th><th>Revision</th><th>Source health</th></tr></thead><tbody id="config-revisions"></tbody></table></section>
 <section><h3>Versions</h3><pre id="versions-summary">-</pre><table><thead><tr><th>Caster</th><th>Version</th><th>Healthy</th><th>Maintenance</th><th>Started</th></tr></thead><tbody id="versions"></tbody></table></section>
 <section><h3>Operation lookup</h3><p><input id="operation-id" aria-label="Operation ID" placeholder="operation id"><button onclick="loadOperation()">Load operation</button></p><pre id="operation">-</pre></section>
+<section class="write-control"><h3>Batch disable users</h3><textarea id="batch-user-ids" aria-label="User IDs" placeholder="one user ID per line"></textarea><p><button onclick="previewBatchDisable()">Preview</button><button id="batch-disable-start" onclick="startBatchDisable()" hidden>Start operation</button></p><pre id="batch-operation">-</pre></section>
 <section><h3>Upgrade lookup</h3><p><input id="upgrade-id" aria-label="Upgrade ID" placeholder="upgrade id"><button onclick="loadUpgrade()">Load upgrade</button></p><pre id="upgrade">-</pre></section>
 <section><h3>Audit</h3><table><thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th></tr></thead><tbody id="audit"></tbody></table></section>
 </main><script>
@@ -3354,6 +3428,7 @@ let userRevision=null,mountRevision=null;
 let csrfToken='';
 let monitorSocket=null;
 let serviceReadOnly=false;
+let batchDisableDigest='';
 async function api(path,options={}){const method=options.method||'GET';if(serviceReadOnly&&method!=='GET')throw new Error('Read-only service session');const headers={'Content-Type':'application/json',...(options.headers||{})};if(method!=='GET')headers['X-CSRF-Token']=csrfToken;const r=await fetch(path,{...options,headers:headers});if(!r.ok)throw new Error(await r.text());return r.status===204?null:r.json();}
 function row(cells){const tr=document.createElement('tr');for(const value of cells){const td=document.createElement('td');td.textContent=value??'';tr.append(td)}return tr}
 async function login(){try{const result=await api('/admin/v1/auth/login',{method:'POST',body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});csrfToken=result.csrf_token;document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=result.username;await load();}catch(e){status.textContent=String(e)}}
@@ -3370,6 +3445,9 @@ async function setMaintenance(enabled){try{await api('/admin/v1/maintenance',{me
 async function reloadConfig(){try{await api('/admin/v1/config/reload',{method:'POST'});status.textContent='Config reload accepted';await load()}catch(e){status.textContent=String(e)}}
 async function saveConfig(){try{const config=JSON.parse(document.getElementById('config-json').value);await api('/admin/v1/config/apply',{method:'POST',body:JSON.stringify(config)});status.textContent='Config applied';await load()}catch(e){status.textContent=String(e)}}
 async function loadOperation(){const id=document.getElementById('operation-id').value.trim();if(!id)return;try{document.getElementById('operation').textContent=JSON.stringify(await api('/admin/v1/operations/'+encodeURIComponent(id)),null,2)}catch(e){document.getElementById('operation').textContent=String(e)}}
+function batchUserTargets(){return [...new Set(document.getElementById('batch-user-ids').value.split(/[\s,]+/).map(value=>value.trim()).filter(Boolean))]}
+async function previewBatchDisable(){try{const targets=batchUserTargets();if(!targets.length)throw new Error('Enter at least one user ID');const result=await api('/admin/v1/operations/preview',{method:'POST',body:JSON.stringify({action:'users.disable',targets})});batchDisableDigest=result.preview_digest;document.getElementById('batch-operation').textContent=JSON.stringify(result,null,2);document.getElementById('batch-disable-start').hidden=false;status.textContent='Batch disable preview ready';}catch(e){batchDisableDigest='';document.getElementById('batch-disable-start').hidden=true;document.getElementById('batch-operation').textContent=String(e)}}
+async function startBatchDisable(){try{if(!batchDisableDigest)throw new Error('Preview the operation first');const result=await api('/admin/v1/operations',{method:'POST',body:JSON.stringify({action:'users.disable',targets:batchUserTargets(),preview_digest:batchDisableDigest})});document.getElementById('operation-id').value=result.operation_id;document.getElementById('batch-operation').textContent=JSON.stringify(result,null,2);document.getElementById('batch-disable-start').hidden=true;status.textContent='Batch operation queued';}catch(e){document.getElementById('batch-operation').textContent=String(e)}}
 async function loadUpgrade(){const id=document.getElementById('upgrade-id').value.trim();if(!id)return;try{document.getElementById('upgrade').textContent=JSON.stringify(await api('/admin/v1/upgrades/'+encodeURIComponent(id)),null,2)}catch(e){document.getElementById('upgrade').textContent=String(e)}}
 function sessionRow(session){const tr=row([session.session_type,session.user_id,session.mountpoint,session.caster_id]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSession(session.session_id);td.append(disconnect)}tr.append(td);return tr}
 function cooldownRow(cooldown){const tr=row([cooldown.mountpoint,cooldown.source_ip,cooldown.reason,cooldown.expires_at]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const clear=document.createElement('button');clear.textContent='Clear';clear.onclick=()=>clearCooldown(cooldown.fingerprint);td.append(clear)}tr.append(td);return tr}
@@ -3391,7 +3469,7 @@ function editBlacklist(rule){blacklistRevision=rule.mod_revision;document.getEle
 async function addBlacklist(){try{const body={id:document.getElementById('bl-id').value,cidr:document.getElementById('bl-cidr').value,quota:Number(document.getElementById('bl-quota').value),enabled:true,description:document.getElementById('bl-description').value};const headers=blacklistRevision===null?{}:{'If-Match':'"'+blacklistRevision+'"'};await api('/admin/v1/blacklist',{method:blacklistRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});status.textContent='Blacklist rule saved';blacklistRevision=null;await load();}catch(e){status.textContent=String(e)}}
 async function deleteBlacklist(rule){if(!confirm('Delete blacklist rule '+rule.id+'?'))return;try{await api('/admin/v1/blacklist/'+encodeURIComponent(rule.id),{method:'DELETE',headers:{'If-Match':'"'+rule.mod_revision+'"'}});status.textContent='Blacklist rule deleted';await load();}catch(e){status.textContent=String(e)}}
 function apiTokenRow(token){const tr=row([token.token_id,token.name,token.username,token.scopes.join(', '),token.expires_at??'never']);const td=document.createElement('td');const del=document.createElement('button');del.textContent='Revoke';del.onclick=()=>deleteApiToken(token);td.append(del);tr.append(td);return tr}
-async function createApiToken(){try{const scope=document.getElementById('api-token-scope').value;const expiry=Number(document.getElementById('api-token-expiry').value);const body={name:document.getElementById('api-token-name').value,scopes:scope==='read'?['admin:read']:['admin:read','admin:write']};if(expiry>0)body.expires_in_s=expiry;const result=await api('/admin/v1/api-tokens',{method:'POST',body:JSON.stringify(body)});document.getElementById('api-token-secret').textContent=result.token;status.textContent='API token created; copy it now';await load();}catch(e){status.textContent=String(e)}}
+async function createApiToken(){try{const scope=document.getElementById('api-token-scope').value;const expiry=Number(document.getElementById('api-token-expiry').value);const body={name:document.getElementById('api-token-name').value,scopes:scope==='read'?['admin:read']:['admin:read','admin:write','operations:write']};if(expiry>0)body.expires_in_s=expiry;const result=await api('/admin/v1/api-tokens',{method:'POST',body:JSON.stringify(body)});document.getElementById('api-token-secret').textContent=result.token;status.textContent='API token created; copy it now';await load();}catch(e){status.textContent=String(e)}}
 async function deleteApiToken(token){if(!confirm('Revoke API token '+token.name+'?'))return;try{await api('/admin/v1/api-tokens/'+encodeURIComponent(token.token_id),{method:'DELETE'});await load();}catch(e){status.textContent=String(e)}}
 load();
 setInterval(function(){if(!document.getElementById('account').hidden)load()},10000);

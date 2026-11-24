@@ -326,7 +326,11 @@ pub async fn create_api_token(
         || scopes.iter().any(|scope| {
             !matches!(
                 scope.as_str(),
-                "admin:read" | "admin:write" | "upgrade:write"
+                "admin:read"
+                    | "admin:write"
+                    | "operations:write"
+                    | "upgrade:write"
+                    | "cluster:admin"
             )
         })
         || scopes
@@ -454,7 +458,9 @@ fn default_admin_scopes() -> Vec<String> {
     vec![
         "admin:read".to_owned(),
         "admin:write".to_owned(),
+        "operations:write".to_owned(),
         "upgrade:write".to_owned(),
+        "cluster:admin".to_owned(),
     ]
 }
 

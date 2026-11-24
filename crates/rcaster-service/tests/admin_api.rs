@@ -4,7 +4,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use etcd_client::{Client, ConnectOptions, GetOptions};
 use futures_util::StreamExt;
 use rcaster_core::{
-    account::{AccountSnapshot, User, UserRole},
+    account::{AccountSnapshot, Mountpoint, User, UserRole},
     protocol::DataProfile,
     str_record::StrRecord,
 };
@@ -119,6 +119,8 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("NEAR clients"));
     assert!(page.contains("Config history unavailable"));
     assert!(page.contains("loadOperation"));
+    assert!(page.contains("previewBatchDisable"));
+    assert!(page.contains("startBatchDisable"));
     assert!(page.contains("loadUpgrade"));
     assert!(page.contains("Audit"));
     assert!(page.contains("admin/v1/auth/login"));
@@ -527,7 +529,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         "/admin/v1/api-tokens",
         "",
         &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
-        r#"{"name":"admin-api-test","scopes":["admin:read","admin:write","upgrade:write"]}"#,
+        r#"{"name":"admin-api-test","scopes":["admin:read","admin:write","operations:write","upgrade:write"]}"#,
     )
     .await;
     assert!(token_response.starts_with("HTTP/1.1 201 Created"));
@@ -1085,6 +1087,19 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .await
         .starts_with("HTTP/1.1 403 Forbidden")
     );
+    assert!(
+        request_raw(
+            address,
+            &pki,
+            "POST",
+            "/admin/v1/operations/preview",
+            &format!("Bearer {write_only_token}"),
+            "",
+            r#"{"action":"users.disable","targets":["batch-user"]}"#,
+        )
+        .await
+        .starts_with("HTTP/1.1 403 Forbidden")
+    );
     let upgrade_only = request_raw(
         address,
         &pki,
@@ -1210,6 +1225,144 @@ async fn admin_writes_blacklist_with_revision_cas() {
         .await
         .contains("\"generation\":2")
     );
+    accounts
+        .upsert_user(
+            User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "batch-user".to_owned(),
+                username: "batch-user".to_owned(),
+                password_hash: rcaster_service::account_auth::hash_password("batch-secret")
+                    .expect("batch password hash"),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: true,
+                web_enabled: true,
+                role: UserRole::User,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("batch user");
+    accounts
+        .upsert_mountpoint(
+            Mountpoint {
+                schema_version: 1,
+                mod_revision: 1,
+                mountpoint: "BATCH".to_owned(),
+                owner_user_id: "batch-user".to_owned(),
+                enabled: true,
+                ntrip1_upload_password_hash: None,
+                advertise: true,
+                region: Some("test".to_owned()),
+                latitude: None,
+                longitude: None,
+                coverage_radius_m: None,
+                str_fields: None,
+                source_expectation: None,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("batch mountpoint");
+    let batch_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        r#"{"action":"users.disable","targets":["batch-user"]}"#,
+    )
+    .await;
+    assert!(batch_preview.starts_with("HTTP/1.1 200 OK"));
+    let batch_preview_body = response_body(&batch_preview);
+    assert_eq!(batch_preview_body["targets"], 1);
+    assert_eq!(batch_preview_body["affected_mountpoints"], 1);
+    let preview_digest = batch_preview_body["preview_digest"]
+        .as_str()
+        .expect("batch preview digest");
+    let mut changed_user = accounts
+        .snapshot()
+        .user_by_id("batch-user")
+        .cloned()
+        .expect("batch user lookup");
+    let changed_revision = changed_user.mod_revision;
+    changed_user.web_enabled = false;
+    accounts
+        .upsert_user(changed_user, Some(changed_revision))
+        .await
+        .expect("change batch user");
+    let stale_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"users.disable","targets":["batch-user"],"preview_digest":"{preview_digest}"}}"#
+        ),
+    )
+    .await;
+    assert!(stale_start.starts_with("HTTP/1.1 409"));
+    let refreshed_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        r#"{"action":"users.disable","targets":["batch-user"]}"#,
+    )
+    .await;
+    let refreshed_preview_body = response_body(&refreshed_preview);
+    let preview_digest = refreshed_preview_body["preview_digest"]
+        .as_str()
+        .expect("refreshed preview digest");
+    let batch_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"users.disable","targets":["batch-user"],"preview_digest":"{preview_digest}"}}"#
+        ),
+    )
+    .await;
+    assert!(batch_start.starts_with("HTTP/1.1 202 Accepted"));
+    let batch_operation_id = response_body(&batch_start)["operation_id"]
+        .as_str()
+        .expect("batch operation ID")
+        .to_owned();
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{batch_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "SUCCEEDED" {
+                break operation;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("batch operation completion");
+    assert_eq!(completed["results"][0]["status"], "succeeded");
+    let disabled = response_body(&request(address, &pki, "/admin/v1/users/batch-user", auth).await);
+    assert_eq!(disabled["user"]["enabled"], false);
     let preview = request_raw(
         address,
         &pki,

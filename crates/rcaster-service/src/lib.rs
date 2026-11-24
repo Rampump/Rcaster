@@ -21,6 +21,7 @@ pub mod maintenance;
 pub mod near;
 pub mod ntrip_io;
 pub mod ntrip_server;
+pub mod operations;
 pub mod proxy_protocol;
 pub mod public;
 pub mod public_auth;
