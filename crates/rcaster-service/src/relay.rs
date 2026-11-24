@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -23,12 +26,21 @@ pub struct RelayManager {
     max_relays: usize,
     max_starting: usize,
     idle_timeout: Duration,
+    failures: Arc<AtomicU64>,
+    idle_closes: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RelayView {
     pub mountpoint: String,
     pub subscribers: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RelayMetrics {
+    pub starting: usize,
+    pub failures: u64,
+    pub idle_closes: u64,
 }
 
 enum RelaySlot {
@@ -58,6 +70,8 @@ impl RelayManager {
             max_relays,
             max_starting,
             idle_timeout,
+            failures: Arc::new(AtomicU64::new(0)),
+            idle_closes: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -71,6 +85,7 @@ impl RelayManager {
         if result.is_ok() {
             self.backoff.lock().await.remove(mountpoint);
         } else {
+            self.failures.fetch_add(1, Ordering::Relaxed);
             let mut backoff = self.backoff.lock().await;
             let failures = backoff
                 .get(mountpoint)
@@ -110,6 +125,20 @@ impl RelayManager {
             .collect::<Vec<_>>();
         views.sort_by(|left, right| left.mountpoint.cmp(&right.mountpoint));
         views
+    }
+
+    pub async fn metrics(&self) -> RelayMetrics {
+        RelayMetrics {
+            starting: self
+                .relays
+                .lock()
+                .await
+                .values()
+                .filter(|slot| matches!(slot, RelaySlot::Starting(_)))
+                .count(),
+            failures: self.failures.load(Ordering::Relaxed),
+            idle_closes: self.idle_closes.load(Ordering::Relaxed),
+        }
     }
 
     async fn ensure_inner(&self, mountpoint: &str) -> Result<(), String> {
@@ -212,6 +241,7 @@ impl RelayManager {
         );
         let idle_source = Arc::clone(&source);
         let idle_timeout = self.idle_timeout;
+        let idle_closes = Arc::clone(&self.idle_closes);
         tokio::spawn(async move {
             let interval = (idle_timeout / 4).min(Duration::from_secs(1));
             loop {
@@ -222,6 +252,7 @@ impl RelayManager {
                 if idle_source.subscriber_count() == 0 {
                     tokio::time::sleep(idle_timeout).await;
                     if idle_source.is_active() && idle_source.subscriber_count() == 0 {
+                        idle_closes.fetch_add(1, Ordering::Relaxed);
                         idle_source.close();
                         return;
                     }

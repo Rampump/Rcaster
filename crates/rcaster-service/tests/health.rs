@@ -84,6 +84,10 @@ async fn live_is_independent_and_ready_reflects_state() {
         base_position_jumps: 4,
         backlog_kicks: 5,
     });
+    state.set_public_monitor_viewers(6);
+    state.monitor_busy();
+    state.monitor_start_limited();
+    state.set_relay_metrics(2, 3, 4);
     state.set_sessions(4);
     state.set_config_generation(7);
     state.set_auth_failure_fallback(3);
@@ -132,6 +136,12 @@ async fn live_is_independent_and_ready_reflects_state() {
     assert!(metrics.contains("rcaster_source_station_id_changes_total 3"));
     assert!(metrics.contains("rcaster_source_position_jumps_total 4"));
     assert!(metrics.contains("rcaster_backlog_kicks_total 5"));
+    assert!(metrics.contains("rcaster_public_monitor_viewers 6"));
+    assert!(metrics.contains("rcaster_monitor_busy_total 1"));
+    assert!(metrics.contains("rcaster_monitor_start_limited_total 1"));
+    assert!(metrics.contains("rcaster_relay_starting 2"));
+    assert!(metrics.contains("rcaster_relay_failures_total 3"));
+    assert!(metrics.contains("rcaster_relay_idle_closes_total 4"));
     assert!(metrics.contains("rcaster_config_generation 7"));
     assert!(metrics.contains("rcaster_auth_failure_fallback_total 3"));
     assert!(metrics.contains("rcaster_process_resident_memory_bytes 123456"));

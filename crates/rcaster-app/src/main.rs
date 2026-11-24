@@ -514,6 +514,17 @@ async fn serve(args: &[String]) -> AppResult<()> {
                     Some(manager) => manager.active_count().await,
                     None => 0,
                 };
+                match &monitor_relay {
+                    Some(manager) => {
+                        let metrics = manager.metrics().await;
+                        monitor_health.set_relay_metrics(
+                            metrics.starting,
+                            metrics.failures,
+                            metrics.idle_closes,
+                        );
+                    }
+                    None => monitor_health.set_relay_metrics(0, 0, 0),
+                }
                 monitor_health.set_counts(monitor_hub.active_sources().len(), relays);
                 monitor_health.set_connections(monitor_connections.active());
                 monitor_health.set_tls_certificate_expiry(
@@ -692,6 +703,10 @@ async fn serve(args: &[String]) -> AppResult<()> {
     let public_task = if let Some(bind) = config.public_bind.as_deref() {
         let listener = TcpListener::bind(bind).await?;
         let address = listener.local_addr()?;
+        let mut public_websockets = rcaster_service::public::PublicMonitorLimiter::default();
+        public_websockets.track_metrics(Arc::clone(&health_state));
+        let mut monitor_starts = rcaster_service::public::MonitorStartLimiter::default();
+        monitor_starts.track_metrics(Arc::clone(&health_state));
         let reloadable_tls = listener_tls
             .clone()
             .ok_or("public API requires tls_certificate")?;
@@ -704,9 +719,9 @@ async fn serve(args: &[String]) -> AppResult<()> {
                 accounts: account_directory.clone(),
                 relays: relay_manager.clone(),
                 audit: audit.clone(),
-                websockets: Default::default(),
+                websockets: public_websockets,
                 login_limiter: Default::default(),
-                monitor_starts: Default::default(),
+                monitor_starts,
                 map_tiles: config
                     .public_map_tiles
                     .as_ref()

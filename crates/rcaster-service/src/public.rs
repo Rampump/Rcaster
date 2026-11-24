@@ -34,6 +34,7 @@ use crate::{
     auth::AuthConcurrencyLimiter,
     cluster_runtime::SharedClusterRuntime,
     connections::ConnectionController,
+    health::HealthState,
     hub::MountpointHub,
     proxy_protocol::{ProxyProtocolConfig, resolve_client_ip},
     public_auth::{
@@ -73,6 +74,7 @@ pub struct PublicMapTiles {
 #[derive(Clone, Default)]
 pub struct MonitorStartLimiter {
     inner: Arc<Mutex<BTreeMap<String, MonitorStartState>>>,
+    metrics: Option<Arc<HealthState>>,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +84,10 @@ struct MonitorStartState {
 }
 
 impl MonitorStartLimiter {
+    pub fn track_metrics(&mut self, metrics: Arc<HealthState>) {
+        self.metrics = Some(metrics);
+    }
+
     fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
         let mut states = self
@@ -97,6 +103,9 @@ impl MonitorStartLimiter {
             state.count = 0;
         }
         if state.count >= 30 {
+            if let Some(metrics) = &self.metrics {
+                metrics.monitor_start_limited();
+            }
             return false;
         }
         state.count += 1;
@@ -107,6 +116,7 @@ impl MonitorStartLimiter {
 #[derive(Clone, Default)]
 pub struct PublicMonitorLimiter {
     inner: Arc<PublicMonitorInner>,
+    metrics: Option<Arc<HealthState>>,
 }
 
 #[derive(Default)]
@@ -125,6 +135,10 @@ pub struct PublicMonitorSlot {
 }
 
 impl PublicMonitorLimiter {
+    pub fn track_metrics(&mut self, metrics: Arc<HealthState>) {
+        self.metrics = Some(metrics);
+    }
+
     pub fn acquire(&self, user: &str, ip: &str, mountpoint: &str) -> Option<PublicMonitorSlot> {
         let mut users = self
             .inner
@@ -146,9 +160,15 @@ impl PublicMonitorLimiter {
             || ips.get(ip).copied().unwrap_or_default() >= 4
             || mounts.get(mountpoint).copied().unwrap_or_default() >= 200
         {
+            if let Some(metrics) = &self.metrics {
+                metrics.monitor_busy();
+            }
             return None;
         }
         self.inner.total.fetch_add(1, Ordering::AcqRel);
+        if let Some(metrics) = &self.metrics {
+            metrics.set_public_monitor_viewers(self.inner.total.load(Ordering::Acquire));
+        }
         *users.entry(user.to_owned()).or_default() += 1;
         *ips.entry(ip.to_owned()).or_default() += 1;
         *mounts.entry(mountpoint.to_owned()).or_default() += 1;
@@ -164,6 +184,9 @@ impl PublicMonitorLimiter {
 impl Drop for PublicMonitorSlot {
     fn drop(&mut self) {
         self.limiter.inner.total.fetch_sub(1, Ordering::AcqRel);
+        if let Some(metrics) = &self.limiter.metrics {
+            metrics.set_public_monitor_viewers(self.limiter.inner.total.load(Ordering::Acquire));
+        }
         let mut users = self
             .limiter
             .inner

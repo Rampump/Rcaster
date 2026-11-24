@@ -61,6 +61,12 @@ pub struct HealthState {
     station_id_changes: AtomicU64,
     base_position_jumps: AtomicU64,
     backlog_kicks: AtomicU64,
+    public_monitor_viewers: AtomicUsize,
+    monitor_busy: AtomicU64,
+    monitor_start_limited: AtomicU64,
+    relay_starting: AtomicUsize,
+    relay_failures: AtomicU64,
+    relay_idle_closes: AtomicU64,
     near_queries: AtomicU64,
     near_queries_limited: AtomicU64,
     near_gga_rate_limited: AtomicU64,
@@ -158,6 +164,25 @@ impl HealthState {
     pub fn set_connections(&self, connections: usize) {
         self.active_connections
             .store(connections, Ordering::Release);
+    }
+
+    pub fn set_public_monitor_viewers(&self, viewers: usize) {
+        self.public_monitor_viewers
+            .store(viewers, Ordering::Release);
+    }
+
+    pub fn monitor_busy(&self) {
+        self.monitor_busy.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn monitor_start_limited(&self) {
+        self.monitor_start_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_relay_metrics(&self, starting: usize, failures: u64, idle_closes: u64) {
+        self.relay_starting.store(starting, Ordering::Release);
+        self.relay_failures.store(failures, Ordering::Release);
+        self.relay_idle_closes.store(idle_closes, Ordering::Release);
     }
 
     pub fn set_tls_certificate_expiry(&self, expires_at: Option<i64>) {
@@ -355,6 +380,15 @@ impl HealthState {
             self.station_id_changes.load(Ordering::Relaxed),
             self.base_position_jumps.load(Ordering::Relaxed),
             self.backlog_kicks.load(Ordering::Relaxed),
+        ));
+        metrics.push_str(&format!(
+            "# HELP rcaster_public_monitor_viewers Active public monitor WebSocket viewers.\n# TYPE rcaster_public_monitor_viewers gauge\nrcaster_public_monitor_viewers {}\n# HELP rcaster_monitor_busy_total Monitor starts rejected by WebSocket or viewer limits.\n# TYPE rcaster_monitor_busy_total counter\nrcaster_monitor_busy_total {}\n# HELP rcaster_monitor_start_limited_total Monitor ticket requests rejected by the per-user start limit.\n# TYPE rcaster_monitor_start_limited_total counter\nrcaster_monitor_start_limited_total {}\n# HELP rcaster_relay_starting Active shared upstream relays still starting.\n# TYPE rcaster_relay_starting gauge\nrcaster_relay_starting {}\n# HELP rcaster_relay_failures_total Shared upstream relay start failures.\n# TYPE rcaster_relay_failures_total counter\nrcaster_relay_failures_total {}\n# HELP rcaster_relay_idle_closes_total Shared upstream relays closed after becoming idle.\n# TYPE rcaster_relay_idle_closes_total counter\nrcaster_relay_idle_closes_total {}\n",
+            self.public_monitor_viewers.load(Ordering::Acquire),
+            self.monitor_busy.load(Ordering::Relaxed),
+            self.monitor_start_limited.load(Ordering::Relaxed),
+            self.relay_starting.load(Ordering::Acquire),
+            self.relay_failures.load(Ordering::Relaxed),
+            self.relay_idle_closes.load(Ordering::Relaxed),
         ));
         metrics.push_str(&format!(
             "# HELP rcaster_auth_failure_fallback_total Shared authentication limiter failures that fell back to node-local protection.\n# TYPE rcaster_auth_failure_fallback_total counter\nrcaster_auth_failure_fallback_total {}\n",

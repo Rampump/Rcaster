@@ -478,7 +478,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
         listener,
         pki.server_tls(),
         AdminState {
-            cluster_id: cluster,
+            cluster_id: cluster.clone(),
             caster_id: "caster-admin".to_owned(),
             token: "secret".to_owned(),
             ready: Arc::new(HealthState::default()),
@@ -1269,6 +1269,212 @@ async fn admin_writes_blacklist_with_revision_cas() {
         )
         .await
         .expect("batch mountpoint");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !runtime.is_healthy().await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("batch runtime healthy");
+    let session_permit = runtime
+        .admit_client("batch-user", "BATCH", "192.0.2.44", 10, None)
+        .await
+        .expect("batch client session");
+    let session_id = session_permit.session.session_id.clone();
+    let drop_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        &format!(r#"{{"action":"sessions.drop","targets":["{session_id}"]}}"#),
+    )
+    .await;
+    assert!(drop_preview.starts_with("HTTP/1.1 200 OK"));
+    let drop_preview_body = response_body(&drop_preview);
+    assert_eq!(drop_preview_body["affected_sessions"], 1);
+    let drop_preview_digest = drop_preview_body["preview_digest"]
+        .as_str()
+        .expect("session drop digest");
+    let drop_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"sessions.drop","targets":["{session_id}"],"preview_digest":"{drop_preview_digest}"}}"#
+        ),
+    )
+    .await;
+    assert!(drop_start.starts_with("HTTP/1.1 202 Accepted"));
+    let drop_operation_id = response_body(&drop_start)["operation_id"]
+        .as_str()
+        .expect("session drop operation ID")
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{drop_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "SUCCEEDED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("session drop completion");
+    let commands = etcd
+        .get(
+            format!("/rcaster/{}/online/commands/caster-admin/", cluster),
+            Some(GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("session commands");
+    assert!(
+        commands
+            .kvs()
+            .iter()
+            .any(|command| String::from_utf8_lossy(command.value()).contains(&session_id))
+    );
+    accounts
+        .upsert_user(
+            User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "delete-user".to_owned(),
+                username: "delete-user".to_owned(),
+                password_hash: rcaster_service::account_auth::hash_password("delete-secret")
+                    .expect("delete password hash"),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: false,
+                web_enabled: false,
+                role: UserRole::User,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("delete user");
+    let delete_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        r#"{"action":"users.delete","targets":["delete-user"]}"#,
+    )
+    .await;
+    let delete_preview_body = response_body(&delete_preview);
+    let delete_digest = delete_preview_body["preview_digest"]
+        .as_str()
+        .expect("delete preview digest");
+    let delete_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"users.delete","targets":["delete-user"],"preview_digest":"{delete_digest}"}}"#
+        ),
+    )
+    .await;
+    assert!(delete_start.starts_with("HTTP/1.1 202 Accepted"));
+    let delete_operation_id = response_body(&delete_start)["operation_id"]
+        .as_str()
+        .expect("delete operation ID")
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{delete_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "SUCCEEDED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("delete user completion");
+    assert!(
+        request(address, &pki, "/admin/v1/users/delete-user", auth)
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+    let disable_mount_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        r#"{"action":"mountpoints.disable","targets":["BATCH"]}"#,
+    )
+    .await;
+    let disable_mount_preview_body = response_body(&disable_mount_preview);
+    let disable_mount_digest = disable_mount_preview_body["preview_digest"]
+        .as_str()
+        .expect("mountpoint disable digest");
+    let disable_mount_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"mountpoints.disable","targets":["BATCH"],"preview_digest":"{disable_mount_digest}"}}"#
+        ),
+    )
+    .await;
+    assert!(disable_mount_start.starts_with("HTTP/1.1 202 Accepted"));
+    let disable_mount_operation_id = response_body(&disable_mount_start)["operation_id"]
+        .as_str()
+        .expect("mountpoint disable operation ID")
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{disable_mount_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "SUCCEEDED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("mountpoint disable completion");
+    let disabled_mount =
+        response_body(&request(address, &pki, "/admin/v1/mountpoints/BATCH", auth).await);
+    assert_eq!(disabled_mount["mountpoint"]["enabled"], false);
     let batch_preview = request_raw(
         address,
         &pki,
@@ -1283,6 +1489,7 @@ async fn admin_writes_blacklist_with_revision_cas() {
     let batch_preview_body = response_body(&batch_preview);
     assert_eq!(batch_preview_body["targets"], 1);
     assert_eq!(batch_preview_body["affected_mountpoints"], 1);
+    assert_eq!(batch_preview_body["affected_sessions"], 1);
     let preview_digest = batch_preview_body["preview_digest"]
         .as_str()
         .expect("batch preview digest");
@@ -1363,6 +1570,81 @@ async fn admin_writes_blacklist_with_revision_cas() {
     assert_eq!(completed["results"][0]["status"], "succeeded");
     let disabled = response_body(&request(address, &pki, "/admin/v1/users/batch-user", auth).await);
     assert_eq!(disabled["user"]["enabled"], false);
+    accounts
+        .upsert_user(
+            User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "new-owner".to_owned(),
+                username: "new-owner".to_owned(),
+                password_hash: rcaster_service::account_auth::hash_password("new-owner-secret")
+                    .expect("new owner password hash"),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: false,
+                web_enabled: false,
+                role: UserRole::User,
+                created_at: "2026-11-24T00:00:00Z".to_owned(),
+                updated_at: "2026-11-24T00:00:00Z".to_owned(),
+            },
+            None,
+        )
+        .await
+        .expect("new owner");
+    let owner_preview = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations/preview",
+        auth,
+        "",
+        r#"{"action":"mountpoints.change_owner","targets":[{"mountpoint":"BATCH","owner_user_id":"new-owner"}]}"#,
+    )
+    .await;
+    let owner_preview_body = response_body(&owner_preview);
+    assert_eq!(owner_preview_body["targets"], 1);
+    let owner_digest = owner_preview_body["preview_digest"]
+        .as_str()
+        .expect("owner migration digest");
+    let owner_start = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/operations",
+        auth,
+        "",
+        &format!(
+            r#"{{"action":"mountpoints.change_owner","targets":[{{"mountpoint":"BATCH","owner_user_id":"new-owner"}}],"preview_digest":"{owner_digest}"}}"#
+        ),
+    )
+    .await;
+    assert!(owner_start.starts_with("HTTP/1.1 202 Accepted"));
+    let owner_operation_id = response_body(&owner_start)["operation_id"]
+        .as_str()
+        .expect("owner migration operation ID")
+        .to_owned();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let operation = response_body(
+                &request(
+                    address,
+                    &pki,
+                    &format!("/admin/v1/operations/{owner_operation_id}"),
+                    auth,
+                )
+                .await,
+            );
+            if operation["status"] == "SUCCEEDED" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("owner migration completion");
+    let migrated =
+        response_body(&request(address, &pki, "/admin/v1/mountpoints/BATCH", auth).await);
+    assert_eq!(migrated["mountpoint"]["owner_user_id"], "new-owner");
     let preview = request_raw(
         address,
         &pki,
@@ -1555,11 +1837,9 @@ async fn admin_writes_blacklist_with_revision_cas() {
         )
         .await
         .expect("command list");
-    assert_eq!(commands.kvs().len(), 1);
-    assert!(
-        String::from_utf8_lossy(commands.kvs()[0].value())
-            .contains("\"session_id\":\"command-session\"")
-    );
+    assert!(commands.kvs().iter().any(|command| {
+        String::from_utf8_lossy(command.value()).contains("\"session_id\":\"command-session\"")
+    }));
     assert!(
         request(address, &pki, "/admin/v1/users/owner/sessions", auth,)
             .await
