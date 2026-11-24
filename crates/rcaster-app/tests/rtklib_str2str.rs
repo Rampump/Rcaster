@@ -46,6 +46,7 @@ async fn rtklib_str2str_source_and_client_round_trip_rtcm3() {
     wait_for_caster(&mut caster, caster_port).await;
 
     let mut source = Command::new(&str2str)
+        .current_dir(directory.path())
         .arg("-in")
         .arg(format!("tcpsvr://:{feed_port}#rtcm3"))
         .arg("-out")
@@ -67,6 +68,7 @@ async fn rtklib_str2str_source_and_client_round_trip_rtcm3() {
     wait_for_mountpoint(caster_port).await;
 
     let mut client = Command::new(&str2str)
+        .current_dir(directory.path())
         .arg("-in")
         .arg(format!("ntrip://127.0.0.1:{caster_port}/C63#rtcm3"))
         .arg("-out")

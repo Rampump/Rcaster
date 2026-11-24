@@ -760,32 +760,64 @@ async fn seed_if_empty(
     if !users.is_empty() || !mounts.is_empty() {
         return Ok(());
     }
-    let mut compares = Vec::new();
-    let mut operations = Vec::new();
+    let mut records = Vec::<SeedRecord>::new();
     for user in seed.users() {
         let key = user_key(cluster_id, &user.user_id)?;
         let username_key = username_key(cluster_id, &user.username)?;
-        compares.push(Compare::create_revision(key.clone(), CompareOp::Equal, 0));
-        compares.push(Compare::create_revision(
-            username_key.clone(),
-            CompareOp::Equal,
-            0,
-        ));
-        operations.push(TxnOp::put(key, serde_json::to_vec(user)?, None));
-        operations.push(TxnOp::put(username_key, user.user_id.as_bytes(), None));
+        records.push(SeedRecord {
+            values: vec![
+                (key, serde_json::to_vec(user)?),
+                (username_key, user.user_id.as_bytes().to_vec()),
+            ],
+        });
     }
     for mountpoint in seed.mountpoints() {
-        let key = mountpoint_key(cluster_id, &mountpoint.mountpoint)?;
-        compares.push(Compare::create_revision(key.clone(), CompareOp::Equal, 0));
-        operations.push(TxnOp::put(key, serde_json::to_vec(mountpoint)?, None));
+        records.push(SeedRecord {
+            values: vec![(
+                mountpoint_key(cluster_id, &mountpoint.mountpoint)?,
+                serde_json::to_vec(mountpoint)?,
+            )],
+        });
     }
-    if operations.is_empty() {
-        return Ok(());
+    for batch in records.chunks(32) {
+        let compares = batch
+            .iter()
+            .flat_map(|record| record.values.iter())
+            .map(|(key, _)| Compare::create_revision(key.clone(), CompareOp::Equal, 0))
+            .collect::<Vec<_>>();
+        let operations = batch
+            .iter()
+            .flat_map(|record| record.values.iter())
+            .map(|(key, value)| TxnOp::put(key.clone(), value.clone(), None))
+            .collect::<Vec<_>>();
+        if client
+            .txn(Txn::new().when(compares).and_then(operations))
+            .await?
+            .succeeded()
+        {
+            continue;
+        }
+        for record in batch {
+            let compares = record
+                .values
+                .iter()
+                .map(|(key, _)| Compare::create_revision(key.clone(), CompareOp::Equal, 0))
+                .collect::<Vec<_>>();
+            let operations = record
+                .values
+                .iter()
+                .map(|(key, value)| TxnOp::put(key.clone(), value.clone(), None))
+                .collect::<Vec<_>>();
+            let _ = client
+                .txn(Txn::new().when(compares).and_then(operations))
+                .await?;
+        }
     }
-    let _ = client
-        .txn(Txn::new().when(compares).and_then(operations))
-        .await?;
     Ok(())
+}
+
+struct SeedRecord {
+    values: Vec<(String, Vec<u8>)>,
 }
 
 pub async fn load_accounts(

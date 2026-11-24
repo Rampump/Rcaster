@@ -199,7 +199,7 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(summary.contains("\"valid_frames\":0"));
     assert!(summary.contains("\"packets\":0"));
     assert!(summary.contains("\"bitrate_bps\":null"));
-    assert!(summary.contains("\"stream_health_warning\":true"));
+    assert!(summary.contains("\"stream_health_warning\":false"));
     let health = request(
         address,
         &pki,
@@ -207,7 +207,7 @@ async fn admin_routes_require_mtls_and_service_token() {
         "Bearer secret",
     )
     .await;
-    assert!(health.contains("\"stream_health_warning\":true"));
+    assert!(health.contains("\"stream_health_warning\":false"));
     assert!(health.contains("\"last_correction_age_seconds\":null"));
     assert!(
         request(address, &pki, "/admin/v1/users", "Bearer secret")

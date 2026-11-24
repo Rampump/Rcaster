@@ -368,6 +368,47 @@ fn malformed_streams_resynchronize_without_panicking() {
 }
 
 #[test]
+fn ambiguous_rtcm2_tail_remains_bounded() {
+    let mut demux = ProtocolDemux::new();
+    for _ in 0..256 {
+        assert!(
+            demux.push(&[0x40; 4096]).is_empty(),
+            "ambiguous RTCM2 bytes must not become frames"
+        );
+        assert!(
+            demux.buffered_bytes() <= 8192,
+            "pending buffer grew to {} bytes",
+            demux.buffered_bytes()
+        );
+    }
+    assert!(demux.profile().unknown_bytes > 1_000_000);
+}
+
+#[test]
+fn deterministic_random_streams_keep_demux_memory_bounded() {
+    for seed in 0..64_u64 {
+        let mut state = seed.wrapping_add(1);
+        let mut demux = ProtocolDemux::new();
+        for _ in 0..256 {
+            let length = (state as usize % 257) + 1;
+            let mut chunk = vec![0_u8; length];
+            for byte in &mut chunk {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            demux.push(&chunk);
+            assert!(
+                demux.buffered_bytes() <= 8192,
+                "seed {seed} buffered {} bytes",
+                demux.buffered_bytes()
+            );
+        }
+    }
+}
+
+#[test]
 fn identifies_msm_version_as_correction_data() {
     let frame = synthetic_rtcm3(1074);
     let mut demux = ProtocolDemux::new();

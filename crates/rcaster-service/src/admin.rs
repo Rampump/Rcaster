@@ -2482,6 +2482,8 @@ async fn handle(
                         "stream_health_warning": health.warning_codes != 0,
                         "warning_codes": health.warning_codes,
                         "last_correction_age_seconds": health.last_correction_age_seconds,
+                        "valid_frame_ratio": health.valid_frame_ratio,
+                        "crc_error_ratio": health.crc_error_ratio,
                     })),
                 })
             } else {
@@ -3215,6 +3217,8 @@ async fn stream_summary(state: &AdminState, mountpoint: &str) -> Option<Value> {
             "stream_health_warning": health.warning_codes != 0,
             "warning_codes": health.warning_codes,
             "last_correction_age_seconds": health.last_correction_age_seconds,
+            "valid_frame_ratio": health.valid_frame_ratio,
+            "crc_error_ratio": health.crc_error_ratio,
         })),
     }))
 }

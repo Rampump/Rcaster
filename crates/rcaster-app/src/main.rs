@@ -214,13 +214,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
         };
     let hub = Arc::new(MountpointHub::new_with_health(
         config.subscriber_buffer_events,
-        HealthThresholds {
-            stale_after: Duration::from_millis(config.source_stale_after_ms),
-            max_crc_ratio: config.source_max_crc_ratio,
-            max_source_bitrate_bps: config.source_max_bitrate_bps,
-            station_id_change_alert: config.source_health.station_id_change_alert,
-            base_position_jump_m: config.source_health.base_position_jump_m,
-        },
+        config.health_thresholds()?,
     )?);
     hub.set_limits(HubLimits {
         max_sources: config.max_sources,
@@ -308,10 +302,15 @@ async fn serve(args: &[String]) -> AppResult<()> {
                 None => None,
             } {
                 sampling_hub.set_health_thresholds(HealthThresholds {
-                    stale_after: Duration::from_secs(
+                    enabled: snapshot.config.source_health.enabled,
+                    short_window: Duration::from_secs(snapshot.config.source_health.short_window_s),
+                    long_window: Duration::from_secs(snapshot.config.source_health.long_window_s),
+                    observation_timeout: Duration::from_secs(
                         snapshot.config.source_health.observation_timeout_s,
                     ),
+                    valid_frame_ratio_min: snapshot.config.source_health.valid_frame_ratio_min,
                     max_crc_ratio: snapshot.config.source_health.crc_error_ratio_max,
+                    alert_clear: Duration::from_secs(snapshot.config.source_health.alert_clear_s),
                     max_source_bitrate_bps: snapshot.config.limits.max_source_bitrate_bps,
                     station_id_change_alert: snapshot.config.source_health.station_id_change_alert,
                     base_position_jump_m: snapshot.config.source_health.base_position_jump_m,
@@ -788,6 +787,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
                 max_frames: admission.max_frames,
                 timeout: Duration::from_millis(admission.timeout_ms),
                 read_timeout: Duration::from_millis(admission.read_timeout_ms),
+                str_refresh: admission.str_refresh.enabled,
             });
     let server_config = NtripServerConfig {
         head_timeout: Duration::from_millis(config.head_timeout_ms),

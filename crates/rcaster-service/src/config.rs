@@ -24,21 +24,39 @@ pub struct CasterConfig {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SourceHealthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_health_short_window_s")]
+    pub short_window_s: u64,
+    #[serde(default = "default_health_long_window_s")]
+    pub long_window_s: u64,
     pub observation_timeout_s: u64,
+    #[serde(default = "default_health_valid_frame_ratio_min")]
+    pub valid_frame_ratio_min: f64,
     pub crc_error_ratio_max: f64,
+    #[serde(default = "default_health_alert_clear_s")]
+    pub alert_clear_s: u64,
     #[serde(default = "default_true")]
     pub station_id_change_alert: bool,
     #[serde(default = "default_base_position_jump_m")]
     pub base_position_jump_m: f64,
+    #[serde(default = "default_health_action")]
+    pub action: String,
 }
 
 impl Default for SourceHealthConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            short_window_s: 10,
+            long_window_s: 60,
             observation_timeout_s: 10,
+            valid_frame_ratio_min: 0.8,
             crc_error_ratio_max: 0.1,
+            alert_clear_s: 30,
             station_id_change_alert: true,
             base_position_jump_m: 100.0,
+            action: default_health_action(),
         }
     }
 }
@@ -456,10 +474,16 @@ fn decode_config(value: &[u8]) -> Result<CasterConfig, ConfigError> {
     if config.schema_version != 1 {
         return Err(ConfigError::UnsupportedSchema(config.schema_version));
     }
-    if config.source_health.observation_timeout_s == 0
+    if config.source_health.short_window_s == 0
+        || config.source_health.long_window_s == 0
+        || config.source_health.short_window_s > config.source_health.long_window_s
+        || config.source_health.observation_timeout_s == 0
+        || !(0.0..=1.0).contains(&config.source_health.valid_frame_ratio_min)
         || !(0.0..=1.0).contains(&config.source_health.crc_error_ratio_max)
+        || config.source_health.alert_clear_s == 0
         || !config.source_health.base_position_jump_m.is_finite()
         || config.source_health.base_position_jump_m <= 0.0
+        || config.source_health.action != "alert"
         || config.limits.max_source_bitrate_bps == 0
         || config.limits.max_sources == 0
         || config.limits.max_validating_sources == 0
@@ -483,6 +507,26 @@ fn default_base_position_jump_m() -> f64 {
     100.0
 }
 
+fn default_health_short_window_s() -> u64 {
+    10
+}
+
+fn default_health_long_window_s() -> u64 {
+    60
+}
+
+fn default_health_valid_frame_ratio_min() -> f64 {
+    0.8
+}
+
+fn default_health_alert_clear_s() -> u64 {
+    30
+}
+
+fn default_health_action() -> String {
+    "alert".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{config_key, decode_config};
@@ -503,12 +547,25 @@ mod tests {
     fn validates_source_health_thresholds() {
         let mut config = super::CasterConfig::new(1);
         assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_ok());
+        config.source_health.short_window_s = 61;
+        config.source_health.long_window_s = 60;
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
+        config.source_health.short_window_s = 10;
         config.source_health.observation_timeout_s = 0;
         assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
         config.source_health.observation_timeout_s = 10;
+        config.source_health.valid_frame_ratio_min = -0.1;
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
+        config.source_health.valid_frame_ratio_min = 0.8;
         config.source_health.crc_error_ratio_max = 1.1;
         assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
         config.source_health.crc_error_ratio_max = 0.1;
+        config.source_health.alert_clear_s = 0;
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
+        config.source_health.alert_clear_s = 30;
+        config.source_health.action = "disconnect".to_owned();
+        assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
+        config.source_health.action = "alert".to_owned();
         config.limits.max_source_bitrate_bps = 0;
         assert!(decode_config(&serde_json::to_vec(&config).unwrap()).is_err());
     }

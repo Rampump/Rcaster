@@ -156,6 +156,22 @@ impl SessionHold {
         Ok(())
     }
 
+    async fn refresh_source_str(
+        &self,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> io::Result<()> {
+        if let Self::ClusterSource(hold) = self
+            && let Some(permit) = &hold.permit
+        {
+            hold.runtime
+                .update_source_str(permit, str_record, admission)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn bind(&self, cancellation: Option<&mut ConnectionCancel>, user_id: Option<&str>) {
         let Some(cancellation) = cancellation else {
             return;
@@ -1075,6 +1091,9 @@ struct AdmissionFeed {
     runtime: Option<SharedClusterRuntime>,
     source_ip: IpAddr,
     configured_mountpoint: Option<Mountpoint>,
+    str_refresh: bool,
+    last_str: Option<StrRecord>,
+    last_admission: Option<SourceAdmissionSummary>,
 }
 
 fn record_from_profile(
@@ -1096,6 +1115,7 @@ impl AdmissionFeed {
         source_ip: IpAddr,
         configured_mountpoint: Option<Mountpoint>,
     ) -> Self {
+        let str_refresh = config.str_refresh;
         Self {
             window: SourceAdmissionWindow::new(config.policy, config.max_bytes, config.max_frames),
             demux: None,
@@ -1104,6 +1124,9 @@ impl AdmissionFeed {
             runtime,
             source_ip,
             configured_mountpoint,
+            str_refresh,
+            last_str: None,
+            last_admission: None,
         }
     }
 
@@ -1122,7 +1145,8 @@ impl AdmissionFeed {
             return Ok(false);
         }
         if let Some(demux) = &mut self.demux {
-            for frame in demux.push(bytes) {
+            let frames = demux.push(bytes);
+            for frame in frames {
                 let packet = Arc::from(frame.bytes);
                 source
                     .publish_frame(packet, frame.format, frame.message_number)
@@ -1131,6 +1155,32 @@ impl AdmissionFeed {
             source
                 .set_profile(demux.profile().clone())
                 .map_err(invalid_hub)?;
+            if self.str_refresh {
+                let record = record_from_profile(
+                    source.mountpoint(),
+                    demux.profile(),
+                    self.configured_mountpoint.as_ref(),
+                );
+                if self.last_str.as_ref() != Some(&record) {
+                    source.set_str_record(record.clone()).map_err(invalid_hub)?;
+                    if let Some(admission) = &self.last_admission
+                        && let Err(error) = permit
+                            .refresh_source_str(&record, Some(admission.clone()))
+                            .await
+                    {
+                        eprintln!(
+                            "rcaster: failed to refresh STR for {}: {error}",
+                            source.mountpoint()
+                        );
+                        return Err(error);
+                    }
+                    eprintln!(
+                        "rcaster: refreshed STR for {} after profile update",
+                        source.mountpoint()
+                    );
+                    self.last_str = Some(record);
+                }
+            }
             return Ok(true);
         }
         match self.window.push(bytes) {
@@ -1148,8 +1198,10 @@ impl AdmissionFeed {
                     .set_profile(self.window.profile().clone())
                     .map_err(invalid_hub)?;
                 permit
-                    .activate_source_with_summary(&record, Some(admission))
+                    .activate_source_with_summary(&record, Some(admission.clone()))
                     .await?;
+                self.last_str = Some(record);
+                self.last_admission = Some(admission);
                 if let Some(metrics) = &self.metrics {
                     metrics.source_accepted();
                 }
@@ -1191,8 +1243,10 @@ impl AdmissionFeed {
                         .set_profile(self.window.profile().clone())
                         .map_err(invalid_hub)?;
                     permit
-                        .activate_source_with_summary(&record, Some(admission))
+                        .activate_source_with_summary(&record, Some(admission.clone()))
                         .await?;
+                    self.last_str = Some(record);
+                    self.last_admission = Some(admission);
                     if let Some(metrics) = &self.metrics {
                         metrics.source_accepted();
                     }

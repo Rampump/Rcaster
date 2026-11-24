@@ -34,7 +34,7 @@ use crate::{
     source_claim::{
         ClaimError, SourceAdmissionSummary, SourceClaimRequest, SourceRoute,
         activate_source_for_connection_with_summary, publish_active_with_summary, release_source,
-        release_source_for_connection,
+        release_source_for_connection, update_source_str_for_connection,
     },
     source_watch::SourceWatcher,
 };
@@ -546,6 +546,41 @@ impl ClusterRuntime {
             .await
             .map_err(AdmissionError::Source),
         }
+    }
+
+    pub async fn update_source_str(
+        &mut self,
+        permit: &ClusterSourcePermit,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> Result<(), AdmissionError> {
+        let (mountpoint, connection_id, runtime_epoch) = match permit {
+            ClusterSourcePermit::Local(permit) => (
+                permit.claimed_source.claim.mountpoint.as_str(),
+                permit.claimed_source.claim.connection_id.as_str(),
+                permit.claimed_source.claim.runtime_epoch.as_str(),
+            ),
+            ClusterSourcePermit::Grpc {
+                mountpoint,
+                connection_id,
+                ..
+            } => (
+                mountpoint.as_str(),
+                connection_id.as_str(),
+                self.options.runtime_epoch.as_str(),
+            ),
+        };
+        update_source_str_for_connection(
+            &mut self.client,
+            &self.options.cluster_id,
+            mountpoint,
+            connection_id,
+            runtime_epoch,
+            str_record,
+            admission,
+        )
+        .await
+        .map_err(AdmissionError::Source)
     }
 
     pub async fn release_source(
@@ -1277,6 +1312,21 @@ impl SharedClusterRuntime {
             .as_mut()
             .ok_or(AdmissionError::CoordinatorUnavailable)?
             .activate_source_with_summary(permit, str_record, admission)
+            .await
+    }
+
+    pub async fn update_source_str(
+        &self,
+        permit: &ClusterSourcePermit,
+        str_record: &StrRecord,
+        admission: Option<SourceAdmissionSummary>,
+    ) -> Result<(), AdmissionError> {
+        self.inner
+            .lock()
+            .await
+            .as_mut()
+            .ok_or(AdmissionError::CoordinatorUnavailable)?
+            .update_source_str(permit, str_record, admission)
             .await
     }
 

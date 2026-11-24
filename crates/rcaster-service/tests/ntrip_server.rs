@@ -1160,6 +1160,7 @@ async fn start_test_server_with_admission(
             max_frames: 8,
             timeout,
             read_timeout: Duration::from_secs(1),
+            str_refresh: true,
         }),
         None,
     )
@@ -1190,6 +1191,7 @@ async fn start_test_near_server() -> (
             max_frames: 8,
             timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
+            str_refresh: true,
         }),
         Some(rcaster_service::ntrip_server::NearServerConfig {
             mountpoint: "AUTO_NEAR".to_owned(),

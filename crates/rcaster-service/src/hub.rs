@@ -23,8 +23,13 @@ pub struct MountpointHub {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HealthThresholds {
-    pub stale_after: Duration,
+    pub enabled: bool,
+    pub short_window: Duration,
+    pub long_window: Duration,
+    pub observation_timeout: Duration,
+    pub valid_frame_ratio_min: f64,
     pub max_crc_ratio: f64,
+    pub alert_clear: Duration,
     pub max_source_bitrate_bps: u64,
     pub station_id_change_alert: bool,
     pub base_position_jump_m: f64,
@@ -52,8 +57,13 @@ impl Default for HubLimits {
 impl Default for HealthThresholds {
     fn default() -> Self {
         Self {
-            stale_after: Duration::from_secs(10),
+            enabled: true,
+            short_window: Duration::from_secs(10),
+            long_window: Duration::from_secs(60),
+            observation_timeout: Duration::from_secs(10),
+            valid_frame_ratio_min: 0.8,
             max_crc_ratio: 0.1,
+            alert_clear: Duration::from_secs(30),
             max_source_bitrate_bps: 2_000_000,
             station_id_change_alert: true,
             base_position_jump_m: 100.0,
@@ -76,14 +86,24 @@ struct SourceState {
     profile: Option<DataProfile>,
     packets: u64,
     bytes: u64,
+    started_at: Instant,
     last_packet: Option<Instant>,
     last_correction: Option<Instant>,
     samples: VecDeque<(Instant, u64)>,
+    quality_samples: VecDeque<QualitySample>,
     station_frame: Option<Arc<[u8]>>,
     history: VecDeque<StreamHistoryPoint>,
     validating: bool,
-    station_id_changed: bool,
-    base_position_jump: bool,
+    pending_warnings: u8,
+    latched_warnings: u8,
+    last_abnormal: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct QualitySample {
+    at: Instant,
+    valid_frames: u64,
+    crc_errors: u64,
 }
 
 pub struct SourceLease {
@@ -212,14 +232,17 @@ impl MountpointHub {
                 profile: None,
                 packets: 0,
                 bytes: 0,
+                started_at: Instant::now(),
                 last_packet: None,
                 last_correction: None,
                 samples: VecDeque::new(),
+                quality_samples: VecDeque::new(),
                 station_frame: None,
                 history,
                 validating,
-                station_id_changed: false,
-                base_position_jump: false,
+                pending_warnings: 0,
+                latched_warnings: 0,
+                last_abnormal: None,
             },
         );
         self.inner.source_revision.fetch_add(1, Ordering::AcqRel);
@@ -488,6 +511,12 @@ impl SourceLease {
                 return Err(HubError::SourceNotFound);
             }
             let now = Instant::now();
+            let thresholds = *self
+                .inner
+                .health
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sample_window = thresholds.short_window.max(Duration::from_secs(1));
             let recent_bytes = source
                 .samples
                 .iter()
@@ -495,11 +524,6 @@ impl SourceLease {
                 .map(|(_, bytes)| *bytes)
                 .sum::<u64>()
                 .saturating_add(packet.len() as u64);
-            let thresholds = *self
-                .inner
-                .health
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if recent_bytes.saturating_mul(8) > thresholds.max_source_bitrate_bps {
                 return Err(HubError::SourceBitrateExceeded);
             }
@@ -513,6 +537,9 @@ impl SourceLease {
                 source.station_frame = Some(frame);
             }
             source.samples.push_back((now, packet.len() as u64));
+            source
+                .samples
+                .retain(|(at, _)| now.duration_since(*at) <= sample_window);
             source.sender.clone()
         };
         let _ = sender.send(packet);
@@ -580,20 +607,33 @@ impl SourceLease {
                 && profile.station_id.is_some()
                 && previous.station_id != profile.station_id
             {
-                source.station_id_changed = true;
+                source.pending_warnings |= STATION_ID_CHANGED_WARNING;
             }
             if let (Some(previous), Some(current)) = (previous.position, profile.position)
                 && distance_m(previous, current) > thresholds.base_position_jump_m
             {
-                source.base_position_jump = true;
+                source.pending_warnings |= BASE_POSITION_JUMP_WARNING;
             }
+        }
+        let now = Instant::now();
+        source.quality_samples.push_back(QualitySample {
+            at: now,
+            valid_frames: profile.valid_frames,
+            crc_errors: profile.crc_errors,
+        });
+        trim_quality_samples(
+            &mut source.quality_samples,
+            now.checked_sub(thresholds.short_window).unwrap_or(now),
+        );
+        while source.quality_samples.len() > 4096 {
+            source.quality_samples.pop_front();
         }
         source.profile = Some(profile);
         Ok(())
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SourceHealth {
     pub packets: u64,
     pub bytes: u64,
@@ -601,6 +641,8 @@ pub struct SourceHealth {
     pub bitrate_bps: Option<u64>,
     pub warning_codes: u8,
     pub last_correction_age_seconds: Option<u64>,
+    pub valid_frame_ratio: Option<f64>,
+    pub crc_error_ratio: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -634,6 +676,7 @@ pub const NO_CORRECTION_WARNING: u8 = 4;
 pub const HIGH_BITRATE_WARNING: u8 = 8;
 pub const STATION_ID_CHANGED_WARNING: u8 = 16;
 pub const BASE_POSITION_JUMP_WARNING: u8 = 32;
+pub const LOW_VALID_FRAME_RATIO_WARNING: u8 = 64;
 
 fn compute_source_health(source: &mut SourceState, thresholds: HealthThresholds) -> SourceHealth {
     compute_source_health_at(source, thresholds, Instant::now())
@@ -644,9 +687,14 @@ fn compute_source_health_at(
     thresholds: HealthThresholds,
     now: Instant,
 ) -> SourceHealth {
+    let sample_window = thresholds.short_window.max(Duration::from_secs(1));
     source
         .samples
-        .retain(|(at, _)| now.duration_since(*at) <= Duration::from_secs(5));
+        .retain(|(at, _)| now.duration_since(*at) <= sample_window);
+    trim_quality_samples(
+        &mut source.quality_samples,
+        now.checked_sub(sample_window).unwrap_or(now),
+    );
     let window_bytes = source.samples.iter().map(|(_, bytes)| *bytes).sum::<u64>();
     let bitrate_bps = source.samples.front().and_then(|(first, _)| {
         let elapsed = now.duration_since(*first).as_secs_f64();
@@ -655,47 +703,92 @@ fn compute_source_health_at(
     let age_seconds = source
         .last_packet
         .map(|last| now.duration_since(last).as_secs());
-    let integrity_attempts = source
-        .profile
-        .as_ref()
-        .map(|profile| profile.valid_frames.saturating_add(profile.crc_errors))
-        .unwrap_or_default();
-    let crc_ratio = source
-        .profile
-        .as_ref()
-        .filter(|_| integrity_attempts > 0)
-        .map(|profile| profile.crc_errors as f64 / integrity_attempts as f64);
-    let mut warning_codes = 0_u8;
-    if age_seconds.is_none_or(|age| age > thresholds.stale_after.as_secs()) {
-        warning_codes |= NO_DATA_WARNING;
+    let (valid_frames, crc_errors) = quality_window(source, sample_window);
+    let integrity_attempts = valid_frames.saturating_add(crc_errors);
+    let valid_ratio =
+        (integrity_attempts > 0).then_some(valid_frames as f64 / integrity_attempts as f64);
+    let crc_ratio =
+        (integrity_attempts > 0).then_some(crc_errors as f64 / integrity_attempts as f64);
+    let mut current_warnings = source.pending_warnings;
+    source.pending_warnings = 0;
+    if thresholds.enabled {
+        if age_seconds.is_none_or(|age| age > thresholds.long_window.as_secs())
+            && now.duration_since(source.started_at) >= thresholds.long_window
+        {
+            current_warnings |= NO_DATA_WARNING;
+        }
+        if valid_ratio.is_some_and(|ratio| ratio < thresholds.valid_frame_ratio_min) {
+            current_warnings |= LOW_VALID_FRAME_RATIO_WARNING;
+        }
+        if crc_ratio.is_some_and(|ratio| ratio > thresholds.max_crc_ratio) {
+            current_warnings |= HIGH_CRC_WARNING;
+        }
+        if bitrate_bps.is_some_and(|bitrate| bitrate > thresholds.max_source_bitrate_bps) {
+            current_warnings |= HIGH_BITRATE_WARNING;
+        }
+        let correction_stale = source.last_correction.map_or_else(
+            || now.duration_since(source.started_at) >= thresholds.observation_timeout,
+            |last| now.duration_since(last) > thresholds.observation_timeout,
+        );
+        if correction_stale {
+            current_warnings |= NO_CORRECTION_WARNING;
+        }
     }
-    if crc_ratio.is_some_and(|ratio| ratio > thresholds.max_crc_ratio) {
-        warning_codes |= HIGH_CRC_WARNING;
-    }
-    if bitrate_bps.is_some_and(|bitrate| bitrate > thresholds.max_source_bitrate_bps) {
-        warning_codes |= HIGH_BITRATE_WARNING;
-    }
-    if source
-        .last_correction
-        .is_none_or(|last| now.duration_since(last) > thresholds.stale_after)
+    if !thresholds.enabled {
+        source.latched_warnings = 0;
+        source.last_abnormal = None;
+    } else if current_warnings != 0 {
+        source.latched_warnings |= current_warnings;
+        source.last_abnormal = Some(now);
+    } else if source
+        .last_abnormal
+        .is_none_or(|last| now.duration_since(last) >= thresholds.alert_clear)
     {
-        warning_codes |= NO_CORRECTION_WARNING;
-    }
-    if source.station_id_changed {
-        warning_codes |= STATION_ID_CHANGED_WARNING;
-    }
-    if source.base_position_jump {
-        warning_codes |= BASE_POSITION_JUMP_WARNING;
+        source.latched_warnings = 0;
     }
     SourceHealth {
         packets: source.packets,
         bytes: source.bytes,
         last_packet_age_seconds: age_seconds,
         bitrate_bps,
-        warning_codes,
+        warning_codes: source.latched_warnings,
         last_correction_age_seconds: source
             .last_correction
             .map(|last| now.duration_since(last).as_secs()),
+        valid_frame_ratio: valid_ratio,
+        crc_error_ratio: crc_ratio,
+    }
+}
+
+fn quality_window(source: &SourceState, window: Duration) -> (u64, u64) {
+    let Some(first) = source.quality_samples.front() else {
+        return source
+            .profile
+            .as_ref()
+            .map(|profile| (profile.valid_frames, profile.crc_errors))
+            .unwrap_or_default();
+    };
+    let Some(last) = source.quality_samples.back() else {
+        return (first.valid_frames, first.crc_errors);
+    };
+    let cutoff = source
+        .quality_samples
+        .back()
+        .map(|last| last.at)
+        .and_then(|at| at.checked_sub(window))
+        .unwrap_or(first.at);
+    if source.quality_samples.len() == 1 || first.at >= cutoff {
+        return (last.valid_frames, last.crc_errors);
+    }
+    (
+        last.valid_frames.saturating_sub(first.valid_frames),
+        last.crc_errors.saturating_sub(first.crc_errors),
+    )
+}
+
+fn trim_quality_samples(samples: &mut VecDeque<QualitySample>, cutoff: Instant) {
+    while samples.len() > 1 && samples.get(1).is_some_and(|sample| sample.at < cutoff) {
+        samples.pop_front();
     }
 }
 

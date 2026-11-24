@@ -73,6 +73,31 @@ async fn account_directory_writes_are_shared_watched_and_revision_checked() {
     watcher.shutdown().await;
 }
 
+#[tokio::test]
+async fn account_watcher_seeds_five_hundred_mountpoints_in_bounded_batches() {
+    let cluster = unique("account-large-seed");
+    let mounts = (0..500)
+        .map(|index| mountpoint(&format!("C{index:03}"), "owner-id"))
+        .collect::<Vec<_>>();
+    let seed =
+        AccountSnapshot::new([user("owner-id", "owner")], mounts).expect("large seed snapshot");
+    let watcher = AccountWatcher::start(connect().await, &cluster, seed)
+        .await
+        .expect("large account watcher");
+    let directory = watcher.directory();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if directory.snapshot().mountpoints().count() == 500 && directory.is_healthy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("large account seed");
+    watcher.shutdown().await;
+}
+
 async fn wait_for(
     directory: &rcaster_service::account_directory::AccountDirectory,
     predicate: impl Fn(&AccountSnapshot) -> bool,

@@ -241,7 +241,7 @@ impl SourceRecord {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 enum SourceState {
     #[serde(rename = "VALIDATING")]
     Validating,
@@ -571,6 +571,61 @@ pub async fn activate_source_for_connection_with_summary(
         .and_then([TxnOp::put(
             source_key,
             active,
+            Some(PutOptions::new().with_lease(source_kv.lease())),
+        )]);
+    if client.txn(transaction).await?.succeeded() {
+        Ok(())
+    } else {
+        Err(ClaimError::StaleClaim)
+    }
+}
+
+pub async fn update_source_str_for_connection(
+    client: &mut Client,
+    cluster_id: &str,
+    mountpoint: &str,
+    connection_id: &str,
+    runtime_epoch: &str,
+    str_record: &StrRecord,
+    admission: Option<SourceAdmissionSummary>,
+) -> Result<(), ClaimError> {
+    validate_identifier(cluster_id, "cluster ID")?;
+    validate_mountpoint(mountpoint)?;
+    let source_key = format!("/rcaster/{cluster_id}/runtime/sources/{mountpoint}");
+    let response = client.get(source_key.clone(), None).await?;
+    let source_kv = response
+        .kvs()
+        .first()
+        .cloned()
+        .ok_or(ClaimError::StaleClaim)?;
+    let mut record: SourceRecord = serde_json::from_slice(source_kv.value())?;
+    if record.mountpoint != mountpoint
+        || record.connection_id != connection_id
+        || record.runtime_epoch != runtime_epoch
+        || record.state != SourceState::Active
+    {
+        return Err(ClaimError::StaleClaim);
+    }
+    let mut str_record = str_record.clone();
+    str_record.mountpoint = mountpoint.to_owned();
+    record.str_record = str_record;
+    record.admission = admission;
+    let transaction = Txn::new()
+        .when([
+            Compare::mod_revision(
+                source_key.clone(),
+                CompareOp::Equal,
+                source_kv.mod_revision(),
+            ),
+            Compare::value(
+                source_key.clone(),
+                CompareOp::Equal,
+                source_kv.value().to_vec(),
+            ),
+        ])
+        .and_then([TxnOp::put(
+            source_key,
+            serde_json::to_vec(&record)?,
             Some(PutOptions::new().with_lease(source_kv.lease())),
         )]);
     if client.txn(transaction).await?.succeeded() {

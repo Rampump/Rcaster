@@ -5,6 +5,7 @@ use std::{
 };
 
 use rcaster_service::{
+    hub::HealthThresholds,
     proxy_protocol::ProxyProtocolConfig,
     session_limit::SessionLimitConfig,
     tls_reload::{
@@ -135,21 +136,28 @@ pub struct ProxyProtocolConfigFile {
     pub trusted_l4_cidrs: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct SourceHealthPolicyFile {
-    #[serde(default = "default_true")]
-    pub station_id_change_alert: bool,
-    #[serde(default = "default_base_position_jump_m")]
-    pub base_position_jump_m: f64,
-}
-
-impl Default for SourceHealthPolicyFile {
-    fn default() -> Self {
-        Self {
-            station_id_change_alert: true,
-            base_position_jump_m: 100.0,
-        }
-    }
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub short_window_s: Option<u64>,
+    #[serde(default)]
+    pub long_window_s: Option<u64>,
+    #[serde(default)]
+    pub observation_timeout_s: Option<u64>,
+    #[serde(default)]
+    pub valid_frame_ratio_min: Option<f64>,
+    #[serde(default)]
+    pub crc_error_ratio_max: Option<f64>,
+    #[serde(default)]
+    pub alert_clear_s: Option<u64>,
+    #[serde(default)]
+    pub station_id_change_alert: Option<bool>,
+    #[serde(default)]
+    pub base_position_jump_m: Option<f64>,
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -212,11 +220,25 @@ pub struct SourceAdmissionConfigFile {
     pub max_unknown_ratio: Option<f64>,
     #[serde(default)]
     pub min_observed_bytes: u64,
+    #[serde(default)]
+    pub str_refresh: SourceStrRefreshConfigFile,
     pub max_bytes: u64,
     pub max_frames: u64,
     pub timeout_ms: u64,
     #[serde(default = "default_source_read_timeout_ms")]
     pub read_timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SourceStrRefreshConfigFile {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for SourceStrRefreshConfigFile {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -417,6 +439,48 @@ impl StandaloneConfig {
         Ok(config)
     }
 
+    pub fn health_thresholds(&self) -> Result<HealthThresholds, ConfigError> {
+        let source_health = &self.source_health;
+        let legacy_stale_s = self.source_stale_after_ms.div_ceil(1000).max(1);
+        let short_window_s = source_health.short_window_s.unwrap_or(10);
+        let long_window_s = source_health.long_window_s.unwrap_or(60);
+        let observation_timeout_s = source_health
+            .observation_timeout_s
+            .unwrap_or(legacy_stale_s);
+        let valid_frame_ratio_min = source_health.valid_frame_ratio_min.unwrap_or(0.8);
+        let crc_error_ratio_max = source_health
+            .crc_error_ratio_max
+            .unwrap_or(self.source_max_crc_ratio);
+        let alert_clear_s = source_health.alert_clear_s.unwrap_or(30);
+        let base_position_jump_m = source_health.base_position_jump_m.unwrap_or(100.0);
+        let action = source_health.action.as_deref().unwrap_or("alert");
+        if short_window_s == 0
+            || long_window_s == 0
+            || short_window_s > long_window_s
+            || observation_timeout_s == 0
+            || !(0.0..=1.0).contains(&valid_frame_ratio_min)
+            || !(0.0..=1.0).contains(&crc_error_ratio_max)
+            || alert_clear_s == 0
+            || !base_position_jump_m.is_finite()
+            || base_position_jump_m <= 0.0
+            || action != "alert"
+        {
+            return Err(ConfigError::InvalidLimits);
+        }
+        Ok(HealthThresholds {
+            enabled: source_health.enabled.unwrap_or(true),
+            short_window: Duration::from_secs(short_window_s),
+            long_window: Duration::from_secs(long_window_s),
+            observation_timeout: Duration::from_secs(observation_timeout_s),
+            valid_frame_ratio_min,
+            max_crc_ratio: crc_error_ratio_max,
+            alert_clear: Duration::from_secs(alert_clear_s),
+            max_source_bitrate_bps: self.source_max_bitrate_bps,
+            station_id_change_alert: source_health.station_id_change_alert.unwrap_or(true),
+            base_position_jump_m,
+        })
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.bind.trim().is_empty() {
             return Err(ConfigError::InvalidBind);
@@ -513,8 +577,7 @@ impl StandaloneConfig {
             || self.source_stale_after_ms == 0
             || !(0.0..=1.0).contains(&self.source_max_crc_ratio)
             || self.source_max_bitrate_bps == 0
-            || !self.source_health.base_position_jump_m.is_finite()
-            || self.source_health.base_position_jump_m <= 0.0
+            || self.health_thresholds().is_err()
             || self.max_sources == 0
             || self.max_validating_sources == 0
             || self.validation_buffer_max_bytes == 0
@@ -853,10 +916,6 @@ fn default_source_max_crc_ratio() -> f64 {
 
 fn default_source_max_bitrate_bps() -> u64 {
     2_000_000
-}
-
-fn default_base_position_jump_m() -> f64 {
-    100.0
 }
 
 fn default_max_sources() -> usize {

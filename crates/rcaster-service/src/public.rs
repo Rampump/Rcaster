@@ -930,6 +930,8 @@ async fn monitor_snapshot(state: &PublicState, mountpoint: &str) -> Option<(Opti
             "bitrate_bps": health.and_then(|health| health.bitrate_bps),
             "last_packet_age_seconds": health.and_then(|health| health.last_packet_age_seconds),
             "stream_health_warning": health.is_some_and(|health| health.warning_codes != 0),
+            "valid_frame_ratio": health.and_then(|health| health.valid_frame_ratio),
+            "crc_error_ratio": health.and_then(|health| health.crc_error_ratio),
         }),
     ))
 }

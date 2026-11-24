@@ -105,8 +105,8 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
         ntrip1_upload_password_hash: None,
         advertise: true,
         region: Some("east".to_owned()),
-        latitude: Some(31.2),
-        longitude: Some(121.4),
+        latitude: None,
+        longitude: None,
         coverage_radius_m: Some(30_000.0),
         str_fields: Some(MountpointStrConfig {
             identifier: Some("Configured Farm".to_owned()),
@@ -171,6 +171,7 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
                 max_frames: 8,
                 timeout: Duration::from_millis(150),
                 read_timeout: Duration::from_secs(2),
+                str_refresh: true,
             }),
             near: None,
             accounts: Some(accounts),
@@ -190,21 +191,18 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
         .await
         .expect("source request");
     assert_eq!(read_http_head(&mut source).await, b"ICY 200 OK\r\n\r\n");
-    if let Some(capture) = std::env::var_os("RCASTER_SERIAL_CAPTURE") {
+    let capture = std::env::var_os("RCASTER_SERIAL_CAPTURE");
+    if let Some(capture) = &capture {
         let capture = fs::read(capture).expect("read serial capture");
         source.write_all(&capture).await.expect("serial capture");
     } else {
-        source
-            .write_all(&decode_hex(RTCM3_1005))
-            .await
-            .expect("position frame");
         source
             .write_all(&synthetic_rtcm3(1074))
             .await
             .expect("MSM frame");
     }
 
-    let value = tokio::time::timeout(Duration::from_secs(3), async {
+    let mut value = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let record = admin
                 .get(format!("/rcaster/{cluster}/runtime/sources/C66"), None)
@@ -222,6 +220,45 @@ async fn uploaded_rtcm3_generates_active_etcd_str_record() {
     })
     .await
     .expect("etcd STR record");
+
+    if capture.is_none() {
+        assert_eq!(value["str"]["latitude"], "0");
+        assert_eq!(value["str"]["longitude"], "0");
+        assert!(
+            value["str"]["format_details"]
+                .as_str()
+                .is_some_and(|details| details.contains("1074") && !details.contains("1005"))
+        );
+        source
+            .write_all(&decode_hex(RTCM3_1005))
+            .await
+            .expect("late position frame");
+        let refreshed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let record = admin
+                    .get(format!("/rcaster/{cluster}/runtime/sources/C66"), None)
+                    .await
+                    .expect("read refreshed runtime source");
+                if let Some(record) = record.kvs().first() {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(record.value()).expect("refreshed JSON");
+                    if value["str"]["latitude"] != "0"
+                        && value["str"]["format_details"]
+                            .as_str()
+                            .is_some_and(|details| details.contains("1005"))
+                    {
+                        break value;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("refreshed etcd STR");
+        assert_ne!(refreshed["str"]["latitude"], "0");
+        assert_ne!(refreshed["str"]["longitude"], "0");
+        value = refreshed;
+    }
 
     assert_eq!(value["mountpoint"], "C66");
     assert_eq!(value["caster_id"], "caster-etcd-str");
@@ -703,6 +740,7 @@ async fn rejected_source_sets_cluster_cooldown_for_reconnect() {
                 max_frames: 8,
                 timeout: Duration::from_secs(1),
                 read_timeout: Duration::from_secs(1),
+                str_refresh: true,
             }),
             near: None,
             accounts: None,
@@ -959,6 +997,7 @@ async fn start_cluster_listener(
                 max_frames: 8,
                 timeout: Duration::from_millis(150),
                 read_timeout: Duration::from_secs(2),
+                str_refresh: true,
             }),
             near: None,
             accounts: Some(accounts),

@@ -209,6 +209,8 @@ pub struct ProtocolDemux {
     rtcm2_tail: Option<u8>,
 }
 
+const MAX_PENDING_BYTES: usize = 8192;
+
 impl ProtocolDemux {
     pub fn new() -> Self {
         Self {
@@ -220,6 +222,10 @@ impl ProtocolDemux {
 
     pub fn profile(&self) -> &DataProfile {
         &self.profile
+    }
+
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffer.len()
     }
 
     pub fn push(&mut self, input: &[u8]) -> Vec<Frame> {
@@ -409,7 +415,17 @@ impl ProtocolDemux {
                 },
             }
         }
+        self.trim_pending_tail();
         frames
+    }
+
+    fn trim_pending_tail(&mut self) {
+        let excess = self.buffer.len().saturating_sub(MAX_PENDING_BYTES);
+        if excess == 0 {
+            return;
+        }
+        self.profile.unknown_bytes = self.profile.unknown_bytes.saturating_add(excess as u64);
+        self.drain_prefix(excess);
     }
 
     fn drain_prefix(&mut self, length: usize) -> Vec<u8> {

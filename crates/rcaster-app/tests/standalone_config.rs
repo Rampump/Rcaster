@@ -46,6 +46,12 @@ fn loads_config_defaults_and_resolves_account_database_relative_to_config() {
     assert_eq!(config.standalone_backup_retention, 168);
     assert!(!config.client_auth_require_tls);
     assert!(!config.source_auth_require_tls);
+    let health = config.health_thresholds().expect("health thresholds");
+    assert!(health.enabled);
+    assert_eq!(health.short_window.as_secs(), 10);
+    assert_eq!(health.long_window.as_secs(), 60);
+    assert_eq!(health.valid_frame_ratio_min, 0.8);
+    assert_eq!(health.alert_clear.as_secs(), 30);
 }
 
 #[test]
@@ -143,6 +149,67 @@ fn loads_and_validates_near_resource_limits() {
     assert!(matches!(
         StandaloneConfig::load(&path),
         Err(ConfigError::InvalidSourceAdmission)
+    ));
+}
+
+#[test]
+fn loads_and_validates_source_health_windows() {
+    let directory = TempDirectory::new();
+    let path = directory.path().join("caster.json");
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "account_db": "accounts.redb",
+            "client_auth_require_tls": false,
+            "source_auth_require_tls": false,
+            "source_health": {
+                "enabled": true,
+                "short_window_s": 5,
+                "long_window_s": 30,
+                "observation_timeout_s": 20,
+                "valid_frame_ratio_min": 0.9,
+                "crc_error_ratio_max": 0.05,
+                "alert_clear_s": 15,
+                "station_id_change_alert": false,
+                "base_position_jump_m": 50,
+                "action": "alert"
+            }
+        }"#,
+    )
+    .expect("write source health config");
+    let thresholds = StandaloneConfig::load(&path)
+        .expect("load source health config")
+        .health_thresholds()
+        .expect("source health thresholds");
+    assert!(thresholds.enabled);
+    assert_eq!(thresholds.short_window.as_secs(), 5);
+    assert_eq!(thresholds.long_window.as_secs(), 30);
+    assert_eq!(thresholds.observation_timeout.as_secs(), 20);
+    assert_eq!(thresholds.valid_frame_ratio_min, 0.9);
+    assert_eq!(thresholds.max_crc_ratio, 0.05);
+    assert_eq!(thresholds.alert_clear.as_secs(), 15);
+    assert!(!thresholds.station_id_change_alert);
+    assert_eq!(thresholds.base_position_jump_m, 50.0);
+
+    fs::write(
+        &path,
+        r#"{
+            "bind": "127.0.0.1:2101",
+            "account_db": "accounts.redb",
+            "client_auth_require_tls": false,
+            "source_auth_require_tls": false,
+            "source_health": {
+                "short_window_s": 60,
+                "long_window_s": 10,
+                "action": "disconnect"
+            }
+        }"#,
+    )
+    .expect("write invalid source health config");
+    assert!(matches!(
+        StandaloneConfig::load(&path),
+        Err(ConfigError::InvalidLimits)
     ));
 }
 
@@ -516,6 +583,7 @@ fn loads_msm_version_restrictions() {
                     "restrict_versions": true,
                     "allowed_versions": [4, 7]
                 },
+                "str_refresh": { "enabled": false },
                 "min_valid_frames": 1,
                 "max_bytes": 65536,
                 "max_frames": 512,
@@ -526,9 +594,11 @@ fn loads_msm_version_restrictions() {
     .expect("write MSM config");
 
     let config = StandaloneConfig::load(&path).expect("load MSM config");
-    let msm = config.source_admission.expect("source admission").msm;
+    let admission = config.source_admission.expect("source admission");
+    let msm = admission.msm;
     assert!(msm.restrict_versions);
     assert_eq!(msm.allowed_versions, vec![4, 7]);
+    assert!(!admission.str_refresh.enabled);
 }
 
 #[test]

@@ -6,7 +6,8 @@ use rcaster_core::{
 };
 use rcaster_service::hub::{
     BASE_POSITION_JUMP_WARNING, HIGH_CRC_WARNING, HealthThresholds, HubError, HubLimits,
-    MountpointHub, NO_CORRECTION_WARNING, STATION_ID_CHANGED_WARNING,
+    LOW_VALID_FRAME_RATIO_WARNING, MountpointHub, NO_CORRECTION_WARNING,
+    STATION_ID_CHANGED_WARNING,
 };
 
 #[tokio::test]
@@ -24,13 +25,37 @@ async fn one_source_fans_out_shared_packets_to_subscribers() {
     assert_eq!(health.bytes, 4);
     assert_eq!(health.last_packet_age_seconds, Some(0));
     assert_eq!(health.bitrate_bps, None);
-    assert_eq!(health.warning_codes, NO_CORRECTION_WARNING);
+    assert_eq!(health.warning_codes, 0);
     assert_eq!(health.last_correction_age_seconds, None);
 
     let first_packet = first.recv().await.expect("first packet");
     let second_packet = second.recv().await.expect("second packet");
     assert!(Arc::ptr_eq(&packet, &first_packet));
     assert!(Arc::ptr_eq(&packet, &second_packet));
+}
+
+#[tokio::test]
+async fn source_health_waits_for_observation_timeout() {
+    let hub = MountpointHub::new_with_health(
+        16,
+        HealthThresholds {
+            observation_timeout: std::time::Duration::from_millis(30),
+            ..HealthThresholds::default()
+        },
+    )
+    .expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    assert_eq!(
+        hub.source_health("C63").expect("health").warning_codes & NO_CORRECTION_WARNING,
+        0
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        hub.source_health("C63").expect("health").warning_codes & NO_CORRECTION_WARNING,
+        NO_CORRECTION_WARNING
+    );
 }
 
 #[tokio::test]
@@ -157,7 +182,9 @@ async fn source_health_warns_on_high_crc_ratio() {
             ..DataProfile::default()
         })
         .expect("profile");
-    source.publish(Arc::from([1_u8])).expect("packet");
+    source
+        .publish_correction(Arc::from([1_u8]))
+        .expect("packet");
 
     assert_eq!(
         hub.source_health("C63").expect("health").warning_codes & HIGH_CRC_WARNING,
@@ -165,16 +192,15 @@ async fn source_health_warns_on_high_crc_ratio() {
     );
 }
 
-#[test]
-fn source_health_uses_configured_crc_threshold() {
+#[tokio::test]
+async fn source_health_uses_configured_crc_threshold() {
     let hub = MountpointHub::new_with_health(
         16,
         HealthThresholds {
-            stale_after: std::time::Duration::from_secs(10),
             max_crc_ratio: 0.4,
-            max_source_bitrate_bps: 2_000_000,
-            station_id_change_alert: true,
-            base_position_jump_m: 100.0,
+            valid_frame_ratio_min: 0.0,
+            alert_clear: std::time::Duration::from_millis(10),
+            ..HealthThresholds::default()
         },
     )
     .expect("hub");
@@ -187,7 +213,9 @@ fn source_health_uses_configured_crc_threshold() {
             ..DataProfile::default()
         })
         .expect("profile");
-    source.publish(Arc::from([1_u8])).expect("packet");
+    source
+        .publish_correction(Arc::from([1_u8]))
+        .expect("packet");
 
     assert_eq!(
         hub.source_health("C63").expect("health").warning_codes & HIGH_CRC_WARNING,
@@ -195,12 +223,12 @@ fn source_health_uses_configured_crc_threshold() {
     );
 
     hub.set_health_thresholds(HealthThresholds {
-        stale_after: std::time::Duration::from_secs(10),
         max_crc_ratio: 0.75,
-        max_source_bitrate_bps: 2_000_000,
-        station_id_change_alert: true,
-        base_position_jump_m: 100.0,
+        valid_frame_ratio_min: 0.0,
+        alert_clear: std::time::Duration::from_millis(10),
+        ..HealthThresholds::default()
     });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(
         hub.source_health("C63").expect("health").warning_codes & HIGH_CRC_WARNING,
         0
@@ -260,15 +288,107 @@ fn source_health_warns_when_base_position_jumps() {
 }
 
 #[test]
+fn source_health_warns_on_low_valid_frame_ratio() {
+    let hub = MountpointHub::new(16).expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            valid_frames: 1,
+            crc_errors: 3,
+            ..DataProfile::default()
+        })
+        .expect("profile");
+    source
+        .publish_correction(Arc::from([1_u8]))
+        .expect("packet");
+
+    let health = hub.source_health("C63").expect("health");
+    assert_eq!(
+        health.warning_codes & LOW_VALID_FRAME_RATIO_WARNING,
+        LOW_VALID_FRAME_RATIO_WARNING
+    );
+    assert_eq!(health.valid_frame_ratio, Some(0.25));
+}
+
+#[tokio::test]
+async fn source_health_clears_after_configured_stable_period() {
+    let hub = MountpointHub::new_with_health(
+        16,
+        HealthThresholds {
+            alert_clear: std::time::Duration::from_millis(50),
+            ..HealthThresholds::default()
+        },
+    )
+    .expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1001),
+            ..DataProfile::default()
+        })
+        .expect("first profile");
+    source
+        .set_profile(DataProfile {
+            station_id: Some(1002),
+            ..DataProfile::default()
+        })
+        .expect("changed profile");
+    source
+        .publish_correction(Arc::from([1_u8]))
+        .expect("correction");
+    assert_eq!(
+        hub.source_health("C63").expect("health").warning_codes & STATION_ID_CHANGED_WARNING,
+        STATION_ID_CHANGED_WARNING
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    source
+        .publish_correction(Arc::from([2_u8]))
+        .expect("normal correction");
+    assert_eq!(
+        hub.source_health("C63").expect("health").warning_codes & STATION_ID_CHANGED_WARNING,
+        0
+    );
+}
+
+#[test]
+fn disabled_source_health_keeps_metrics_without_warnings() {
+    let hub = MountpointHub::new_with_health(
+        16,
+        HealthThresholds {
+            enabled: false,
+            ..HealthThresholds::default()
+        },
+    )
+    .expect("hub");
+    let source = hub.claim_source("C63").expect("source");
+    activate(&source);
+    source
+        .set_profile(DataProfile {
+            valid_frames: 1,
+            crc_errors: 5,
+            ..DataProfile::default()
+        })
+        .expect("profile");
+    source
+        .publish_correction(Arc::from([1_u8]))
+        .expect("packet");
+
+    let health = hub.source_health("C63").expect("health");
+    assert_eq!(health.warning_codes, 0);
+    assert_eq!(health.packets, 1);
+    assert_eq!(health.valid_frame_ratio, Some(1.0 / 6.0));
+}
+
+#[test]
 fn source_bitrate_limit_rejects_excess_data() {
     let hub = MountpointHub::new_with_health(
         16,
         HealthThresholds {
-            stale_after: std::time::Duration::from_secs(10),
-            max_crc_ratio: 0.1,
             max_source_bitrate_bps: 8,
-            station_id_change_alert: true,
-            base_position_jump_m: 100.0,
+            ..HealthThresholds::default()
         },
     )
     .expect("hub");

@@ -10,6 +10,7 @@ pub struct SourceAdmissionConfig {
     pub max_frames: u64,
     pub timeout: Duration,
     pub read_timeout: Duration,
+    pub str_refresh: bool,
 }
 
 pub struct SourceAdmissionWindow {
