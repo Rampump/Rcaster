@@ -33,7 +33,7 @@ enum Slot {
     B,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct SlotState {
     current: Slot,
     previous: Option<Slot>,
@@ -340,15 +340,20 @@ impl Updater {
     async fn start_child(&mut self) -> UpdaterResult<()> {
         self.stop_child().await;
         let state = self.read_state();
-        let program = [
+        let (selected, program) = [
             state.current,
             state.previous.unwrap_or(Slot::Initial),
             Slot::Initial,
         ]
         .into_iter()
-        .map(|slot| self.slot_program(slot))
-        .find(|program| program.is_file())
+        .find_map(|slot| {
+            let program = self.slot_program(slot);
+            program.is_file().then_some((slot, program))
+        })
         .ok_or("no service program is available")?;
+        if state.current != selected {
+            self.write_slot_state(&repaired_slot_state(state, selected))?;
+        }
         if !program.is_file() {
             return Err(format!("service program {} does not exist", program.display()).into());
         }
@@ -512,6 +517,15 @@ fn inactive_slot(current: Slot) -> Slot {
     }
 }
 
+fn repaired_slot_state(mut state: SlotState, selected: Slot) -> SlotState {
+    if state.current != selected {
+        let missing = state.current;
+        state.current = selected;
+        state.previous = Some(missing);
+    }
+    state
+}
+
 fn terminal_upgrade_state(state: &Value) -> bool {
     matches!(
         state["status"].as_str(),
@@ -636,8 +650,9 @@ mod tests {
     };
 
     use super::{
-        Slot, Updater, connect_etcd, download_artifact, ensure_staging_space, inactive_slot,
-        probe_health, request_graceful_stop, terminal_upgrade_state,
+        Slot, SlotState, Updater, connect_etcd, download_artifact, ensure_staging_space,
+        inactive_slot, probe_health, repaired_slot_state, request_graceful_stop,
+        terminal_upgrade_state,
     };
     use crate::config::UpdaterConfig;
     use rcaster_service::upgrade::UpgradePolicy;
@@ -647,6 +662,28 @@ mod tests {
         assert_eq!(inactive_slot(Slot::Initial), Slot::A);
         assert_eq!(inactive_slot(Slot::A), Slot::B);
         assert_eq!(inactive_slot(Slot::B), Slot::A);
+    }
+
+    #[test]
+    fn fallback_slot_repairs_persisted_state() {
+        let repaired = repaired_slot_state(
+            SlotState {
+                current: Slot::A,
+                previous: Some(Slot::B),
+            },
+            Slot::B,
+        );
+        assert_eq!(repaired.current, Slot::B);
+        assert_eq!(repaired.previous, Some(Slot::A));
+        let unchanged = repaired_slot_state(
+            SlotState {
+                current: Slot::Initial,
+                previous: None,
+            },
+            Slot::Initial,
+        );
+        assert_eq!(unchanged.current, Slot::Initial);
+        assert_eq!(unchanged.previous, None);
     }
 
     #[test]
