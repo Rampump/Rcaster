@@ -43,6 +43,12 @@ Implementation progress:
 - Browser evidence:
   `tools/web-e2e/runs/20261126-015017/result.json`; admin and public pages
   have no horizontal overflow at 390×844.
+- Finding 12 is partially fixed and finding 16 is partially fixed by commit
+  `ce9e785`: STR/source-expectation JSON now validates before submit, all batch
+  action types and operation Cancel/Retry controls are present; config diff and
+  upgrade mutation controls remain.
+- Browser evidence:
+  `tools/web-e2e/runs/20261126-015339/result.json`.
 
 ## Coverage map
 
@@ -134,7 +140,7 @@ Implementation progress:
     - **Fix:** Add required/paired-field checks, JSON parse feedback and a summary of affected sessions/sources before disabling/deleting. Keep the server validation.
     - **If we skip it:** Users discover basic errors late and cannot see the impact before a destructive action.
 
-12. **Raw JSON fields are too risky for routine administration** (`crates/rcaster-service/src/admin.rs:4113`, `crates/rcaster-service/src/admin.rs:4121`)
+12. **[Partially fixed] Raw JSON fields are too risky for routine administration** (`crates/rcaster-service/src/admin.rs:4113`, `crates/rcaster-service/src/admin.rs:4121`)
     - **What this is:** STR fields, source expectations and the full caster config are edited as JSON.
     - **Problem:** One missing quote or comma loses the edit context and yields a raw parse error. There is no schema example, format button or diff before Apply.
     - **Fix:** Add JSON validation on blur, collapsible field help/examples, and a read-only diff preview before applying config.
@@ -158,7 +164,7 @@ Implementation progress:
     - **Fix:** Track last-success time, show “Data stale” without hiding the current view, add bounded retry/backoff, and test offline → online recovery.
     - **If we skip it:** Operators may mistake old state for current state.
 
-16. **Batch operation and upgrade UI cover only part of the backend** (`crates/rcaster-service/src/admin.rs:4123`)
+16. **[Partially fixed] Batch operation and upgrade UI cover only part of the backend** (`crates/rcaster-service/src/admin.rs:4123`)
     - **What it is:** The batch selector exposes only `users.disable` and `sessions.drop`; operation lookup has no Cancel/Retry; upgrade UI is lookup-only.
     - **Problem:** Backend actions for user delete, mountpoint disable, owner change, cancel, retry, approve and rollback cannot be exercised through the browser.
     - **Fix:** Add controls in the same existing sections and browser tests for each action’s preview, permission and failure states.
