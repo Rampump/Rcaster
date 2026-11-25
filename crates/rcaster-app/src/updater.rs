@@ -158,7 +158,10 @@ impl Updater {
             return Err("upgrade command action is invalid".into());
         }
         let caster_id = self.config.caster_id.clone();
-        if self.command_has_state(operation_id, &caster_id).await? {
+        if self
+            .command_has_terminal_state(operation_id, &caster_id)
+            .await?
+        {
             return Ok(());
         }
         if !self
@@ -228,7 +231,7 @@ impl Updater {
         Ok(())
     }
 
-    async fn command_has_state(
+    async fn command_has_terminal_state(
         &mut self,
         operation_id: &str,
         caster_id: &str,
@@ -237,7 +240,14 @@ impl Updater {
             "/rcaster/{}/runtime/upgrade-states/{operation_id}/{caster_id}",
             self.config.cluster_id
         );
-        Ok(!self.client.get(key, None).await?.kvs().is_empty())
+        Ok(self
+            .client
+            .get(key, None)
+            .await?
+            .kvs()
+            .first()
+            .and_then(|value| serde_json::from_slice::<Value>(value.value()).ok())
+            .is_some_and(|state| terminal_upgrade_state(&state)))
     }
 
     async fn stage_artifact(
@@ -484,6 +494,13 @@ fn inactive_slot(current: Slot) -> Slot {
     }
 }
 
+fn terminal_upgrade_state(state: &Value) -> bool {
+    matches!(
+        state["status"].as_str(),
+        Some("APPLIED" | "FAILED" | "ROLLED_BACK")
+    )
+}
+
 fn download_artifact(url: &str, path: &Path, expected_size: u64) -> UpdaterResult<()> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
@@ -562,13 +579,33 @@ mod tests {
         time::Duration,
     };
 
-    use super::{Slot, download_artifact, inactive_slot, probe_health, request_graceful_stop};
+    use super::{
+        Slot, download_artifact, inactive_slot, probe_health, request_graceful_stop,
+        terminal_upgrade_state,
+    };
 
     #[test]
     fn alternates_between_two_slots() {
         assert_eq!(inactive_slot(Slot::Initial), Slot::A);
         assert_eq!(inactive_slot(Slot::A), Slot::B);
         assert_eq!(inactive_slot(Slot::B), Slot::A);
+    }
+
+    #[test]
+    fn only_updater_completion_states_suppress_command_replay() {
+        assert!(!terminal_upgrade_state(
+            &serde_json::json!({"status":"DRAINING"})
+        ));
+        assert!(terminal_upgrade_state(
+            &serde_json::json!({"status":"APPLIED"})
+        ));
+        assert!(terminal_upgrade_state(
+            &serde_json::json!({"status":"FAILED"})
+        ));
+        assert!(terminal_upgrade_state(
+            &serde_json::json!({"status":"ROLLED_BACK"})
+        ));
+        assert!(!terminal_upgrade_state(&serde_json::json!({})));
     }
 
     #[tokio::test]
