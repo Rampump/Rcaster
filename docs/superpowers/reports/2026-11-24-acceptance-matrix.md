@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`5f66852` (committed locally, not pushed or deployed)
+`cb015d3` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -39,9 +39,9 @@ not be described as final production acceptance.
 | 18.8 STR lifecycle | Verified | NTRIP, source-fencing, cluster-runtime and public API tests cover VALIDATING visibility, ACTIVE publication, private filtering, source generation changes, remote owner routing and removal. `second_caster_serves_cached_etcd_str_without_local_source` proves Caster B serves its locally cached source table without owning the source. A late-position test proves 1005/1006 and format details refresh the existing ACTIVE etcd STR in place when they arrive after initial MSM admission. | Confirm the final soak sources disappear and public/private source tables converge after cleanup. |
 | 18.9 etcd Watch | Verified | Config, blacklist, source and account watch tests cover snapshot-before-watch, incremental updates, compaction/reconnect, silent-stall detection, leader failure and full-quorum recovery. The two-Caster STR test confirms etcd changes converge into the edge source cache and are served locally. Account seeding now caps transaction operations and is covered with 500 mountpoints. | Final soak exit check should confirm no watch-related warnings and the expected cleaned key set. |
 | 18.10 Ownership and reconnect | Verified | Automated tests cover owner-only writes, runtime epoch changes, source generation fencing, lease expiry, stale cache replacement and old-connection rejection. | Repeat a post-window orphan-key and source/session count audit. |
-| 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download and slot switching. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
+| 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download, slot switching, and SIGTERM-before-drain with KILL fallback. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
-| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` uses top-level server TLS, and standalone public sessions/tickets now use bounded in-process state instead of requiring etcd. Headless Chromium validation covers standalone admin login/filter/health/history/config/operation UI and public map/login/ticket/WebSocket, plus a clustered etcd/mTLS admin configuration check and public login/ticket/WebSocket path. The browser run had no unexpected console or network errors. | Public web is not exposed on the protected test deployment (`public_bind=null`); external DNS/LB, production tile service, large-map behavior and production monitor load remain unverified. |
+| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` uses top-level server TLS, and standalone public sessions/tickets now use bounded in-process state instead of requiring etcd. Headless Chromium validation covers both standalone and clustered admin login, user and mountpoint create/update/disable/delete, health/history/config/operation UI, source filtering, public map/login/ticket/WebSocket, user-disable client disconnect, live session drop and source disconnect. The browser run had no unexpected console or network errors. | Public web is not exposed on the protected test deployment (`public_bind=null`); external DNS/LB, production tile service, large-map behavior and production monitor load remain unverified. |
 
 ## Operational Completeness Follow-up
 
@@ -76,7 +76,7 @@ Final current-tree verification on 2026-11-25:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `49854056127AB4462CC8937504780DB1DCAC022205406E6EAF760CD04092E103`.
+  `979DACD7E6E496E608A79254CECE381F64FED504934B2A53762887AF97AAF57D`.
 - The full ignored integration suite was rerun after the source lifecycle
   changes. One initial leader-failover attempt hit a temporary etcd startup
   race; the failing test then passed alone and the complete ignored suite
@@ -91,7 +91,7 @@ Final current-tree verification on 2026-11-25:
   all L2a static/boundary/hysteresis/switch/rate/jump/HDOP/TTL/failover/
   no-alternative-timeout/concurrency checks, and the 1,301-source / 50
   non-station-query L2b sample pass.
-- Browser validation: `tools/web-e2e/runs/20261125-033259/result.json`.
+- Browser validation: `tools/web-e2e/runs/20261125-225607/result.json`.
   Standalone admin/public browser flows and clustered etcd/mTLS/public flows
   pass with no unexpected console or network failures.
 

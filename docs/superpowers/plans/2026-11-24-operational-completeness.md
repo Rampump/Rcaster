@@ -103,6 +103,9 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 - [x] Start an isolated local standalone and clustered test instance.
 - [x] Exercise admin login, source filtering, health, history, config and
   operation lookup.
+- [x] Exercise user and mountpoint create/update/disable/delete.
+- [x] Exercise live user-disable disconnect, session drop and source
+  disconnect against real NTRIP sockets.
 - [x] Exercise public directory, map, login, ticket and monitor WebSocket.
 - [x] Capture console errors and failed network requests.
 - [x] Keep the test independent of the soak deployment.
