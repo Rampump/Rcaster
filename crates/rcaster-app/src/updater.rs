@@ -141,6 +141,9 @@ impl Updater {
             return Err("upgrade command action is invalid".into());
         }
         let caster_id = self.config.caster_id.clone();
+        if self.command_has_state(operation_id, &caster_id).await? {
+            return Ok(());
+        }
         if !self
             .command_is_active(operation_id, action, &caster_id)
             .await
@@ -206,6 +209,18 @@ impl Updater {
         }
         eprintln!("rcaster-updater: {error}");
         Ok(())
+    }
+
+    async fn command_has_state(
+        &mut self,
+        operation_id: &str,
+        caster_id: &str,
+    ) -> UpdaterResult<bool> {
+        let key = format!(
+            "/rcaster/{}/runtime/upgrade-states/{operation_id}/{caster_id}",
+            self.config.cluster_id
+        );
+        Ok(!self.client.get(key, None).await?.kvs().is_empty())
     }
 
     async fn stage_artifact(
