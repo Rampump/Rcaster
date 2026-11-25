@@ -398,15 +398,13 @@ pub async fn list_api_tokens(
     directory: &AccountDirectory,
 ) -> Result<Vec<ApiTokenView>, AdminAuthError> {
     if !directory.is_clustered() {
+        let now = unix_time();
+        directory.local_expired_api_tokens_delete(now).await?;
         let mut tokens = directory
             .local_api_tokens()
             .await?
             .into_iter()
-            .filter(|(token, _)| {
-                token
-                    .expires_at
-                    .is_none_or(|expires_at| expires_at > unix_time())
-            })
+            .filter(|(token, _)| token.expires_at.is_none_or(|expires_at| expires_at > now))
             .map(|(token, last_used_at)| ApiTokenView {
                 token_id: token.token_id,
                 name: token.name,
@@ -567,6 +565,9 @@ async fn authenticate_api_token(
         .expires_at
         .is_some_and(|expires_at| expires_at <= unix_time())
     {
+        if !directory.is_clustered() {
+            let _ = directory.local_api_token_delete(&token.token_id).await;
+        }
         return Err(AdminAuthError::Invalid);
     }
     if !verify_secret_hash(token.token_hash, secret.to_owned()).await? {

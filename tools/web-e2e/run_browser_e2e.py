@@ -313,6 +313,8 @@ def exercise_admin_mutations(
         "document.getElementById('user-password').value='user-secret';"
         "document.getElementById('user-role').value='user';"
         "document.getElementById('user-enabled').checked=true;"
+        "document.getElementById('user-ntrip-enabled').checked=true;"
+        "document.getElementById('user-web-enabled').checked=false;"
         "return saveUser();"
         "})()"
     )
@@ -324,6 +326,17 @@ def exercise_admin_mutations(
     page.wait_for(
         "document.getElementById('users').textContent.includes('browser-user')"
     )
+    checks["user_scope_flags"] = page.evaluate(
+        "fetch('/admin/v1/users/browser-user')"
+        ".then(response=>response.json())"
+        ".then(result=>({ntrip_enabled:result.user.ntrip_enabled,"
+        "web_enabled:result.user.web_enabled}))"
+    )
+    if checks["user_scope_flags"] != {
+        "ntrip_enabled": True,
+        "web_enabled": False,
+    }:
+        raise RuntimeError(f"user scope flags failed: {checks['user_scope_flags']}")
     checks["user_create"] = True
 
     if clustered:
@@ -371,6 +384,7 @@ def exercise_admin_mutations(
         ".find(row=>row.textContent.includes('browser-user'));"
         "row.querySelectorAll('button')[0].click();"
         "document.getElementById('user-enabled').checked=true;"
+        "document.getElementById('user-web-enabled').checked=true;"
         "return saveUser();"
         "})()"
     )
@@ -378,6 +392,20 @@ def exercise_admin_mutations(
         "document.getElementById('users').textContent"
         ".includes('browser-userusertrue')"
     )
+    checks["user_scope_flags_update"] = page.evaluate(
+        "fetch('/admin/v1/users/browser-user')"
+        ".then(response=>response.json())"
+        ".then(result=>({ntrip_enabled:result.user.ntrip_enabled,"
+        "web_enabled:result.user.web_enabled}))"
+    )
+    if checks["user_scope_flags_update"] != {
+        "ntrip_enabled": True,
+        "web_enabled": True,
+    }:
+        raise RuntimeError(
+            f"user scope flags update failed: "
+            f"{checks['user_scope_flags_update']}"
+        )
 
     page.evaluate(
         "(() => {"
@@ -386,6 +414,14 @@ def exercise_admin_mutations(
         "document.getElementById('mount-owner').value='browser-user';"
         "document.getElementById('mount-password').value='upload-secret';"
         "document.getElementById('mount-region').value='e2e';"
+        "document.getElementById('mount-latitude').value='31.2';"
+        "document.getElementById('mount-longitude').value='121.4';"
+        "document.getElementById('mount-radius').value='25000';"
+        "document.getElementById('mount-str-fields').value="
+        "JSON.stringify({identifier:'Browser Farm',network:'RCaster-E2E',"
+        "country:'CHN',carrier:'2',navigation_system:'GPS+GLO'});"
+        "document.getElementById('mount-source-expectation').value="
+        "JSON.stringify({formats:['rtcm3'],msm_versions:[4]});"
         "document.getElementById('mount-enabled').checked=true;"
         "document.getElementById('mount-advertise').checked=true;"
         "return saveMount();"
@@ -394,6 +430,30 @@ def exercise_admin_mutations(
     page.wait_for(
         "document.getElementById('mountpoints').textContent.includes('TMP1')"
     )
+    checks["mountpoint_metadata_create"] = page.evaluate(
+        "fetch('/admin/v1/mountpoints/TMP1')"
+        ".then(response=>response.json())"
+        ".then(result=>({latitude:result.mountpoint.latitude,"
+        "longitude:result.mountpoint.longitude,"
+        "coverage_radius_m:result.mountpoint.coverage_radius_m,"
+        "identifier:result.mountpoint.str_fields.identifier,"
+        "network:result.mountpoint.str_fields.network,"
+        "format:result.mountpoint.source_expectation.formats[0],"
+        "msm_version:result.mountpoint.source_expectation.msm_versions[0]}))"
+    )
+    if checks["mountpoint_metadata_create"] != {
+        "latitude": 31.2,
+        "longitude": 121.4,
+        "coverage_radius_m": 25000.0,
+        "identifier": "Browser Farm",
+        "network": "RCaster-E2E",
+        "format": "rtcm3",
+        "msm_version": 4,
+    }:
+        raise RuntimeError(
+            f"mountpoint metadata create failed: "
+            f"{checks['mountpoint_metadata_create']}"
+        )
     checks["mountpoint_create"] = True
 
     page.evaluate(
@@ -402,6 +462,14 @@ def exercise_admin_mutations(
         ".find(row=>row.textContent.includes('TMP1'));"
         "row.querySelectorAll('button')[0].click();"
         "document.getElementById('mount-region').value='e2e-edited';"
+        "document.getElementById('mount-latitude').value='31.3';"
+        "document.getElementById('mount-longitude').value='121.5';"
+        "document.getElementById('mount-radius').value='30000';"
+        "document.getElementById('mount-str-fields').value="
+        "JSON.stringify({identifier:'Browser Farm Edited',network:'RCaster-E2E',"
+        "country:'CHN',carrier:'1',navigation_system:'GPS+GLO'});"
+        "document.getElementById('mount-source-expectation').value="
+        "JSON.stringify({formats:['rtcm3'],msm_versions:[4,7]});"
         "document.getElementById('mount-enabled').checked=false;"
         "return saveMount();"
         "})()"
@@ -409,6 +477,26 @@ def exercise_admin_mutations(
     page.wait_for(
         "document.getElementById('mountpoints').textContent.includes('TMP1browser-userfalse')"
     )
+    checks["mountpoint_metadata_update"] = page.evaluate(
+        "fetch('/admin/v1/mountpoints/TMP1')"
+        ".then(response=>response.json())"
+        ".then(result=>({latitude:result.mountpoint.latitude,"
+        "longitude:result.mountpoint.longitude,"
+        "coverage_radius_m:result.mountpoint.coverage_radius_m,"
+        "identifier:result.mountpoint.str_fields.identifier,"
+        "msm_versions:result.mountpoint.source_expectation.msm_versions}))"
+    )
+    if checks["mountpoint_metadata_update"] != {
+        "latitude": 31.3,
+        "longitude": 121.5,
+        "coverage_radius_m": 30000.0,
+        "identifier": "Browser Farm Edited",
+        "msm_versions": [4, 7],
+    }:
+        raise RuntimeError(
+            f"mountpoint metadata update failed: "
+            f"{checks['mountpoint_metadata_update']}"
+        )
     checks["mountpoint_update_disable"] = True
 
     page.evaluate(
@@ -574,49 +662,48 @@ def exercise_admin_mutations(
     owner_client = connect_local_client(clear_port, "owner", "secret")
     clients.append(owner_client)
     page.evaluate("load()")
-    if clustered:
-        page.wait_for(
-            "(() => {"
-            "const row=[...document.querySelectorAll('#sessions tr')]"
-            ".find(row=>row.textContent.includes('client')"
-            "&&row.textContent.includes('owner'));"
-            "return Boolean(row);"
-            "})()"
-        )
-        page.evaluate(
-            "(() => {"
-            "const row=[...document.querySelectorAll('#sessions tr')]"
-            ".find(row=>row.textContent.includes('client')"
-            "&&row.textContent.includes('owner'));"
-            "row.querySelector('button').click();"
-            "return true;"
-            "})()"
-        )
-        if not owner_client.wait_closed():
-            raise RuntimeError("session disconnect did not close the NTRIP client")
-        page.evaluate("load()")
-        page.wait_for(
-            "![...document.querySelectorAll('#sessions tr')]"
-            ".some(row=>row.textContent.includes('client')"
-            "&&row.textContent.includes('owner'))"
-        )
-        checks["session_disconnect_kicks_client"] = True
+    page.wait_for(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#sessions tr')]"
+        ".find(row=>row.textContent.includes('client')"
+        "&&row.textContent.includes('owner'));"
+        "return Boolean(row);"
+        "})()"
+    )
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#sessions tr')]"
+        ".find(row=>row.textContent.includes('client')"
+        "&&row.textContent.includes('owner'));"
+        "row.querySelector('button').click();"
+        "return true;"
+        "})()"
+    )
+    if not owner_client.wait_closed():
+        raise RuntimeError("session disconnect did not close the NTRIP client")
+    page.evaluate("load()")
+    page.wait_for(
+        "![...document.querySelectorAll('#sessions tr')]"
+        ".some(row=>row.textContent.includes('client')"
+        "&&row.textContent.includes('owner'))"
+    )
+    checks["session_disconnect_kicks_client"] = True
 
-        page.evaluate(
-            "(() => {"
-            "const row=[...document.querySelectorAll('#sources tr')]"
-            ".find(row=>row.textContent.includes('C63'));"
-            "row.querySelectorAll('button')[3].click();"
-            "return true;"
-            "})()"
-        )
-        if not source.closed.wait(5):
-            raise RuntimeError("source disconnect did not close the NTRIP source")
-        page.evaluate("loadSources()")
-        page.wait_for(
-            "!document.getElementById('sources').textContent.includes('C63')"
-        )
-        checks["source_disconnect_kicks_source"] = True
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#sources tr')]"
+        ".find(row=>row.textContent.includes('C63'));"
+        "row.querySelectorAll('button')[3].click();"
+        "return true;"
+        "})()"
+    )
+    if not source.closed.wait(5):
+        raise RuntimeError("source disconnect did not close the NTRIP source")
+    page.evaluate("loadSources()")
+    page.wait_for(
+        "!document.getElementById('sources').textContent.includes('C63')"
+    )
+    checks["source_disconnect_kicks_source"] = True
     page.evaluate("logout()")
     page.wait_for(
         "!document.getElementById('login').hidden"

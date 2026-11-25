@@ -375,6 +375,16 @@ impl AccountDirectory {
         Ok(store.lock().await.delete_api_token(token_id)?)
     }
 
+    pub(crate) async fn local_expired_api_tokens_delete(
+        &self,
+        now: u64,
+    ) -> Result<usize, AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        Ok(store.lock().await.delete_expired_api_tokens(now)?)
+    }
+
     pub(crate) async fn local_api_token_last_used(
         &self,
         token_id: &str,

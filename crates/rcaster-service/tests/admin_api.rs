@@ -98,7 +98,11 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("If-Match"));
     assert!(page.contains("showSourceHealth"));
     assert!(page.contains("saveUser"));
+    assert!(page.contains("id=\"user-ntrip-enabled\""));
+    assert!(page.contains("id=\"user-web-enabled\""));
     assert!(page.contains("saveMount"));
+    assert!(page.contains("id=\"mount-latitude\""));
+    assert!(page.contains("id=\"mount-source-expectation\""));
     assert!(page.contains("createApiToken"));
     assert!(page.contains("id=\"api-tokens-section\""));
     assert!(page.contains("session.kind==='service'"));
@@ -122,6 +126,8 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("loadOperation"));
     assert!(page.contains("previewBatchDisable"));
     assert!(page.contains("startBatchDisable"));
+    assert!(page.contains("AbortController"));
+    assert!(page.contains("loggingOut"));
     assert!(page.contains("loadUpgrade"));
     assert!(page.contains("Audit"));
     assert!(page.contains("admin/v1/auth/login"));
@@ -532,6 +538,34 @@ async fn standalone_admin_api_token_authenticates_lists_and_revokes() {
         .await
         .starts_with("HTTP/1.1 401 Unauthorized")
     );
+    let expired = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/api-tokens",
+        "",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+        r#"{"name":"expired-cleanup","scopes":["admin:read"],"expires_in_s":1}"#,
+    )
+    .await;
+    assert!(expired.starts_with("HTTP/1.1 201 Created"), "{expired}");
+    let expired_id = response_body(&expired)["token_id"]
+        .as_str()
+        .expect("expired API token ID")
+        .to_owned();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let listed = request_raw(
+        address,
+        &pki,
+        "GET",
+        "/admin/v1/api-tokens",
+        "",
+        &format!("Cookie: {cookie}\r\n"),
+        "",
+    )
+    .await;
+    assert!(listed.starts_with("HTTP/1.1 200 OK"), "{listed}");
+    assert!(!listed.contains(&expired_id), "{listed}");
     let versioned = request_raw(
         address,
         &pki,

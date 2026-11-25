@@ -20,14 +20,14 @@ python3 tools/web-e2e/run_browser_e2e.py
 
 Results are written to `tools/web-e2e/runs/<timestamp>/result.json`.
 
-Both modes exercise administrator login, user create/update/disable/delete,
-mountpoint create/update/disable/delete, blacklist create/update/delete,
-API token create/list/revoke, administrator logout, source filtering, health,
-history, maintenance enable/disable, public
-directory rendering, map auto-fit, public login, one-time ticket consumption,
-and the monitor WebSocket. The clustered mode additionally uses a real NTRIP
-client and source session to verify administrator session drop, user-disable
-disconnect, source disconnect and configuration application with generation
-advancement. The clustered flow also previews and completes a batch user-disable
-operation through the browser. Console exceptions, uncaught errors, failed
-network requests, and unexpected HTTP errors fail the run.
+Both modes exercise administrator login, user create/update/disable/delete with
+NTRIP and Web permissions, mountpoint create/update/disable/delete with
+coordinates, coverage, STR metadata and source expectations, blacklist
+create/update/delete, API token create/list/revoke, administrator logout,
+source filtering, health, history, maintenance enable/disable, public directory
+rendering, map auto-fit, public login, one-time ticket consumption, and the
+monitor WebSocket. Both modes also list and disconnect a real NTRIP client
+session and disconnect a live source. The clustered mode additionally applies
+configuration with generation advancement and previews/completes a batch
+user-disable operation through the browser. Console exceptions, uncaught
+errors, failed network requests, and unexpected HTTP errors fail the run.

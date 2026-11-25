@@ -783,6 +783,51 @@ async fn handle(
                 );
             }
         }
+        if state.runtime.is_none() && method == "DELETE" && path.starts_with("/admin/v1/sources/") {
+            let mountpoint = &path["/admin/v1/sources/".len()..];
+            if state.hub.source_profile(mountpoint).is_none() {
+                return Ok(response(
+                    404,
+                    json!({"code":"NOT_FOUND","message":"source not found"}),
+                ));
+            }
+            if !state.connections.cancel_source(mountpoint) {
+                return Ok(response(
+                    503,
+                    json!({"code":"UNAVAILABLE","message":"source connection not found"}),
+                ));
+            }
+            audit(
+                state,
+                source_ip,
+                access_actor(&access),
+                "source.disconnect",
+                mountpoint,
+                "accepted",
+                json!({"caster_id": state.caster_id}),
+            );
+            return Ok(response(202, json!({"status":"accepted"})));
+        }
+        if state.runtime.is_none() && method == "DELETE" && path.starts_with("/admin/v1/sessions/")
+        {
+            let session_id = &path["/admin/v1/sessions/".len()..];
+            if !state.connections.cancel_session(session_id) {
+                return Ok(response(
+                    404,
+                    json!({"code":"NOT_FOUND","message":"session not found"}),
+                ));
+            }
+            audit(
+                state,
+                source_ip,
+                access_actor(&access),
+                "session.disconnect",
+                session_id,
+                "accepted",
+                json!({"caster_id": state.caster_id}),
+            );
+            return Ok(response(202, json!({"status":"accepted"})));
+        }
         let Some(runtime) = &state.runtime else {
             return Ok(response(
                 503,
@@ -2436,7 +2481,26 @@ async fn handle(
                     Ok(sessions) => serde_json::to_value(sessions).unwrap_or(Value::Array(Vec::new())),
                     Err(_) => return Ok(response(503, json!({"code":"UNAVAILABLE","message":"session state unavailable"}))),
                 },
-                None => Value::Array(Vec::new()),
+                None => Value::Array(
+                    state
+                        .connections
+                        .sessions()
+                        .into_iter()
+                        .map(|session| json!({
+                            "schema_version": 1,
+                            "session_id": session.session_id,
+                            "session_type": session.session_type,
+                            "user_id": session.user_id,
+                            "mountpoint": session.mountpoint,
+                            "caster_id": state.caster_id,
+                            "runtime_epoch": "standalone",
+                            "ntrip_version": session.ntrip_version,
+                            "client_ip": session.client_ip,
+                            "software": session.software,
+                            "started_at": session.started_at.to_string(),
+                        }))
+                        .collect(),
+                ),
             },
         }),
         "/admin/v1/source-cooldowns" => match &state.runtime {
@@ -3257,12 +3321,24 @@ async fn standalone_account_write(
         if let Some(enabled) = body.get("ntrip_enabled").and_then(Value::as_bool) {
             updated.ntrip_enabled = enabled;
         }
+        if let Some(enabled) = body.get("web_enabled").and_then(Value::as_bool)
+            && updated.web_enabled != enabled
+        {
+            updated.web_enabled = enabled;
+            updated.auth_version = updated.auth_version.saturating_add(1);
+        }
         updated.updated_at = now_timestamp();
         return Some(
             match state.accounts.upsert_user(updated, Some(revision)).await {
                 Ok(revision) => {
-                    if body.get("enabled").and_then(Value::as_bool) == Some(false) {
+                    if body.get("enabled").and_then(Value::as_bool) == Some(false)
+                        || body.get("ntrip_enabled").and_then(Value::as_bool) == Some(false)
+                    {
                         state.connections.cancel_user(user_id);
+                    }
+                    if body.get("enabled").and_then(Value::as_bool) == Some(false)
+                        || body.get("web_enabled").and_then(Value::as_bool) == Some(false)
+                    {
                         state.connections.cancel_web_user(user_id);
                     }
                     audit(
@@ -3424,6 +3500,14 @@ async fn standalone_account_write(
                 json!({"code":"ACTIVE_SOURCE","message":"mountpoint has an active source"}),
             ));
         }
+        if let Some(value) = body.get("mountpoint")
+            && value.as_str() != Some(mountpoint_name)
+        {
+            return Some(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"mountpoint cannot be renamed"}),
+            ));
+        }
         if let Some(owner) = body.get("owner_user_id").and_then(Value::as_str) {
             updated.owner_user_id = owner.to_owned();
         }
@@ -3435,6 +3519,78 @@ async fn standalone_account_write(
         }
         if let Some(region) = body.get("region") {
             updated.region = region.as_str().map(str::to_owned);
+        }
+        if body.get("latitude").is_some() {
+            let Ok(latitude) = parse_optional_number(&body, "latitude") else {
+                return Some(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid latitude"}),
+                ));
+            };
+            updated.latitude = latitude;
+        }
+        if body.get("longitude").is_some() {
+            let Ok(longitude) = parse_optional_number(&body, "longitude") else {
+                return Some(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid longitude"}),
+                ));
+            };
+            updated.longitude = longitude;
+        }
+        if body.get("coverage_radius_m").is_some() {
+            let Ok(coverage_radius_m) = parse_optional_number(&body, "coverage_radius_m") else {
+                return Some(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid coverage radius"}),
+                ));
+            };
+            updated.coverage_radius_m = coverage_radius_m;
+        }
+        if body.get("str_fields").is_some() {
+            let Ok(str_fields) = parse_optional_str_fields(&body) else {
+                return Some(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid STR fields"}),
+                ));
+            };
+            updated.str_fields = str_fields;
+        }
+        if let Some(value) = body.get("source_expectation") {
+            updated.source_expectation = if value.is_null() {
+                None
+            } else {
+                match serde_json::from_value::<SourceExpectation>(value.clone()) {
+                    Ok(expectation) => Some(expectation),
+                    Err(_) => {
+                        return Some(response(
+                            400,
+                            json!({"code":"BAD_REQUEST","message":"invalid source expectation"}),
+                        ));
+                    }
+                }
+            };
+        }
+        if let Some(password) = body
+            .get("ntrip1_upload_password")
+            .and_then(Value::as_str)
+            .filter(|password| !password.is_empty())
+        {
+            let password = password.to_owned();
+            let Ok(Ok(hash)) = tokio::task::spawn_blocking(move || hash_password(&password)).await
+            else {
+                return Some(response(
+                    503,
+                    json!({"code":"UNAVAILABLE","message":"password hashing unavailable"}),
+                ));
+            };
+            updated.ntrip1_upload_password_hash = Some(hash);
+        }
+        if body
+            .get("ntrip1_upload_password")
+            .is_some_and(Value::is_null)
+        {
+            updated.ntrip1_upload_password_hash = None;
         }
         updated.updated_at = now_timestamp();
         return Some(
@@ -3938,8 +4094,8 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 <section><h3>Cluster</h3><pre id="cluster">-</pre><h3>Source filters</h3><p><input id="source-format" aria-label="Source format" placeholder="format"><input id="source-validation" aria-label="Validation result" placeholder="pass/warn/fail"><input id="source-caster" aria-label="Caster ID" placeholder="caster id"><select id="source-mismatch" aria-label="Expected format mismatch"><option value="">any mismatch</option><option value="true">mismatch</option><option value="false">match</option></select><input id="source-msm" aria-label="MSM version" type="number" min="1" max="7" placeholder="MSM"><button onclick="loadSources()">Apply</button></p><h3>Sources</h3><table><thead><tr><th>Mountpoint</th><th>Format</th><th>Details</th><th>Caster</th><th>Validation</th><th>MSM</th><th>Action</th></tr></thead><tbody id="sources"></tbody></table></section>
 <section><h3>Source health</h3><pre id="source-health">Select Health or History on a source.</pre><canvas id="history-chart" width="1000" height="180" aria-label="Source history chart"></canvas></section>
 <section><h3>Relays</h3><table><thead><tr><th>Mountpoint</th><th>Subscribers</th></tr></thead><tbody id="relays"></tbody></table></section>
-<section><h3>Users</h3><p class="write-control"><input id="user-id" aria-label="User ID" placeholder="user id"><input id="user-name" aria-label="Username" placeholder="username"><input id="user-password" aria-label="Password" type="password" placeholder="password (blank to keep)"><select id="user-role" aria-label="Role"><option value="user">user</option><option value="admin">admin</option></select><label><input id="user-enabled" type="checkbox" checked> enabled</label><button onclick="saveUser()">Save user</button></p><table><thead><tr><th>Username</th><th>Role</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="users"></tbody></table></section>
-<section><h3>Mountpoints</h3><p class="write-control"><input id="mount-name" aria-label="Mountpoint" placeholder="mountpoint"><input id="mount-owner" aria-label="Owner user ID" placeholder="owner user id"><input id="mount-password" aria-label="NTRIP1 upload password" type="password" placeholder="upload password (blank to keep)"><input id="mount-region" aria-label="Region" placeholder="region"><label><input id="mount-enabled" type="checkbox" checked> enabled</label><label><input id="mount-advertise" type="checkbox" checked> advertise</label><button onclick="saveMount()">Save mountpoint</button></p><table><thead><tr><th>Mountpoint</th><th>Owner</th><th>Enabled</th><th>Action</th></tr></thead><tbody id="mountpoints"></tbody></table></section>
+<section><h3>Users</h3><p class="write-control"><input id="user-id" aria-label="User ID" placeholder="user id"><input id="user-name" aria-label="Username" placeholder="username"><input id="user-password" aria-label="Password" type="password" placeholder="password (blank to keep)"><select id="user-role" aria-label="Role"><option value="user">user</option><option value="admin">admin</option></select><label><input id="user-enabled" type="checkbox" checked> enabled</label><label><input id="user-ntrip-enabled" type="checkbox" checked> NTRIP</label><label><input id="user-web-enabled" type="checkbox"> Web</label><button onclick="saveUser()">Save user</button></p><table><thead><tr><th>Username</th><th>Role</th><th>Enabled</th><th>NTRIP</th><th>Web</th><th>Action</th></tr></thead><tbody id="users"></tbody></table></section>
+<section><h3>Mountpoints</h3><p class="write-control"><input id="mount-name" aria-label="Mountpoint" placeholder="mountpoint"><input id="mount-owner" aria-label="Owner user ID" placeholder="owner user id"><input id="mount-password" aria-label="NTRIP1 upload password" type="password" placeholder="upload password (blank to keep)"><input id="mount-region" aria-label="Region" placeholder="region"><input id="mount-latitude" aria-label="Latitude" type="number" step="any" placeholder="latitude"><input id="mount-longitude" aria-label="Longitude" type="number" step="any" placeholder="longitude"><input id="mount-radius" aria-label="Coverage radius (m)" type="number" min="0" step="any" placeholder="coverage radius (m)"><input id="mount-str-fields" aria-label="STR fields JSON" placeholder="STR fields JSON"><input id="mount-source-expectation" aria-label="Source expectation JSON" placeholder="source expectation JSON"><label><input id="mount-enabled" type="checkbox" checked> enabled</label><label><input id="mount-advertise" type="checkbox" checked> advertise</label><button onclick="saveMount()">Save mountpoint</button></p><table><thead><tr><th>Mountpoint</th><th>Owner</th><th>Enabled</th><th>Region</th><th>Latitude</th><th>Longitude</th><th>Radius (m)</th><th>Action</th></tr></thead><tbody id="mountpoints"></tbody></table></section>
 <section id="api-tokens-section"><h3>API tokens</h3><p><input id="api-token-name" aria-label="Token name" placeholder="token name"><select id="api-token-scope" aria-label="Scope"><option value="read">read only</option><option value="write" selected>read + write</option></select><input id="api-token-expiry" aria-label="Expiry seconds" type="number" min="0" placeholder="expiry seconds (optional)"><button onclick="createApiToken()">Create token</button></p><pre id="api-token-secret"></pre><table><thead><tr><th>ID</th><th>Name</th><th>Owner</th><th>Scopes</th><th>Expires</th><th>Action</th></tr></thead><tbody id="api-tokens"></tbody></table></section>
 <section><h3>Blacklist</h3><p class="write-control"><input id="bl-id" aria-label="Rule ID" placeholder="rule id"><input id="bl-cidr" aria-label="CIDR" placeholder="CIDR"><input id="bl-quota" aria-label="Quota" type="number" value="0" style="width:90px"><input id="bl-description" aria-label="Description" placeholder="description"><button onclick="addBlacklist()">Add rule</button></p><table><thead><tr><th>ID</th><th>CIDR</th><th>Quota</th><th>Enabled</th></tr></thead><tbody id="blacklist"></tbody></table></section>
 <section><h3>Sessions</h3><table><thead><tr><th>Type</th><th>User</th><th>Mountpoint</th><th>Caster</th></tr></thead><tbody id="sessions"></tbody></table></section>
@@ -3961,11 +4117,16 @@ let csrfToken='';
 let monitorSocket=null;
 let serviceReadOnly=false;
 let batchDisableDigest='';
-async function api(path,options={}){const method=options.method||'GET';if(serviceReadOnly&&method!=='GET')throw new Error('Read-only service session');const headers={'Content-Type':'application/json',...(options.headers||{})};if(method!=='GET')headers['X-CSRF-Token']=csrfToken;const r=await fetch(path,{...options,headers:headers});if(!r.ok)throw new Error(await r.text());return r.status===204?null:r.json();}
+let requestScope=null;
+let requestSignal=null;
+let loggingOut=false;
+function beginRequestScope(){requestScope?.abort();const controller=new AbortController();requestScope=controller;requestSignal=controller.signal;return controller}
+function endRequestScope(controller){if(requestScope===controller)requestScope=null;if(requestSignal===controller.signal)requestSignal=null}
+async function api(path,options={}){const method=options.method||'GET';if(serviceReadOnly&&method!=='GET')throw new Error('Read-only service session');const headers={'Content-Type':'application/json',...(options.headers||{})};if(method!=='GET')headers['X-CSRF-Token']=csrfToken;const signal=method==='GET'&&options.signal===undefined?requestSignal:options.signal;const r=await fetch(path,{...options,headers:headers,signal:signal});if(!r.ok)throw new Error(await r.text());return r.status===204?null:r.json();}
 function row(cells){const tr=document.createElement('tr');for(const value of cells){const td=document.createElement('td');td.textContent=value??'';tr.append(td)}return tr}
 async function login(){try{const result=await api('/admin/v1/auth/login',{method:'POST',body:JSON.stringify({username:document.getElementById('username').value,password:document.getElementById('password').value})});csrfToken=result.csrf_token;document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=result.username;await load();}catch(e){status.textContent=String(e)}}
-async function logout(){try{await api('/admin/v1/auth/logout',{method:'POST'});csrfToken='';document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent='Signed out';}catch(e){status.textContent=String(e)}}
-async function load(){try{status.textContent='Loading...';const session=await api('/admin/v1/auth/session');const service=session.kind==='service';serviceReadOnly=service;csrfToken=service?'':((await api('/admin/v1/auth/csrf')).csrf_token||'');document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=session.username||session.kind;document.getElementById('read-only').hidden=!service;document.getElementById('logout').hidden=service;document.querySelectorAll('.write-control').forEach(element=>element.hidden=service);document.getElementById('api-tokens-section').hidden=service;document.getElementById('config-json').readOnly=service;const c=await api('/admin/v1/cluster/status');document.getElementById('cluster').textContent=JSON.stringify(c,null,2);await loadSources();const r=await api('/admin/v1/relays');document.getElementById('relays').replaceChildren(...r.relays.map(x=>row([x.mountpoint,x.subscribers])));const u=await api('/admin/v1/users');document.getElementById('users').replaceChildren(...u.users.map(userRow));const m=await api('/admin/v1/mountpoints');document.getElementById('mountpoints').replaceChildren(...m.mountpoints.map(mountRow));const b=await api('/admin/v1/blacklist');document.getElementById('blacklist').replaceChildren(...b.rules.map(blacklistRow));const ss=await api('/admin/v1/sessions');document.getElementById('sessions').replaceChildren(...ss.sessions.map(sessionRow));const cd=await api('/admin/v1/source-cooldowns');document.getElementById('cooldowns').replaceChildren(...cd.cooldowns.map(cooldownRow));await loadOperationalViews();if(!service){const at=await api('/admin/v1/api-tokens');document.getElementById('api-tokens').replaceChildren(...at.tokens.map(apiTokenRow));}status.textContent=service?'Connected (service read-only)':'Connected';}catch(e){document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent=String(e)}}
+async function logout(){if(loggingOut)return;loggingOut=true;const controller=beginRequestScope();try{await api('/admin/v1/auth/logout',{method:'POST'});csrfToken='';document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent='Signed out';}catch(e){status.textContent=String(e)}finally{controller.abort();endRequestScope(controller);loggingOut=false}}
+async function load(){if(loggingOut)return;const controller=beginRequestScope();try{status.textContent='Loading...';const session=await api('/admin/v1/auth/session');const service=session.kind==='service';serviceReadOnly=service;csrfToken=service?'':((await api('/admin/v1/auth/csrf')).csrf_token||'');document.getElementById('login').hidden=true;document.getElementById('account').hidden=false;document.getElementById('account-name').textContent=session.username||session.kind;document.getElementById('read-only').hidden=!service;document.getElementById('logout').hidden=service;document.querySelectorAll('.write-control').forEach(element=>element.hidden=service);document.getElementById('api-tokens-section').hidden=service;document.getElementById('config-json').readOnly=service;const c=await api('/admin/v1/cluster/status');document.getElementById('cluster').textContent=JSON.stringify(c,null,2);await loadSources();const r=await api('/admin/v1/relays');document.getElementById('relays').replaceChildren(...r.relays.map(x=>row([x.mountpoint,x.subscribers])));const u=await api('/admin/v1/users');document.getElementById('users').replaceChildren(...u.users.map(userRow));const m=await api('/admin/v1/mountpoints');document.getElementById('mountpoints').replaceChildren(...m.mountpoints.map(mountRow));const b=await api('/admin/v1/blacklist');document.getElementById('blacklist').replaceChildren(...b.rules.map(blacklistRow));const ss=await api('/admin/v1/sessions');document.getElementById('sessions').replaceChildren(...ss.sessions.map(sessionRow));const cd=await api('/admin/v1/source-cooldowns');document.getElementById('cooldowns').replaceChildren(...cd.cooldowns.map(cooldownRow));await loadOperationalViews();if(!service){const at=await api('/admin/v1/api-tokens');document.getElementById('api-tokens').replaceChildren(...at.tokens.map(apiTokenRow));}status.textContent=service?'Connected (service read-only)':'Connected';}catch(e){if(controller.signal.aborted)return;document.getElementById('login').hidden=false;document.getElementById('account').hidden=true;status.textContent=String(e)}finally{endRequestScope(controller)}}
 async function loadSources(){const params=new URLSearchParams();const fields=[['primary_format','source-format'],['validation_result','source-validation'],['caster_id','source-caster'],['expected_format_mismatch','source-mismatch'],['msm_version','source-msm']];for(const [name,id] of fields){const value=document.getElementById(id).value.trim();if(value)params.set(name,value)}const suffix=params.toString()?'?'+params.toString():'';const result=await api('/admin/v1/sources'+suffix);document.getElementById('sources').replaceChildren(...result.sources.map(sourceRow))}
 function sourceRow(source){const admission=source.admission||{};const tr=row([source.mountpoint,source.format,source.format_details,source.caster_id,admission.validation_result||'',(admission.msm_versions||[]).join(',')]);const td=document.createElement('td');const health=document.createElement('button');health.textContent='Health';health.onclick=()=>showSourceHealth(source.mountpoint);const history=document.createElement('button');history.textContent='History';history.onclick=()=>showSourceHistory(source.mountpoint);const live=document.createElement('button');live.textContent='Live';live.onclick=()=>monitorSource(source.mountpoint);td.append(health,history,live);if(!serviceReadOnly){const disconnect=document.createElement('button');disconnect.textContent='Disconnect';disconnect.onclick=()=>disconnectSource(source.mountpoint);td.append(disconnect)}tr.append(td);return tr}
 async function showSourceHistory(mountpoint){try{const result=await api('/admin/v1/streams/'+encodeURIComponent(mountpoint)+'/history?limit=120');document.getElementById('source-health').textContent=JSON.stringify(result,null,2);drawHistory(result.points||[]);status.textContent='History loaded for '+mountpoint}catch(e){status.textContent=String(e)}}
@@ -3988,13 +4149,15 @@ async function disconnectSource(mountpoint){if(!confirm('Disconnect source '+mou
 async function disconnectSession(sessionId){if(!confirm('Disconnect session '+sessionId+'?'))return;try{await api('/admin/v1/sessions/'+encodeURIComponent(sessionId),{method:'DELETE'});status.textContent='Disconnect accepted for '+sessionId;}catch(e){status.textContent=String(e)}}
 async function clearCooldown(fingerprint){if(!confirm('Clear source cooldown?'))return;try{await api('/admin/v1/source-cooldowns/'+encodeURIComponent(fingerprint),{method:'DELETE'});status.textContent='Source cooldown cleared';await load();}catch(e){status.textContent=String(e)}}
 function monitorSource(mountpoint){if(monitorSocket)monitorSocket.close();const target=document.getElementById('source-health');const scheme=location.protocol==='https:'?'wss':'ws';const socket=new WebSocket(scheme+'://'+location.host+'/admin/v1/ws?mountpoint='+encodeURIComponent(mountpoint));monitorSocket=socket;status.textContent='Live monitor connecting for '+mountpoint;target.textContent='Waiting for monitor_ready...';socket.onmessage=event=>{try{const message=JSON.parse(event.data);if(message.type==='monitor_snapshot')status.textContent='Live: '+mountpoint;target.textContent=JSON.stringify(message,null,2);}catch(e){target.textContent=String(e)}};socket.onerror=()=>{status.textContent='Live monitor failed';};socket.onclose=()=>{if(monitorSocket===socket)monitorSocket=null;if(status.textContent.startsWith('Live'))status.textContent='Live monitor closed';};}
-function userRow(user){const tr=row([user.username,user.role,user.enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editUser(user);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteUser(user);td.append(edit,del)}tr.append(td);return tr}
-function editUser(user){userRevision=user.mod_revision;document.getElementById('user-id').value=user.user_id;document.getElementById('user-name').value=user.username;document.getElementById('user-password').value='';document.getElementById('user-role').value=user.role;document.getElementById('user-enabled').checked=user.enabled;status.textContent='Editing '+user.username}
-async function saveUser(){try{const body={user_id:document.getElementById('user-id').value,username:document.getElementById('user-name').value,role:document.getElementById('user-role').value,enabled:document.getElementById('user-enabled').checked};const password=document.getElementById('user-password').value;if(password)body.password=password;const headers=userRevision===null?{}:{'If-Match':'"'+userRevision+'"'};await api('/admin/v1/users'+(userRevision===null?'':'/'+encodeURIComponent(body.user_id)),{method:userRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});userRevision=null;status.textContent='User saved';await load();}catch(e){status.textContent=String(e)}}
+function userRow(user){const tr=row([user.username,user.role,user.enabled,user.ntrip_enabled,user.web_enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editUser(user);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteUser(user);td.append(edit,del)}tr.append(td);return tr}
+function editUser(user){userRevision=user.mod_revision;document.getElementById('user-id').value=user.user_id;document.getElementById('user-name').value=user.username;document.getElementById('user-password').value='';document.getElementById('user-role').value=user.role;document.getElementById('user-enabled').checked=user.enabled;document.getElementById('user-ntrip-enabled').checked=user.ntrip_enabled;document.getElementById('user-web-enabled').checked=user.web_enabled;status.textContent='Editing '+user.username}
+async function saveUser(){try{const body={user_id:document.getElementById('user-id').value,username:document.getElementById('user-name').value,role:document.getElementById('user-role').value,enabled:document.getElementById('user-enabled').checked,ntrip_enabled:document.getElementById('user-ntrip-enabled').checked,web_enabled:document.getElementById('user-web-enabled').checked};const password=document.getElementById('user-password').value;if(password)body.password=password;const headers=userRevision===null?{}:{'If-Match':'"'+userRevision+'"'};await api('/admin/v1/users'+(userRevision===null?'':'/'+encodeURIComponent(body.user_id)),{method:userRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});userRevision=null;status.textContent='User saved';await load();}catch(e){status.textContent=String(e)}}
 async function deleteUser(user){if(!confirm('Delete user '+user.username+'?'))return;try{await api('/admin/v1/users/'+encodeURIComponent(user.user_id),{method:'DELETE',headers:{'If-Match':'"'+user.mod_revision+'"'}});status.textContent='User deleted';await load();}catch(e){status.textContent=String(e)}}
-function mountRow(mount){const tr=row([mount.mountpoint,mount.owner_user_id,mount.enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editMount(mount);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteMount(mount);td.append(edit,del)}tr.append(td);return tr}
-function editMount(mount){mountRevision=mount.mod_revision;document.getElementById('mount-name').value=mount.mountpoint;document.getElementById('mount-owner').value=mount.owner_user_id;document.getElementById('mount-password').value='';document.getElementById('mount-region').value=mount.region||'';document.getElementById('mount-enabled').checked=mount.enabled;document.getElementById('mount-advertise').checked=mount.advertise;status.textContent='Editing '+mount.mountpoint}
-async function saveMount(){try{const body={mountpoint:document.getElementById('mount-name').value,owner_user_id:document.getElementById('mount-owner').value,region:document.getElementById('mount-region').value||null,enabled:document.getElementById('mount-enabled').checked,advertise:document.getElementById('mount-advertise').checked};const password=document.getElementById('mount-password').value;if(password)body.ntrip1_upload_password=password;const headers=mountRevision===null?{}:{'If-Match':'"'+mountRevision+'"'};await api('/admin/v1/mountpoints'+(mountRevision===null?'':'/'+encodeURIComponent(body.mountpoint)),{method:mountRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});mountRevision=null;status.textContent='Mountpoint saved';await load();}catch(e){status.textContent=String(e)}}
+function mountRow(mount){const tr=row([mount.mountpoint,mount.owner_user_id,mount.enabled,mount.region||'',mount.latitude??'',mount.longitude??'',mount.coverage_radius_m??'']);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editMount(mount);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteMount(mount);td.append(edit,del)}tr.append(td);return tr}
+function optionalNumber(id){const value=document.getElementById(id).value.trim();return value===''?null:Number(value)}
+function optionalJson(id){const value=document.getElementById(id).value.trim();return value===''?null:JSON.parse(value)}
+function editMount(mount){mountRevision=mount.mod_revision;document.getElementById('mount-name').value=mount.mountpoint;document.getElementById('mount-owner').value=mount.owner_user_id;document.getElementById('mount-password').value='';document.getElementById('mount-region').value=mount.region||'';document.getElementById('mount-latitude').value=mount.latitude??'';document.getElementById('mount-longitude').value=mount.longitude??'';document.getElementById('mount-radius').value=mount.coverage_radius_m??'';document.getElementById('mount-str-fields').value=mount.str_fields?JSON.stringify(mount.str_fields):'';document.getElementById('mount-source-expectation').value=mount.source_expectation?JSON.stringify(mount.source_expectation):'';document.getElementById('mount-enabled').checked=mount.enabled;document.getElementById('mount-advertise').checked=mount.advertise;status.textContent='Editing '+mount.mountpoint}
+async function saveMount(){try{const body={mountpoint:document.getElementById('mount-name').value,owner_user_id:document.getElementById('mount-owner').value,region:document.getElementById('mount-region').value||null,latitude:optionalNumber('mount-latitude'),longitude:optionalNumber('mount-longitude'),coverage_radius_m:optionalNumber('mount-radius'),str_fields:optionalJson('mount-str-fields'),source_expectation:optionalJson('mount-source-expectation'),enabled:document.getElementById('mount-enabled').checked,advertise:document.getElementById('mount-advertise').checked};const password=document.getElementById('mount-password').value;if(password)body.ntrip1_upload_password=password;const headers=mountRevision===null?{}:{'If-Match':'"'+mountRevision+'"'};await api('/admin/v1/mountpoints'+(mountRevision===null?'':'/'+encodeURIComponent(body.mountpoint)),{method:mountRevision===null?'POST':'PATCH',headers:headers,body:JSON.stringify(body)});mountRevision=null;status.textContent='Mountpoint saved';await load();}catch(e){status.textContent=String(e)}}
 async function deleteMount(mount){if(!confirm('Delete mountpoint '+mount.mountpoint+'?'))return;try{await api('/admin/v1/mountpoints/'+encodeURIComponent(mount.mountpoint),{method:'DELETE',headers:{'If-Match':'"'+mount.mod_revision+'"'}});status.textContent='Mountpoint deleted';await load();}catch(e){status.textContent=String(e)}}
 async function showSourceHealth(mountpoint){try{document.getElementById('source-health').textContent='Loading...';const health=await api('/admin/v1/sources/'+encodeURIComponent(mountpoint)+'/health');document.getElementById('source-health').textContent=JSON.stringify(health,null,2);status.textContent='Health loaded for '+mountpoint}catch(e){document.getElementById('source-health').textContent=String(e)}}
 function blacklistRow(rule){const tr=row([rule.id,rule.cidr,rule.quota,rule.enabled]);const td=document.createElement('td');if(serviceReadOnly){td.textContent='Read-only'}else{const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>editBlacklist(rule);const del=document.createElement('button');del.textContent='Delete';del.onclick=()=>deleteBlacklist(rule);td.append(edit,del)}tr.append(td);return tr}
@@ -4005,7 +4168,7 @@ function apiTokenRow(token){const tr=row([token.token_id,token.name,token.userna
 async function createApiToken(){try{const scope=document.getElementById('api-token-scope').value;const expiry=Number(document.getElementById('api-token-expiry').value);const body={name:document.getElementById('api-token-name').value,scopes:scope==='read'?['admin:read']:['admin:read','admin:write','operations:write']};if(expiry>0)body.expires_in_s=expiry;const result=await api('/admin/v1/api-tokens',{method:'POST',body:JSON.stringify(body)});document.getElementById('api-token-secret').textContent=result.token;status.textContent='API token created; copy it now';await load();}catch(e){status.textContent=String(e)}}
 async function deleteApiToken(token){if(!confirm('Revoke API token '+token.name+'?'))return;try{await api('/admin/v1/api-tokens/'+encodeURIComponent(token.token_id),{method:'DELETE'});await load();}catch(e){status.textContent=String(e)}}
 load();
-setInterval(function(){if(!document.getElementById('account').hidden)load()},10000);
+setInterval(function(){if(!loggingOut&&!document.getElementById('account').hidden)load()},10000);
 </script></body></html>"#;
 
 fn header<'a>(headers: &'a [&'a str], name: &str) -> Option<&'a str> {

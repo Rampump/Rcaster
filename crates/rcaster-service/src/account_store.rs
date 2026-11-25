@@ -228,6 +228,55 @@ impl AccountStore {
         Ok(removed)
     }
 
+    pub fn delete_expired_api_tokens(&self, now: u64) -> Result<usize, StoreError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        let expired = {
+            let table = transaction
+                .open_table(API_TOKENS)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            table
+                .iter()
+                .map_err(|error| StoreError::Database(error.to_string()))?
+                .map(|entry| {
+                    let (key, value) =
+                        entry.map_err(|error| StoreError::Database(error.to_string()))?;
+                    let token: ApiToken =
+                        serde_json::from_slice(value.value()).map_err(StoreError::Json)?;
+                    Ok(token
+                        .expires_at
+                        .is_some_and(|expires_at| expires_at <= now)
+                        .then(|| key.value().to_owned()))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        if !expired.is_empty() {
+            let mut tokens = transaction
+                .open_table(API_TOKENS)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let mut last_used = transaction
+                .open_table(API_TOKEN_LAST_USED)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            for token_id in &expired {
+                tokens
+                    .remove(token_id.as_str())
+                    .map_err(|error| StoreError::Database(error.to_string()))?;
+                last_used
+                    .remove(token_id.as_str())
+                    .map_err(|error| StoreError::Database(error.to_string()))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        Ok(expired.len())
+    }
+
     pub fn api_token_last_used(&self, token_id: &str) -> Result<Option<u64>, StoreError> {
         let transaction = self
             .database

@@ -165,6 +165,42 @@ fn standalone_api_tokens_round_trip_across_reopen() {
     );
 }
 
+#[test]
+fn deleting_expired_api_tokens_also_removes_last_used_metadata() {
+    let path = TempDatabase::new();
+    let store = AccountStore::open(path.as_ref()).expect("open store");
+    let token = ApiToken {
+        schema_version: 1,
+        token_id: "b".repeat(64),
+        name: "expired".to_owned(),
+        token_hash: "sha256:hash".to_owned(),
+        user_id: "owner-id".to_owned(),
+        username: "owner".to_owned(),
+        auth_version: 1,
+        scopes: vec!["admin:read".to_owned()],
+        created_at: 1_800_000_000,
+        expires_at: Some(1_800_000_060),
+    };
+    store.put_api_token(&token).expect("persist API token");
+    store
+        .put_api_token_last_used(&token.token_id, 1_800_000_001)
+        .expect("persist last-used timestamp");
+
+    assert_eq!(
+        store
+            .delete_expired_api_tokens(1_800_000_060)
+            .expect("delete expired API tokens"),
+        1
+    );
+    assert!(store.api_tokens().expect("reload API tokens").is_empty());
+    assert_eq!(
+        store
+            .api_token_last_used(&token.token_id)
+            .expect("reload last-used timestamp"),
+        None
+    );
+}
+
 #[tokio::test]
 async fn standalone_blacklist_directory_reloads_limiter_state() {
     let path = TempDatabase::new();

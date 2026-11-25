@@ -29,7 +29,7 @@ use crate::{
     admin_auth::LoginLimiter,
     admission::{AdmissionError, ClientPermit},
     cluster_runtime::{ClusterSourcePermit, SharedClusterRuntime},
-    connections::{ConnectionCancel, ConnectionController},
+    connections::{ConnectionCancel, ConnectionController, LocalSession},
     health::HealthState,
     hub::{HubError, MountpointHub, SourceLease},
     near::{
@@ -587,6 +587,23 @@ where
                         .as_ref()
                         .map(|user| user.user_id.as_str()),
                 );
+                if matches!(_permit, SessionHold::Local(_))
+                    && let Some(cancellation) = cancellation.as_mut()
+                {
+                    cancellation.track_session(LocalSession {
+                        session_id: connection_id(),
+                        session_type: "client".to_owned(),
+                        user_id: authenticated_user
+                            .as_ref()
+                            .map(|user| user.user_id.clone())
+                            .unwrap_or_default(),
+                        mountpoint: request.mountpoint.clone(),
+                        ntrip_version: ntrip_version_name(request.version),
+                        client_ip: remote_ip.to_string(),
+                        started_at: unix_time(),
+                        software: software_header(&request.headers),
+                    });
+                }
                 send_data_success(&mut stream, request.version).await?;
                 let operation = async {
                     if let Some(near) = near {
@@ -837,6 +854,23 @@ where
         }
     };
     _permit.bind(cancellation.as_mut(), Some(&context.user.user_id));
+    if let Some(cancellation) = cancellation.as_mut() {
+        cancellation.bind(format!("source:{}", source.mountpoint()));
+    }
+    if matches!(_permit, SessionHold::Local(_))
+        && let Some(cancellation) = cancellation.as_mut()
+    {
+        cancellation.track_session(LocalSession {
+            session_id: source_connection_id.clone(),
+            session_type: "source".to_owned(),
+            user_id: context.user.user_id.clone(),
+            mountpoint: request.mountpoint().to_owned(),
+            ntrip_version: ntrip_version_name(version),
+            client_ip: context.remote_ip.to_string(),
+            started_at: unix_time(),
+            software: context.software.clone(),
+        });
+    }
     let lease_health = match &config.cluster_runtime {
         Some(runtime) => runtime.lease_health().await,
         None => None,
@@ -2181,6 +2215,13 @@ fn connection_id() -> String {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     )
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn ntrip_version_name(version: NtripVersion) -> String {

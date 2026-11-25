@@ -4,7 +4,7 @@ use std::{
 };
 
 use etcd_client::{Client, ConnectOptions};
-use rcaster_service::connections::{CommandWatcher, ConnectionController};
+use rcaster_service::connections::{CommandWatcher, ConnectionController, LocalSession};
 use tokio::time::timeout;
 
 #[tokio::test]
@@ -21,6 +21,46 @@ async fn cancel_all_cancels_every_bound_connection() {
     timeout(Duration::from_secs(1), second.cancelled())
         .await
         .expect("second cancellation");
+}
+
+#[tokio::test]
+async fn source_mountpoint_cancels_only_the_matching_local_source() {
+    let controller = ConnectionController::default();
+    let mut source = controller.connection();
+    source.bind("source:C63".to_owned());
+    let mut other = controller.connection();
+    other.bind("source:C64".to_owned());
+
+    assert!(controller.cancel_source("C63"));
+    timeout(Duration::from_secs(1), source.cancelled())
+        .await
+        .expect("source cancellation");
+    assert!(!controller.cancel_source("C65"));
+}
+
+#[tokio::test]
+async fn local_sessions_are_listed_and_cancelled_by_id() {
+    let controller = ConnectionController::default();
+    let mut client = controller.connection();
+    client.track_session(LocalSession {
+        session_id: "local-client".to_owned(),
+        session_type: "client".to_owned(),
+        user_id: "owner-id".to_owned(),
+        mountpoint: "C63".to_owned(),
+        ntrip_version: "2".to_owned(),
+        client_ip: "127.0.0.1".to_owned(),
+        started_at: 1,
+        software: Some("test-client".to_owned()),
+    });
+
+    assert_eq!(controller.sessions().len(), 1);
+    assert_eq!(controller.sessions()[0].user_id, "owner-id");
+    assert!(controller.cancel_session("local-client"));
+    timeout(Duration::from_secs(1), client.cancelled())
+        .await
+        .expect("client cancellation");
+    assert!(controller.sessions().is_empty());
+    assert!(!controller.cancel_session("missing"));
 }
 
 #[tokio::test]

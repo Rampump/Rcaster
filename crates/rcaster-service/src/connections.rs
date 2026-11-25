@@ -4,12 +4,26 @@ use std::{
 };
 
 use etcd_client::{Client, EventType, GetOptions, WatchOptions};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::{sync::watch, task::JoinHandle};
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LocalSession {
+    pub session_id: String,
+    pub session_type: String,
+    pub user_id: String,
+    pub mountpoint: String,
+    pub ntrip_version: String,
+    pub client_ip: String,
+    pub started_at: u64,
+    pub software: Option<String>,
+}
 
 #[derive(Clone, Default)]
 pub struct ConnectionController {
     inner: Arc<Mutex<HashMap<String, Vec<watch::Sender<bool>>>>>,
+    sessions: Arc<Mutex<HashMap<String, LocalSession>>>,
 }
 
 pub struct ConnectionCancel {
@@ -17,6 +31,7 @@ pub struct ConnectionCancel {
     sender: watch::Sender<bool>,
     receiver: watch::Receiver<bool>,
     keys: Vec<String>,
+    session_ids: Vec<String>,
 }
 
 pub struct CommandWatcher {
@@ -31,6 +46,7 @@ impl ConnectionController {
             sender,
             receiver,
             keys: Vec::new(),
+            session_ids: Vec::new(),
         }
     }
 
@@ -58,6 +74,33 @@ impl ConnectionController {
         self.cancel(&format!("web-user:{user_id}"))
     }
 
+    pub fn cancel_source(&self, mountpoint: &str) -> bool {
+        self.cancel(&format!("source:{mountpoint}"))
+    }
+
+    pub fn cancel_session(&self, session_id: &str) -> bool {
+        if !self.cancel(&format!("session:{session_id}")) {
+            return false;
+        }
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        true
+    }
+
+    pub fn sessions(&self) -> Vec<LocalSession> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| session.started_at);
+        sessions
+    }
+
     pub fn cancel_all(&self) {
         for senders in self
             .inner
@@ -82,6 +125,17 @@ impl ConnectionCancel {
             .or_default()
             .push(self.sender.clone());
         self.keys.push(key);
+    }
+
+    pub fn track_session(&mut self, session: LocalSession) {
+        let session_id = session.session_id.clone();
+        self.bind(format!("session:{session_id}"));
+        self.controller
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), session);
+        self.session_ids.push(session_id);
     }
 
     pub async fn cancelled(&mut self) {
@@ -111,6 +165,14 @@ impl Drop for ConnectionCancel {
             if senders.is_empty() {
                 connections.remove(key);
             }
+        }
+        let mut sessions = self
+            .controller
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for session_id in &self.session_ids {
+            sessions.remove(session_id);
         }
     }
 }
