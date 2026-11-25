@@ -904,6 +904,16 @@ fn default_updater_drain_timeout_s() -> u64 {
     30
 }
 
+#[cfg(test)]
+mod deployment_tests {
+    #[test]
+    fn updater_stop_timeout_covers_the_maximum_configured_drain() {
+        let unit = include_str!("../../../deploy/systemd/rcaster-updater.service");
+        assert!(unit.contains("TimeoutStopSec=330s"));
+        assert!(unit.contains("Restart=on-failure"));
+    }
+}
+
 fn default_head_timeout_ms() -> u64 {
     10_000
 }
