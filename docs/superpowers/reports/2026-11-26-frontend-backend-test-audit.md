@@ -36,6 +36,9 @@ Implementation progress:
   the user form and remains for the mountpoint form.
 - Browser evidence:
   `tools/web-e2e/runs/20261126-013722/result.json`.
+- Finding 7 is now complete, and findings 9–10 are fixed by commit `91b2272`.
+- Browser evidence:
+  `tools/web-e2e/runs/20261126-014406/result.json`.
 
 ## Coverage map
 
@@ -97,7 +100,7 @@ Implementation progress:
    - **Fix:** Keep the connection indicator separate from action toasts, and update rows by stable key instead of replacing the whole table. Test focus survives refresh and a success message remains visible.
    - **If we skip it:** Keyboard users lose their place and operators miss action outcomes.
 
-7. **[Partially fixed] Create and edit modes are not visible or cancellable** (`crates/rcaster-service/src/admin.rs:4168`, `crates/rcaster-service/src/admin.rs:4174`)
+7. **[Fixed] Create and edit modes are not visible or cancellable** (`crates/rcaster-service/src/admin.rs:4168`, `crates/rcaster-service/src/admin.rs:4174`)
    - **What this is:** Clicking Edit fills the same form used for Create. There is no mode label, Cancel, Clear or reset after save.
    - **Problem:** After saving an edit, the fields remain and the revision resets to Create mode. Pressing Save again attempts to create a duplicate. Users can also unknowingly overwrite another edit context.
    - **Fix:** Add an explicit “Creating / Editing X” label, Cancel button, and clear/reset after save. Change the button text to “Create” or “Update”.
@@ -109,13 +112,13 @@ Implementation progress:
    - **Fix:** Parse `{code,message}` once, map common statuses to concise messages, and show field errors beside the form. Test 400, 401, 403, 409, 429 and 503.
    - **If we skip it:** Operators cannot distinguish a bad field from a stale revision or permission failure.
 
-9. **Public/admin live monitors do not recover after WebSocket loss** (`crates/rcaster-service/src/public.rs:1404`, `crates/rcaster-service/src/admin.rs:4166`)
+9. **[Fixed] Public/admin live monitors do not recover after WebSocket loss** (`crates/rcaster-service/src/public.rs:1404`, `crates/rcaster-service/src/admin.rs:4166`)
    - **What this is:** `onclose` changes the status text but does not offer retry or restart the socket.
    - **Problem:** A network interruption, ticket expiry or source generation change ends monitoring. The public chart timer also keeps polling every five seconds after the socket closes.
    - **Fix:** Clear timers on close, show the close reason, add a Retry button that requests a new ticket, and test disconnect → reconnect.
    - **If we skip it:** Users may see stale charts and believe monitoring is still active.
 
-10. **Public login state can remain visually “Signed in” after expiry** (`crates/rcaster-service/src/public.rs:1385`, `crates/rcaster-service/src/public.rs:1404`)
+10. **[Fixed] Public login state can remain visually “Signed in” after expiry** (`crates/rcaster-service/src/public.rs:1385`, `crates/rcaster-service/src/public.rs:1404`)
     - **What this is:** The page checks login only when the action starts; it does not refresh `/api/v1/auth/session`.
     - **Problem:** After the session expires, the page still says “Signed in” until Monitor is clicked. The eventual failure is raw backend text.
     - **Fix:** Poll the session at a low rate or handle 401 globally by switching to anonymous mode and showing “Session expired”.
