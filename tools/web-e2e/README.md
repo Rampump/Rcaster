@@ -27,5 +27,6 @@ directory rendering, map auto-fit, public login, one-time ticket consumption,
 and the monitor WebSocket. The clustered mode additionally uses a real NTRIP
 client and source session to verify administrator session drop, user-disable
 disconnect, source disconnect and configuration application with generation
-advancement. Console exceptions, uncaught errors, failed network requests, and
-unexpected HTTP errors fail the run.
+advancement. The clustered flow also previews and completes a batch user-disable
+operation through the browser. Console exceptions, uncaught errors, failed
+network requests, and unexpected HTTP errors fail the run.

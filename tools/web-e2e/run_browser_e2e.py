@@ -143,7 +143,7 @@ class Cdp:
     def wait_for(self, expression: str, timeout: float = 20.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self.evaluate(f"Boolean({expression})"):
+            if self.evaluate(f"(async()=>Boolean(await ({expression})))()"):
                 return
             time.sleep(0.1)
         raise RuntimeError(f"timed out waiting for {expression}")
@@ -479,6 +479,63 @@ def exercise_admin_mutations(
         "!document.getElementById('blacklist').textContent.includes('e2e-rule')"
     )
     checks["blacklist_delete"] = True
+
+    if clustered:
+        page.evaluate(
+            "(() => {"
+            "userRevision=null;"
+            "document.getElementById('user-id').value='batch-user';"
+            "document.getElementById('user-name').value='batch-user';"
+            "document.getElementById('user-password').value='batch-secret';"
+            "document.getElementById('user-role').value='user';"
+            "document.getElementById('user-enabled').checked=true;"
+            "return saveUser();"
+            "})()"
+        )
+        page.wait_for(
+            "document.getElementById('users').textContent.includes('batch-user')"
+        )
+        page.evaluate(
+            "(() => {"
+            "document.getElementById('batch-action').value='users.disable';"
+            "document.getElementById('batch-targets').value='batch-user';"
+            "return previewBatchDisable();"
+            "})()"
+        )
+        page.wait_for(
+            "!document.getElementById('batch-disable-start').hidden"
+        )
+        page.evaluate("startBatchDisable()")
+        page.wait_for(
+            "document.getElementById('operation-id').value.length > 0"
+        )
+        page.wait_for(
+            "(() => {"
+            "const id=document.getElementById('operation-id').value;"
+            "return api('/admin/v1/operations/'+encodeURIComponent(id))"
+            ".then(operation=>operation.status==='SUCCEEDED');"
+            "})()",
+            timeout=20,
+        )
+        page.evaluate("load()")
+        page.wait_for(
+            "document.getElementById('users').textContent"
+            ".includes('batch-useruserfalse')"
+        )
+        checks["batch_users_disable"] = page.evaluate(
+            "document.getElementById('operation-id').value"
+        )
+        page.evaluate(
+            "(() => {"
+            "const row=[...document.querySelectorAll('#users tr')]"
+            ".find(row=>row.textContent.includes('batch-user'));"
+            "row.querySelectorAll('button')[1].click();"
+            "return true;"
+            "})()"
+        )
+        page.wait_for(
+            "!document.getElementById('users').textContent.includes('batch-user')"
+        )
 
     owner_client = connect_local_client(clear_port, "owner", "secret")
     clients.append(owner_client)
