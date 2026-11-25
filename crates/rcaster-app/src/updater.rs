@@ -168,6 +168,9 @@ impl Updater {
         let operation_id = command["operation_id"]
             .as_str()
             .ok_or("upgrade command has no operation ID")?;
+        if !valid_identifier(operation_id) {
+            return Err("upgrade command operation ID is invalid".into());
+        }
         let action = command["action"]
             .as_str()
             .ok_or("upgrade command has no action")?;
@@ -533,6 +536,14 @@ fn terminal_upgrade_state(state: &Value) -> bool {
     )
 }
 
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 fn ensure_staging_space(path: &Path, artifact_size: u64) -> UpdaterResult<()> {
     fs::create_dir_all(path)?;
     let available = available_disk_bytes(path)?;
@@ -652,7 +663,7 @@ mod tests {
     use super::{
         Slot, SlotState, Updater, connect_etcd, download_artifact, ensure_staging_space,
         inactive_slot, probe_health, repaired_slot_state, request_graceful_stop,
-        terminal_upgrade_state,
+        terminal_upgrade_state, valid_identifier,
     };
     use crate::config::UpdaterConfig;
     use rcaster_service::upgrade::UpgradePolicy;
@@ -684,6 +695,16 @@ mod tests {
         );
         assert_eq!(unchanged.current, Slot::Initial);
         assert_eq!(unchanged.previous, None);
+    }
+
+    #[test]
+    fn rejects_operation_ids_that_escape_updater_paths() {
+        assert!(valid_identifier("0123abcd"));
+        assert!(valid_identifier("operation-1.retry"));
+        assert!(!valid_identifier(""));
+        assert!(!valid_identifier("../escape"));
+        assert!(!valid_identifier("a/b"));
+        assert!(!valid_identifier(&"x".repeat(129)));
     }
 
     #[test]
