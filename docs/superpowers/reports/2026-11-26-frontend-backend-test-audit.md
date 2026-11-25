@@ -32,6 +32,10 @@ Implementation progress:
   - public directory loads 250/250 across cursor pages;
   - double-click token creation creates exactly one token;
   - all 17 global map clusters are keyboard-focusable.
+- Findings 5, 6 and 8 are fixed by commit `49b624e`; finding 7 is fixed for
+  the user form and remains for the mountpoint form.
+- Browser evidence:
+  `tools/web-e2e/runs/20261126-013722/result.json`.
 
 ## Coverage map
 
@@ -81,25 +85,25 @@ Implementation progress:
 
 ### Should fix
 
-5. **Dynamic status and errors are not announced** (`crates/rcaster-service/src/admin.rs:4107`, `crates/rcaster-service/src/public.rs:1375`)
+5. **[Fixed] Dynamic status and errors are not announced** (`crates/rcaster-service/src/admin.rs:4107`, `crates/rcaster-service/src/public.rs:1375`)
    - **What this is:** Save, login, disconnect and failure messages are written into `<p id="status">`.
    - **Problem:** The element has no `role="status"` or `aria-live`. A screen-reader user gets no confirmation after a save or disconnect, including failures.
    - **Fix:** Use `role="status" aria-live="polite"` for progress/success and `role="alert"` for errors. Add browser accessibility assertions.
    - **If we skip it:** Non-visual users cannot tell whether an action worked.
 
-6. **Admin auto-refresh destroys table focus and overwrites user feedback** (`crates/rcaster-service/src/admin.rs:4144`, `crates/rcaster-service/src/admin.rs:4186`)
+6. **[Fixed] Admin auto-refresh destroys table focus and overwrites user feedback** (`crates/rcaster-service/src/admin.rs:4144`, `crates/rcaster-service/src/admin.rs:4186`)
    - **What this is:** Every 10 seconds `load()` replaces table children and sets status to “Loading…” then “Connected”.
    - **Problem:** If focus is on an Edit/Delete button, the node is destroyed and focus drops. A “User saved”, “Disconnect accepted” or error message is also replaced within 10 seconds.
    - **Fix:** Keep the connection indicator separate from action toasts, and update rows by stable key instead of replacing the whole table. Test focus survives refresh and a success message remains visible.
    - **If we skip it:** Keyboard users lose their place and operators miss action outcomes.
 
-7. **Create and edit modes are not visible or cancellable** (`crates/rcaster-service/src/admin.rs:4168`, `crates/rcaster-service/src/admin.rs:4174`)
+7. **[Partially fixed] Create and edit modes are not visible or cancellable** (`crates/rcaster-service/src/admin.rs:4168`, `crates/rcaster-service/src/admin.rs:4174`)
    - **What this is:** Clicking Edit fills the same form used for Create. There is no mode label, Cancel, Clear or reset after save.
    - **Problem:** After saving an edit, the fields remain and the revision resets to Create mode. Pressing Save again attempts to create a duplicate. Users can also unknowingly overwrite another edit context.
    - **Fix:** Add an explicit “Creating / Editing X” label, Cancel button, and clear/reset after save. Change the button text to “Create” or “Update”.
    - **If we skip it:** Routine CRUD produces duplicate requests and user confusion.
 
-8. **Raw JSON errors are shown as backend text** (`crates/rcaster-service/src/admin.rs:4140`, `crates/rcaster-service/src/public.rs:1382`)
+8. **[Fixed] Raw JSON errors are shown as backend text** (`crates/rcaster-service/src/admin.rs:4140`, `crates/rcaster-service/src/public.rs:1382`)
    - **What this is:** `api()` throws the complete response text.
    - **Problem:** A 400/403/409/429 produces raw JSON or an empty body in the status line. Users do not get the offending field, a conflict explanation or a lockout countdown.
    - **Fix:** Parse `{code,message}` once, map common statuses to concise messages, and show field errors beside the form. Test 400, 401, 403, 409, 429 and 503.
