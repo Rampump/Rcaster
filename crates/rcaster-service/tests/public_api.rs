@@ -18,7 +18,7 @@ use rcaster_service::{
     connections::ConnectionController,
     coordinator_admission::{AdmissionCoordinator, CoordinatorOptions},
     hub::MountpointHub,
-    public::{PublicMapTiles, PublicState, serve_public},
+    public::{PublicMapCoordinateSystem, PublicMapTiles, PublicState, serve_public},
     public_auth,
 };
 use tokio::{
@@ -148,6 +148,7 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
                 attribution: "Test tiles".to_owned(),
                 min_zoom: 1,
                 max_zoom: 18,
+                coordinate_system: PublicMapCoordinateSystem::Gcj02,
             }),
             proxy_protocol: None,
             connections: Arc::new(ConnectionController::default()),
@@ -173,6 +174,10 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     assert!(page.contains("initializeMapControls"));
     assert!(page.contains("function drawMap"));
     assert!(page.contains("function mapBbox"));
+    assert!(page.contains("function wgs84ToGcj02"));
+    assert!(page.contains("coordinate_system"));
+    assert!(page.contains("dataset.mountpoint"));
+    assert!(page.contains("dataset.displayLongitude"));
     assert!(page.contains("async function refreshMap"));
     assert!(page.contains("/api/v1/public/map/stations?bbox="));
     assert!(page.contains("/api/v1/mountpoints?limit=200"));
@@ -307,6 +312,7 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     let map_config = request(address, "/api/v1/public/map/config").await;
     assert!(map_config.contains("\"attribution\":\"Test tiles\""));
     assert!(map_config.contains("\"max_zoom\":18"));
+    assert!(map_config.contains("\"coordinate_system\":\"gcj02\""));
     let history = request(address, "/api/v1/public/streams/C63/history?limit=1").await;
     assert!(history.contains("\"mountpoint\":\"C63\""));
     assert!(history.contains("\"packets\":0"));

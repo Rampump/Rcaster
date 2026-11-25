@@ -871,6 +871,7 @@ async fn serve(args: &[String]) -> AppResult<()> {
                         attribution: tiles.attribution.clone(),
                         min_zoom: tiles.min_zoom,
                         max_zoom: tiles.max_zoom,
+                        coordinate_system: tiles.coordinate_system,
                     }),
                 proxy_protocol: proxy_protocol.clone(),
                 connections: Arc::clone(&connections),

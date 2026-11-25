@@ -32,3 +32,9 @@ configuration with generation advancement and previews/completes a batch
 user-disable operation through the browser. Console exceptions, uncaught
 errors, failed network requests, and unexpected HTTP errors fail the run.
 Disabling an active mountpoint is also verified to close its live source.
+
+The public map test also injects the 1,301-station CRTK.NET snapshot into the
+production map JavaScript, verifies low-zoom cluster totals, and compares 15
+individual marker pixel positions against an independent WGS-84/Web-Mercator
+calculation. Standalone uses WGS-84 XYZ tiles; clustered uses GCJ-02 AMap
+satellite tiles. See `MAP_REPORT.md`.

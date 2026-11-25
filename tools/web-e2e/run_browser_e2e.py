@@ -8,6 +8,7 @@ inside one WSL Linux network namespace. It never contacts the soak cluster.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -33,6 +34,11 @@ ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target/release/rcaster"
 CAPTURE = ROOT / "target/com3-rtcm3-capture.bin"
 OUTPUT = ROOT / "tools/web-e2e/runs" / datetime.now().strftime("%Y%m%d-%H%M%S")
+TILE_PIXEL = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "/A8AAusB9Wl2nWQAAAAASUVORK5CYII="
+)
+CRTK_SNAPSHOT = ROOT / "tools/near-e2e/data/crtk-str-20261125.json"
 sys.path.insert(0, str(ROOT / "tools/near-e2e"))
 import rtcm  # noqa: E402
 
@@ -752,6 +758,275 @@ def exercise_admin_mutations(
     return checks
 
 
+def gcj02_from_wgs84(longitude: float, latitude: float) -> tuple[float, float]:
+    if (
+        longitude < 72.004
+        or longitude > 137.8347
+        or latitude < 0.8293
+        or latitude > 55.8271
+    ):
+        return longitude, latitude
+
+    def transform_latitude(x: float, y: float) -> float:
+        value = (
+            -100.0
+            + 2.0 * x
+            + 3.0 * y
+            + 0.2 * y * y
+            + 0.1 * x * y
+            + 0.2 * math.sqrt(abs(x))
+        )
+        value += (
+            20.0 * math.sin(6.0 * x * math.pi)
+            + 20.0 * math.sin(2.0 * x * math.pi)
+        ) * 2.0 / 3.0
+        value += (
+            20.0 * math.sin(y * math.pi)
+            + 40.0 * math.sin(y / 3.0 * math.pi)
+        ) * 2.0 / 3.0
+        value += (
+            160.0 * math.sin(y / 12.0 * math.pi)
+            + 320.0 * math.sin(y * math.pi / 30.0)
+        ) * 2.0 / 3.0
+        return value
+
+    def transform_longitude(x: float, y: float) -> float:
+        value = (
+            300.0
+            + x
+            + 2.0 * y
+            + 0.1 * x * x
+            + 0.1 * x * y
+            + 0.1 * math.sqrt(abs(x))
+        )
+        value += (
+            20.0 * math.sin(6.0 * x * math.pi)
+            + 20.0 * math.sin(2.0 * x * math.pi)
+        ) * 2.0 / 3.0
+        value += (
+            20.0 * math.sin(x * math.pi)
+            + 40.0 * math.sin(x / 3.0 * math.pi)
+        ) * 2.0 / 3.0
+        value += (
+            150.0 * math.sin(x / 12.0 * math.pi)
+            + 300.0 * math.sin(x / 30.0 * math.pi)
+        ) * 2.0 / 3.0
+        return value
+
+    delta_latitude = transform_latitude(longitude - 105.0, latitude - 35.0)
+    delta_longitude = transform_longitude(longitude - 105.0, latitude - 35.0)
+    radians = latitude / 180.0 * math.pi
+    magic = 1.0 - 0.00669342162296594323 * math.sin(radians) ** 2
+    root = math.sqrt(magic)
+    delta_latitude = (
+        delta_latitude
+        * 180.0
+        / (
+            (6378245.0 * (1.0 - 0.00669342162296594323) / (magic * root))
+            * math.pi
+        )
+    )
+    delta_longitude = (
+        delta_longitude
+        * 180.0
+        / (6378245.0 / root * math.cos(radians) * math.pi)
+    )
+    return longitude + delta_longitude, latitude + delta_latitude
+
+
+def haversine_m(
+    left_latitude: float,
+    left_longitude: float,
+    right_latitude: float,
+    right_longitude: float,
+) -> float:
+    radius = 6_371_000.0
+    latitude_delta = math.radians(right_latitude - left_latitude)
+    longitude_delta = math.radians(right_longitude - left_longitude)
+    value = (
+        math.sin(latitude_delta / 2.0) ** 2
+        + math.cos(math.radians(left_latitude))
+        * math.cos(math.radians(right_latitude))
+        * math.sin(longitude_delta / 2.0) ** 2
+    )
+    return radius * 2.0 * math.asin(min(1.0, math.sqrt(value)))
+
+
+def crtk_map_records() -> list[dict]:
+    snapshot = json.loads(CRTK_SNAPSHOT.read_text(encoding="utf-8"))
+    return [
+        record
+        for record in snapshot["records"]
+        if record["mountpoint"] != "NEAR"
+        and -90.0 <= float(record["latitude"]) <= 90.0
+        and -180.0 <= float(record["longitude"]) <= 180.0
+    ]
+
+
+def dense_crtk_subset(records: list[dict]) -> tuple[dict, list[dict]]:
+    best_anchor = records[0]
+    best_nearby: list[dict] = []
+    for anchor in records:
+        nearby = [
+            record
+            for record in records
+            if record is not anchor
+            and haversine_m(
+                float(anchor["latitude"]),
+                float(anchor["longitude"]),
+                float(record["latitude"]),
+                float(record["longitude"]),
+            )
+            <= 30_000.0
+        ]
+        if not 3 <= len(nearby) <= 15:
+            continue
+        if len(nearby) > len(best_nearby):
+            best_anchor = anchor
+            best_nearby = nearby
+    return best_anchor, ([best_anchor] + best_nearby)[:15]
+
+
+def measure_crtk_map(page: Cdp, coordinate_system: str, mode: str) -> dict:
+    records = crtk_map_records()
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    float(record["longitude"]),
+                    float(record["latitude"]),
+                ],
+            },
+            "properties": {
+                "mountpoint": record["mountpoint"],
+                "identifier": record["identifier"],
+                "format": record["format"],
+                "network": record["network"],
+                "region": "crtk.net",
+                "coverage_m": None,
+            },
+        }
+        for record in records
+    ]
+    feature_json = json.dumps(features, ensure_ascii=False, separators=(",", ":"))
+    page.evaluate(
+        "(features=>{window.__crtkMapFeatures=features;"
+        "refreshMap=async()=>{};mapData={type:'FeatureCollection',features};"
+        "mapCamera.initialized=false;renderMap(mapData);"
+        f"return {len(features)};}})({feature_json})"
+    )
+    page.wait_for("document.querySelectorAll('#map circle').length > 0")
+    global_result = page.evaluate(
+        "(() => {const circles=[...document.querySelectorAll('#map circle')];"
+        "return {circle_count:circles.length,"
+        "marker_total:circles.reduce((sum,circle)=>sum+Number(circle.dataset.clusterCount||1),0),"
+        "bbox:mapBbox(),zoom:mapCamera.zoom};})()"
+    )
+    if global_result["marker_total"] != len(features):
+        raise RuntimeError(
+            f"CRTK global marker count mismatch: {global_result} for {len(features)}"
+        )
+
+    anchor, subset = dense_crtk_subset(records)
+    subset_features = [
+        feature
+        for feature in features
+        if feature["properties"]["mountpoint"]
+        in {record["mountpoint"] for record in subset}
+    ]
+    subset_json = json.dumps(
+        subset_features, ensure_ascii=False, separators=(",", ":")
+    )
+    anchor_longitude = float(anchor["longitude"])
+    anchor_latitude = float(anchor["latitude"])
+    display_longitude, display_latitude = (
+        gcj02_from_wgs84(anchor_longitude, anchor_latitude)
+        if coordinate_system == "gcj02"
+        else (anchor_longitude, anchor_latitude)
+    )
+    local_result = page.evaluate(
+        "(features=>{mapData={type:'FeatureCollection',features};"
+        f"const longitude={display_longitude!r},latitude={display_latitude!r};"
+        "mapCamera.centerX=longitudeX(longitude);"
+        "mapCamera.centerY=latitudeY(latitude);"
+        "mapCamera.zoom=Math.min(9,mapZoomBounds()[1]);"
+        "mapCamera.initialized=true;drawMap();"
+        "const shell=document.getElementById('map-shell');"
+        "return {width:shell.clientWidth,height:shell.clientHeight,"
+        "zoom:mapCamera.zoom,centerX:mapCamera.centerX,centerY:mapCamera.centerY,"
+        "bbox:mapBbox(),circles:[...document.querySelectorAll('#map circle')]"
+        ".map(circle=>({mountpoint:circle.dataset.mountpoint,"
+        "longitude:Number(circle.dataset.longitude),latitude:Number(circle.dataset.latitude),"
+        "displayLongitude:Number(circle.dataset.displayLongitude),"
+        "displayLatitude:Number(circle.dataset.displayLatitude),"
+        "x:Number(circle.getAttribute('cx')),y:Number(circle.getAttribute('cy'))}))};})"
+        f"({subset_json})"
+    )
+    size = 256.0 * 2.0 ** int(local_result["zoom"])
+    left = local_result["centerX"] * size - local_result["width"] / 2.0
+    top = local_result["centerY"] * size - local_result["height"] / 2.0
+    errors: list[float] = []
+    coordinate_errors: list[float] = []
+    for circle in local_result["circles"]:
+        display_lon, display_lat = (
+            gcj02_from_wgs84(circle["longitude"], circle["latitude"])
+            if coordinate_system == "gcj02"
+            else (circle["longitude"], circle["latitude"])
+        )
+        expected_x = (display_lon + 180.0) / 360.0 * size - left
+        radians = max(
+            -85.05112878,
+            min(85.05112878, display_lat),
+        ) * math.pi / 180.0
+        expected_y = (
+            1.0
+            - math.log(math.tan(radians) + 1.0 / math.cos(radians)) / math.pi
+        ) / 2.0 * size - top
+        errors.append(
+            math.hypot(circle["x"] - expected_x, circle["y"] - expected_y)
+        )
+        coordinate_errors.append(
+            math.hypot(
+                circle["displayLongitude"] - display_lon,
+                circle["displayLatitude"] - display_lat,
+            )
+        )
+    if not errors:
+        raise RuntimeError("CRTK dense subset produced no visible markers")
+    control_x, control_y = gcj02_from_wgs84(116.397, 39.909)
+    js_control = page.evaluate("wgs84ToGcj02(116.397,39.909)")
+    control_error = math.hypot(
+        js_control[0] - control_x,
+        js_control[1] - control_y,
+    )
+    control_offset_m = haversine_m(39.909, 116.397, control_y, control_x)
+    page.evaluate(
+        "document.getElementById('map-shell')"
+        ".scrollIntoView({block:'center'}); true"
+    )
+    time.sleep(0.2)
+    screenshot = page.send("Page.captureScreenshot", {"format": "png"})
+    screenshot_path = OUTPUT / f"map-{mode}.png"
+    screenshot_path.write_bytes(base64.b64decode(screenshot["data"]))
+    return {
+        "source": str(CRTK_SNAPSHOT.relative_to(ROOT)),
+        "feature_count": len(features),
+        "global": global_result,
+        "dense_anchor": anchor["mountpoint"],
+        "dense_subset": len(subset_features),
+        "visible_markers": len(local_result["circles"]),
+        "local_bbox": local_result["bbox"],
+        "max_pixel_error": round(max(errors), 9),
+        "mean_pixel_error": round(sum(errors) / len(errors), 9),
+        "max_coordinate_error_degrees": round(max(coordinate_errors), 12),
+        "gcj02_control_error_degrees": round(control_error, 12),
+        "gcj02_beijing_offset_m": round(control_offset_m, 3),
+        "screenshot": str(screenshot_path.relative_to(ROOT)),
+    }
+
+
 def expected_resource_error(url: str, status: int) -> bool:
     return (
         url.endswith("/favicon.ico")
@@ -873,6 +1148,29 @@ class AdminProxyServer(ThreadingHTTPServer):
         if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
             return
         super().handle_error(request, client_address)
+
+
+class TileServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class TileHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        if not self.path.endswith(".png"):
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(TILE_PIXEL)))
+        self.send_header("Cache-Control", "public, max-age=60")
+        self.end_headers()
+        self.wfile.write(TILE_PIXEL)
 
 
 class AdminProxyHandler(BaseHTTPRequestHandler):
@@ -1003,10 +1301,11 @@ def write_accounts(path: Path) -> None:
 
 def run_test(temp: Path, clustered: bool) -> dict:
     temp.mkdir(parents=True, exist_ok=True)
-    ports = free_ports(9 if clustered else 5)
+    ports = free_ports(10 if clustered else 6)
     clear_port, public_port, admin_port, health_port, debug_port = ports[:5]
+    tile_port = ports[5]
     etcd_client_port, etcd_peer_port, tls_port, admin_proxy_port = (
-        ports[5:] if clustered else (None, None, None, None)
+        ports[6:] if clustered else (None, None, None, None)
     )
     subprocess.run(
         [
@@ -1100,6 +1399,18 @@ def run_test(temp: Path, clustered: bool) -> dict:
         "client_auth_require_tls": False,
         "source_auth_require_tls": False,
         "head_timeout_ms": 5000,
+        "public_map_tiles": {
+            "url_template": (
+                "https://webst01.is.autonavi.com/appmaptile"
+                "?style=6&x={x}&y={y}&z={z}"
+                if clustered
+                else f"https://127.0.0.1:{tile_port}/{{z}}/{{x}}/{{y}}.png"
+            ),
+            "attribution": "© 高德地图" if clustered else "OSM-compatible test tiles",
+            "min_zoom": 0,
+            "max_zoom": 19 if not clustered else 18,
+            "coordinate_system": "gcj02" if clustered else "wgs84",
+        },
     }
     if clustered:
         config["tls_bind"] = f"127.0.0.1:{tls_port}"
@@ -1168,6 +1479,22 @@ def run_test(temp: Path, clustered: bool) -> dict:
             check=True,
             capture_output=True,
         )
+    tile_server = TileServer(("127.0.0.1", tile_port), TileHandler)
+    tile_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tile_context.load_cert_chain(
+        str(temp / "server.crt"),
+        str(temp / "server.key"),
+    )
+    tile_server.socket = tile_context.wrap_socket(
+        tile_server.socket,
+        server_side=True,
+    )
+    tile_thread = threading.Thread(
+        target=tile_server.serve_forever,
+        name="browser-e2e-tile-server",
+        daemon=True,
+    )
+    tile_thread.start()
     caster_log = (temp / "caster.log").open("w+", encoding="utf-8")
     caster = subprocess.Popen(
         [str(BINARY), "serve", "--config", str(temp / "caster.json")],
@@ -1292,6 +1619,25 @@ def run_test(temp: Path, clustered: bool) -> dict:
             "({mounts:document.getElementById('mounts').textContent,"
             "map_points:document.querySelectorAll('#map circle').length})"
         )
+        public.wait_for(
+            "document.querySelectorAll('#tile-layer img').length > 0"
+        )
+        public.wait_for(
+            "[...document.querySelectorAll('#tile-layer img')]"
+            ".every(image=>image.complete)"
+        )
+        result["checks"]["public_map_tiles"] = public.evaluate(
+            "(() => {const images=[...document.querySelectorAll('#tile-layer img')];"
+            "return {coordinate_system:tileConfig.coordinate_system,"
+            "count:images.length,loaded:images.filter(image=>image.naturalWidth>0).length,"
+            "hosts:[...new Set(images.map(image=>new URL(image.src).host))],"
+            "attribution:document.getElementById('map-attribution').textContent};})()"
+        )
+        result["checks"]["public_crtk_map"] = measure_crtk_map(
+            public,
+            result["checks"]["public_map_tiles"]["coordinate_system"],
+            "clustered" if clustered else "standalone",
+        )
         result["checks"]["public_login_result"] = public.evaluate(
             "(() => {"
             "document.getElementById('username').value='owner';"
@@ -1392,6 +1738,9 @@ def run_test(temp: Path, clustered: bool) -> dict:
             admin_proxy.server_close()
         if proxy_thread is not None:
             proxy_thread.join(timeout=3)
+        tile_server.shutdown()
+        tile_server.server_close()
+        tile_thread.join(timeout=3)
         for process in (chrome, caster, etcd):
             if process is not None and process.poll() is None:
                 try:

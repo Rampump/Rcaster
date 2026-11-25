@@ -7,6 +7,7 @@ use std::{
 use rcaster_service::{
     hub::HealthThresholds,
     proxy_protocol::ProxyProtocolConfig,
+    public::PublicMapCoordinateSystem,
     session_limit::SessionLimitConfig,
     tls_reload::{
         OcspResponderConfig,
@@ -129,6 +130,8 @@ pub struct PublicMapTilesConfig {
     pub min_zoom: u8,
     #[serde(default = "default_map_max_zoom")]
     pub max_zoom: u8,
+    #[serde(default)]
+    pub coordinate_system: PublicMapCoordinateSystem,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1085,7 +1088,7 @@ fn health_bind_requires_auth(bind: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PublicMapTilesConfig, valid_public_map_tiles};
+    use super::{PublicMapCoordinateSystem, PublicMapTilesConfig, valid_public_map_tiles};
 
     #[test]
     fn validates_public_tile_templates() {
@@ -1094,6 +1097,7 @@ mod tests {
             attribution: "Example".to_owned(),
             min_zoom: 1,
             max_zoom: 18,
+            coordinate_system: PublicMapCoordinateSystem::Gcj02,
         };
         assert!(valid_public_map_tiles(&valid));
         let mut invalid = valid.clone();
