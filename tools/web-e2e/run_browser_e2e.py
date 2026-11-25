@@ -218,6 +218,13 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
     checks["admin_source_filter"] = page.evaluate(
         "document.getElementById('sources').textContent"
     )
+    checks["admin_source_pagination"] = measure_admin_source_pagination(page)
+    if checks["admin_source_pagination"]["rows"] != 150:
+        raise RuntimeError(
+            f"admin source pagination failed: {checks['admin_source_pagination']}"
+        )
+    page.evaluate("loadSources()")
+    page.wait_for("document.getElementById('sources').textContent.includes('C63')")
     page.evaluate("showSourceHealth('C63')")
     page.wait_for(
         "document.getElementById('source-health')"
@@ -603,6 +610,12 @@ def exercise_admin_mutations(
         "!document.getElementById('api-tokens').textContent.includes('browser-token')"
     )
     checks["api_token_revoke"] = True
+    checks["api_token_double_submit"] = measure_api_token_double_submit(page)
+    if checks["api_token_double_submit"]["created"] != 1:
+        raise RuntimeError(
+            f"API token double-submit guard failed: "
+            f"{checks['api_token_double_submit']}"
+        )
 
     if clustered:
         page.evaluate(
@@ -918,11 +931,17 @@ def measure_crtk_map(page: Cdp, coordinate_system: str, mode: str) -> dict:
         "(() => {const circles=[...document.querySelectorAll('#map circle')];"
         "return {circle_count:circles.length,"
         "marker_total:circles.reduce((sum,circle)=>sum+Number(circle.dataset.clusterCount||1),0),"
+        "focusable_markers:circles.filter(circle=>circle.tabIndex===0&&"
+        "circle.getAttribute('role')==='button').length,"
         "bbox:mapBbox(),zoom:mapCamera.zoom};})()"
     )
     if global_result["marker_total"] != len(features):
         raise RuntimeError(
             f"CRTK global marker count mismatch: {global_result} for {len(features)}"
+        )
+    if global_result["focusable_markers"] != global_result["circle_count"]:
+        raise RuntimeError(
+            f"CRTK map markers are not keyboard accessible: {global_result}"
         )
 
     anchor, subset = dense_crtk_subset(records)
@@ -1062,6 +1081,91 @@ def capture_amap_china_view(page: Cdp) -> dict:
         "hosts:[...new Set(images.map(image=>new URL(image.src).host))],"
         "screenshot:'tools/web-e2e/runs/"
         f"{OUTPUT.name}/map-amap-china.png'}};}})()"
+    )
+
+
+def measure_public_directory_pagination(page: Cdp) -> dict:
+    return page.evaluate(
+        "(async()=>{"
+        "const originalFetch=window.fetch;"
+        "const records=Array.from({length:250},(_,index)=>({"
+        "mountpoint:'PAGE'+String(index).padStart(4,'0'),"
+        "format:'RTCM 3.3',region:'pagination-test'}));"
+        "window.fetch=(input,options)=>{"
+        "const url=typeof input==='string'?input:input.url;"
+        "const parsed=new URL(url,location.origin);"
+        "if(parsed.pathname==='/api/v1/mountpoints'){"
+        "const limit=Number(parsed.searchParams.get('limit')||100);"
+        "const cursor=parsed.searchParams.get('cursor');"
+        "const start=cursor?records.findIndex(record=>record.mountpoint>cursor):0;"
+        "const page=records.slice(Math.max(0,start),Math.max(0,start)+limit);"
+        "const next=start+limit<records.length?records[start+limit-1].mountpoint:null;"
+        "return Promise.resolve(new Response(JSON.stringify("
+        "{mountpoints:page,next_cursor:next}),"
+        "{status:200,headers:{'Content-Type':'application/json'}}));}"
+        "return originalFetch(input,options)};"
+        "try{await load();"
+        "return {rows:document.querySelectorAll('#mounts tr').length,"
+        "first:document.querySelector('#mounts tr')?.textContent||'',"
+        "last:[...document.querySelectorAll('#mounts tr')].at(-1)?.textContent||''};"
+        "}finally{window.fetch=originalFetch}})()"
+    )
+
+
+def measure_admin_source_pagination(page: Cdp) -> dict:
+    return page.evaluate(
+        "(async()=>{"
+        "const originalFetch=window.fetch;"
+        "const records=Array.from({length:150},(_,index)=>({"
+        "mountpoint:'SRC'+String(index).padStart(4,'0'),format:'RTCM 3.3',"
+        "format_details:'1005,1074',caster_id:'pagination-caster',"
+        "admission:{validation_result:'pass',msm_versions:[4]},region:'pagination-test'}));"
+        "window.fetch=(input,options)=>{"
+        "const url=typeof input==='string'?input:input.url;"
+        "const parsed=new URL(url,location.origin);"
+        "if(parsed.pathname==='/admin/v1/sources'){"
+        "const limit=Number(parsed.searchParams.get('limit')||100);"
+        "const cursor=parsed.searchParams.get('cursor');"
+        "const start=cursor?records.findIndex(record=>record.mountpoint>cursor):0;"
+        "const page=records.slice(Math.max(0,start),Math.max(0,start)+limit);"
+        "const next=start+limit<records.length?records[start+limit-1].mountpoint:null;"
+        "return Promise.resolve(new Response(JSON.stringify("
+        "{sources:page,next_cursor:next}),"
+        "{status:200,headers:{'Content-Type':'application/json'}}));}"
+        "return originalFetch(input,options)};"
+        "try{await loadSources();"
+        "return {rows:document.querySelectorAll('#sources tr').length,"
+        "first:document.querySelector('#sources tr')?.textContent||'',"
+        "last:[...document.querySelectorAll('#sources tr')].at(-1)?.textContent||''};"
+        "}finally{window.fetch=originalFetch}})()"
+    )
+
+
+def measure_api_token_double_submit(page: Cdp) -> dict:
+    return page.evaluate(
+        "(async()=>{"
+        "const before=await api('/admin/v1/api-tokens');"
+        "const originalFetch=window.fetch;"
+        "window.fetch=(input,options)=>{"
+        "const url=typeof input==='string'?input:input.url;"
+        "const parsed=new URL(url,location.origin);"
+        "if(parsed.pathname==='/admin/v1/api-tokens'&&"
+        "(options?.method||'GET')==='POST'){"
+        "return new Promise(resolve=>setTimeout(()=>"
+        "resolve(originalFetch(input,options)),150));}"
+        "return originalFetch(input,options)};"
+        "document.getElementById('api-token-name').value='double-submit';"
+        "document.getElementById('api-token-expiry').value='60';"
+        "try{await Promise.allSettled([createApiToken(),createApiToken()]);}"
+        "finally{window.fetch=originalFetch}"
+        "const after=await api('/admin/v1/api-tokens');"
+        "const created=after.tokens.filter(token=>token.name==='double-submit');"
+        "for(const token of created){"
+        "await api('/admin/v1/api-tokens/'+encodeURIComponent(token.token_id),"
+        "{method:'DELETE'})}"
+        "return {before:before.tokens.length,after:after.tokens.length,"
+        "created:created.length,secret:document.getElementById('api-token-secret')"
+        ".textContent.startsWith('rcaster_')};})()"
     )
 
 
@@ -1640,6 +1744,18 @@ def run_test(temp: Path, clustered: bool) -> dict:
             result["checks"]["public_map_amap_china"] = capture_amap_china_view(
                 public
             )
+        result["checks"]["public_directory_pagination"] = (
+            measure_public_directory_pagination(public)
+        )
+        if result["checks"]["public_directory_pagination"]["rows"] != 250:
+            raise RuntimeError(
+                "public directory pagination failed: "
+                f"{result['checks']['public_directory_pagination']}"
+            )
+        public.evaluate("load()")
+        public.wait_for(
+            "document.getElementById('mounts').textContent.includes('C63')"
+        )
         result["checks"]["public_login_result"] = public.evaluate(
             "(() => {"
             "document.getElementById('username').value='owner';"

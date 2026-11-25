@@ -180,7 +180,8 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     assert!(page.contains("dataset.displayLongitude"));
     assert!(page.contains("async function refreshMap"));
     assert!(page.contains("/api/v1/public/map/stations?bbox="));
-    assert!(page.contains("/api/v1/mountpoints?limit=200"));
+    assert!(page.contains("/api/v1/mountpoints?"));
+    assert!(page.contains("next_cursor"));
     assert!(page.contains("function drawMapClusters"));
     assert!(page.contains("tile-layer"));
     assert!(page.contains("https://tiles.example.test"));
