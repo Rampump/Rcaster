@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-25 23:48 CST
+Status date: 2026-11-26 00:24 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`19ed7ca` (committed locally, not pushed or deployed)
+`df6a501` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -41,7 +41,7 @@ not be described as final production acceptance.
 | 18.10 Ownership and reconnect | Verified | Automated tests cover owner-only writes, runtime epoch changes, source generation fencing, lease expiry, stale cache replacement and old-connection rejection. | Repeat a post-window orphan-key and source/session count audit. |
 | 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater unit tests cover artifact download, slot switching, and SIGTERM-before-drain with KILL fallback. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
-| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` uses top-level server TLS, and standalone public sessions/tickets now use bounded in-process state instead of requiring etcd. Standalone API tokens persist in redb, support create/list/revoke/Bearer authentication, and are invalidated by user auth-version changes; standalone logout no longer requires cluster runtime. Headless Chromium validation covers both standalone and clustered admin login/logout, user and mountpoint create/update/disable/delete, blacklist create/update/delete, API token create/list/revoke, maintenance toggle, clustered config apply with automatic generation advancement, batch user-disable preview/completion, health/history/operation UI, source filtering, public map/login/ticket/WebSocket, user-disable client disconnect, live session drop and source disconnect. The browser run had no unexpected console or network errors. | Public web is not exposed on the protected test deployment (`public_bind=null`); external DNS/LB, production tile service, large-map behavior and production monitor load remain unverified. |
+| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` uses top-level server TLS, and standalone public sessions/tickets now use bounded in-process state instead of requiring etcd. Standalone API tokens persist in redb, support create/list/revoke/Bearer authentication, prune expired records, and are invalidated by user auth-version changes; standalone logout no longer requires cluster runtime. Standalone and clustered management now support NTRIP/Web user flags, full mountpoint coordinates/coverage/STR/source expectations, local session listing and single-session drop, and live source disconnect. Headless Chromium validation covers both modes for admin login/logout, user and mountpoint CRUD, blacklist CRUD, API token create/list/revoke, maintenance toggle, clustered config apply, batch user-disable, health/history/operation UI, source filtering, public map/login/ticket/WebSocket, user-disable disconnect, session drop and source disconnect. The browser run had no unexpected console or network errors. | Public web is not exposed on the protected test deployment (`public_bind=null`); external DNS/LB, production tile service, large-map behavior and production monitor load remain unverified. |
 
 ## Operational Completeness Follow-up
 
@@ -76,7 +76,7 @@ Final current-tree verification on 2026-11-25:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `71EFE86D126E902133F92DBA7F3C3F68CACB7500C7D78CA9A3CA596370ACD706`.
+  `0E391487EF01F14460D42C307DCEFE98553D0D8B7054BA9C583D6AF7A070156B`.
 - The full ignored integration suite was rerun after the source lifecycle
   changes. One initial leader-failover attempt hit a temporary etcd startup
   race; the failing test then passed alone and the complete ignored suite
@@ -91,7 +91,7 @@ Final current-tree verification on 2026-11-25:
   all L2a static/boundary/hysteresis/switch/rate/jump/HDOP/TTL/failover/
   no-alternative-timeout/concurrency checks, and the 1,301-source / 50
   non-station-query L2b sample pass.
-- Browser validation: `tools/web-e2e/runs/20261125-234052/result.json`.
+- Browser validation: `tools/web-e2e/runs/20261126-001733/result.json`.
   Standalone admin/public browser flows and clustered etcd/mTLS/public flows
   pass with no unexpected console or network failures.
 
@@ -129,6 +129,9 @@ Commit `8108912` closes the remaining code gaps tracked by
 - Standalone API tokens persist in redb with scope, expiry and last-used
   metadata. Create/list/revoke/Bearer authentication and auth-version
   invalidation are covered by API and browser tests.
+- Standalone local sessions are registered with user, mountpoint, NTRIP
+  version, client IP and source/client type, and can be disconnected by ID.
+  Live sources can be disconnected by mountpoint in both deployment modes.
 - The real local COM3 capture again passed
   `uploaded_rtcm3_generates_active_etcd_str_record`: upload, RTCM parsing,
   admission, ACTIVE source generation and etcd STR creation with 1005/1074 and

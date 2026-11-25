@@ -111,6 +111,10 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 - [x] Toggle maintenance mode through the browser in standalone and clustered
   deployments.
 - [x] Exercise blacklist rule create/update/delete through the browser.
+- [x] Exercise NTRIP/Web user permissions and full mountpoint metadata
+  through the browser.
+- [x] Exercise local session listing, single-session drop and live source
+  disconnect in standalone and clustered modes.
 - [x] Preview and complete a clustered batch user-disable operation through
   the browser.
 - [x] Exercise public directory, map, login, ticket and monitor WebSocket.
@@ -120,12 +124,13 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 Evidence:
 
 - `tools/web-e2e/run_browser_e2e.py`
-- `tools/web-e2e/runs/20261125-232714/result.json`
+- `tools/web-e2e/runs/20261126-001733/result.json`
 - Standalone: real admin login/source/health/history/config and public
-  login/ticket/WebSocket flows pass with no unexpected browser or network
-  errors.
+  login/ticket/WebSocket, local session drop and source disconnect flows pass
+  with no unexpected browser or network errors.
 - Clustered: local etcd, mTLS admin configuration, RTCM3 STR publication and
-  public login/ticket/WebSocket pass on the same isolated host.
+  public login/ticket/WebSocket/session/source disconnect pass on the same
+  isolated host.
 
 ## Task 15: Final External Acceptance
 
