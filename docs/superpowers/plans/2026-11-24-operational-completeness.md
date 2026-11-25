@@ -124,13 +124,14 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 Evidence:
 
 - `tools/web-e2e/run_browser_e2e.py`
-- `tools/web-e2e/runs/20261126-001733/result.json`
+- `tools/web-e2e/runs/20261126-003511/result.json`
 - Standalone: real admin login/source/health/history/config and public
   login/ticket/WebSocket, local session drop and source disconnect flows pass
   with no unexpected browser or network errors.
 - Clustered: local etcd, mTLS admin configuration, RTCM3 STR publication and
   public login/ticket/WebSocket/session/source disconnect pass on the same
   isolated host.
+- Both modes verify that disabling an active mountpoint closes its live source.
 
 ## Task 15: Final External Acceptance
 
