@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-26 01:47 CST
+Status date: 2026-11-26 01:51 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -9,7 +9,7 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`91b2272` (committed locally, not pushed or deployed)
+`98eab6b` (committed locally, not pushed or deployed)
 
 ## Status
 
@@ -76,7 +76,7 @@ Final current-tree verification on 2026-11-25:
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
 - Release build: pass; `target/release/rcaster` SHA-256
-  `561B85AE6815C28A099CA1C131BF152842DF07F0F4F6349E73EA070AFE6B1FFB`.
+  `70F262BE40E17F54B7CFA0CFFBF73435FFBC39F7F8016B8E88F4DC43F0D3BDD7`.
 - The full ignored integration suite was rerun after the source lifecycle
   changes. One initial leader-failover attempt hit a temporary etcd startup
   race; the failing test then passed alone and the complete ignored suite
@@ -91,7 +91,7 @@ Final current-tree verification on 2026-11-25:
   all L2a static/boundary/hysteresis/switch/rate/jump/HDOP/TTL/failover/
   no-alternative-timeout/concurrency checks, and the 1,301-source / 50
   non-station-query L2b sample pass.
-- Browser validation: `tools/web-e2e/runs/20261126-014406/result.json`.
+- Browser validation: `tools/web-e2e/runs/20261126-015017/result.json`.
   Standalone admin/public browser flows and clustered etcd/mTLS/public flows
   pass with no unexpected console or network failures.
 - CRTK map validation: `tools/web-e2e/MAP_REPORT.md` records 1,301 stations,

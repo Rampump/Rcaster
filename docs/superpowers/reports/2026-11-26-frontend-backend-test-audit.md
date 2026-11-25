@@ -39,6 +39,10 @@ Implementation progress:
 - Finding 7 is now complete, and findings 9–10 are fixed by commit `91b2272`.
 - Browser evidence:
   `tools/web-e2e/runs/20261126-014406/result.json`.
+- Finding 14 is fixed by commit `98eab6b`.
+- Browser evidence:
+  `tools/web-e2e/runs/20261126-015017/result.json`; admin and public pages
+  have no horizontal overflow at 390×844.
 
 ## Coverage map
 
@@ -142,7 +146,7 @@ Implementation progress:
     - **Fix:** Use one shared accessible confirmation dialog with target and impact count; disable the action while pending. Keep typed confirmation only for cluster-wide operations.
     - **If we skip it:** A fast double-click or wrong row can disconnect the wrong service.
 
-14. **No mobile or overflow design** (`crates/rcaster-service/src/admin.rs:4105`, `crates/rcaster-service/src/public.rs:1373`)
+14. **[Fixed] No mobile or overflow design** (`crates/rcaster-service/src/admin.rs:4105`, `crates/rcaster-service/src/public.rs:1373`)
     - **What this is:** There is a viewport meta tag, but no media query or horizontal table wrapper.
     - **Problem:** On a 390 px phone, wide tables and 360 px inputs grow the page wider than the viewport. Map touch zoom is not explicitly tested, and buttons have small spacing.
     - **Fix:** Add a table scroll container, stack form fields under a mobile breakpoint, and test 390×844 plus 768×1024 with touch.
