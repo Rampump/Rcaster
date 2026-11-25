@@ -2,6 +2,11 @@
 
 Date: 2026-11-26
 
+Code commit: `1150633`
+
+Release SHA-256:
+`942B94274D6A8B854C4429A720FF1706371C524B7DABA62435AC2272F56FAF26`
+
 ## Data
 
 - Source snapshot: `tools/near-e2e/data/crtk-str-20261125.json`
