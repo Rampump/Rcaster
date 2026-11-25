@@ -605,6 +605,49 @@ async fn handle(
     {
         return Ok(result);
     }
+    if state.runtime.is_none() && method == "POST" && path == "/admin/v1/maintenance" {
+        let Ok(body) = serde_json::from_str::<Value>(body) else {
+            return Ok(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"invalid JSON body"}),
+            ));
+        };
+        let Some(maintenance) = body.get("maintenance").and_then(Value::as_bool) else {
+            return Ok(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"maintenance must be a boolean"}),
+            ));
+        };
+        if let Some(path) = &state.maintenance_state
+            && let Err(error) = maintenance::save(path, maintenance)
+        {
+            return Ok(response(
+                503,
+                json!({
+                    "code":"UNAVAILABLE",
+                    "message":format!("maintenance state cannot be persisted: {error}"),
+                }),
+            ));
+        }
+        state.ready.set_maintenance(maintenance);
+        audit(
+            state,
+            source_ip,
+            access_actor(&access),
+            "node.maintenance",
+            &state.caster_id,
+            "success",
+            json!({"maintenance": maintenance}),
+        );
+        return Ok(response(
+            200,
+            json!({
+                "caster_id": state.caster_id,
+                "maintenance": maintenance,
+                "ready": state.ready.is_ready(),
+            }),
+        ));
+    }
     if method != "GET" {
         let Some(runtime) = &state.runtime else {
             return Ok(response(

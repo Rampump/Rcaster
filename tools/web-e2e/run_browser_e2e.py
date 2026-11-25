@@ -278,6 +278,20 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
         checks["config_apply"] = page.evaluate(
             "JSON.parse(document.getElementById('config-status').textContent).generation"
         )
+    page.evaluate("setMaintenance(true)")
+    page.wait_for(
+        "document.getElementById('maintenance').textContent.includes('true')"
+    )
+    checks["maintenance_enable"] = page.evaluate(
+        "document.getElementById('maintenance').textContent"
+    )
+    page.evaluate("setMaintenance(false)")
+    page.wait_for(
+        "document.getElementById('maintenance').textContent.includes('false')"
+    )
+    checks["maintenance_disable"] = page.evaluate(
+        "document.getElementById('maintenance').textContent"
+    )
     return checks
 
 
