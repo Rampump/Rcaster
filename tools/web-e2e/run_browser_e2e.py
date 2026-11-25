@@ -261,6 +261,23 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
         f".textContent.includes('{operation_result}')"
     )
     checks["admin_health_history_config_operation"] = True
+    if clustered:
+        page.evaluate(
+            "(() => {"
+            "const config=JSON.parse(document.getElementById('config-json').value);"
+            "config.source_health.alert_clear_s=31;"
+            "document.getElementById('config-json').value=JSON.stringify(config,null,2);"
+            "return saveConfig();"
+            "})()"
+        )
+        page.wait_for(
+            "(() => {const status=JSON.parse("
+            "document.getElementById('config-status').textContent);"
+            "return status.generation>=2;})()"
+        )
+        checks["config_apply"] = page.evaluate(
+            "JSON.parse(document.getElementById('config-status').textContent).generation"
+        )
     return checks
 
 
