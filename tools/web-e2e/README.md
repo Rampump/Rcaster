@@ -9,6 +9,8 @@ servers are not contacted.
 
 - Debian/WSL with `chromium`, `openssl`, `etcd`, `etcdctl`,
   `python3-websockets`, and `python`.
+- Optional cross-browser smoke: `firefox-esr`, `python3-selenium`, and a
+  compatible `geckodriver` on `PATH` or at `~/.local/bin/geckodriver`.
 - A release binary at `target/release/rcaster`.
 - `target/com3-rtcm3-capture.bin`.
 
@@ -32,6 +34,19 @@ configuration with generation advancement and previews/completes a batch
 user-disable operation through the browser. Console exceptions, uncaught
 errors, failed network requests, and unexpected HTTP errors fail the run.
 Disabling an active mountpoint is also verified to close its live source.
+
+The HCI gate also verifies paired coordinate errors, required user passwords,
+JSON field invalidation, configuration diff before Apply, the accessible
+destructive-action impact dialog, bounded refresh retry with `Data stale`,
+idle public-session expiry, reconnect status from the active socket, and
+single-flight mutation controls. Batch preview/start and operation Cancel/Retry
+are exercised when the local etcd-backed mode is available.
+
+When Firefox prerequisites are present, both modes also run a Firefox 153.7 ESR
+smoke covering public directory rendering, login, monitor snapshot, OSM/AMap
+tile requests, administrator login, source rendering, configuration-preview
+controls and upgrade controls. The check records screenshots and fails on
+window errors or unhandled Promise rejections.
 
 The public map test also injects the 1,301-station CRTK.NET snapshot into the
 production map JavaScript, verifies low-zoom cluster totals, and compares 15

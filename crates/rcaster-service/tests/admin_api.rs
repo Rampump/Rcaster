@@ -128,6 +128,16 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("startBatchDisable"));
     assert!(page.contains("AbortController"));
     assert!(page.contains("loggingOut"));
+    assert!(page.contains("Data stale."));
+    assert!(page.contains("data-freshness"));
+    assert!(page.contains("confirm-dialog"));
+    assert!(page.contains("validateUserForm"));
+    assert!(page.contains("validateMountForm"));
+    assert!(page.contains("previewConfig"));
+    assert!(page.contains("config-diff"));
+    assert!(page.contains("previewUpgrade"));
+    assert!(page.contains("upgrade-rollback"));
+    assert!(page.contains("class=\"write-control\""));
     assert!(page.contains("loadUpgrade"));
     assert!(page.contains("Audit"));
     assert!(page.contains("admin/v1/auth/login"));

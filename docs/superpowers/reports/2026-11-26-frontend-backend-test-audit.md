@@ -49,6 +49,21 @@ Implementation progress:
   upgrade mutation controls remain.
 - Browser evidence:
   `tools/web-e2e/runs/20261126-015339/result.json`.
+- Findings 3, 10-13, 15 and 17 are now closed for the local browser scope:
+  - configuration changes require a field-level diff preview before Apply;
+  - destructive actions use an accessible impact dialog with pending disable;
+  - paired coordinates, owner, password, radius and JSON errors are identified
+    before a write;
+  - admin and public views retain data and show `Data stale` with bounded retry;
+  - public idle session checks detect expiry and monitor reconnect status is
+    tied to the active socket;
+  - the browser gate runs Chromium plus Firefox 153.7 ESR in standalone and
+    clustered modes.
+- Final local evidence:
+  `tools/web-e2e/runs/20261126-023629/result.json`.
+- Firefox found and verified a startup auth race where an old anonymous 401
+  could clear a newly authenticated admin session. `api()` now binds 401
+  handling to the auth generation captured when the request started.
 
 ## Coverage map
 
@@ -84,7 +99,7 @@ Implementation progress:
    - **Fix:** Add cursor pagination or “Load more” to the source table. Test 101 sources and filtered result sets across page boundaries.
    - **If we skip it:** Operators get an incomplete active-source view under normal capacity.
 
-3. **[Fixed for token creation] Repeated clicks can create hidden credentials or duplicate writes** (`crates/rcaster-service/src/admin.rs:4169`, `crates/rcaster-service/src/admin.rs:4175`, `crates/rcaster-service/src/admin.rs:4183`)
+3. **[Fixed] Repeated clicks can create hidden credentials or duplicate writes** (`crates/rcaster-service/src/admin.rs:4169`, `crates/rcaster-service/src/admin.rs:4175`, `crates/rcaster-service/src/admin.rs:4183`)
    - **What this is:** Save/Create/Start buttons remain enabled while requests are running.
    - **Problem:** Double-clicking “Create token” can create two valid tokens. The second secret replaces the first in `api-token-secret`, while the first token remains active but its secret is lost. User/mountpoint saves can similarly produce duplicate requests and confusing 409 errors.
    - **Fix:** Add one in-flight flag per action and disable the initiating button until completion. Clear the token secret before creating another token. Test one double-click produces one token.
@@ -134,19 +149,19 @@ Implementation progress:
     - **Fix:** Poll the session at a low rate or handle 401 globally by switching to anonymous mode and showing “Session expired”.
     - **If we skip it:** Users repeatedly click actions that cannot succeed.
 
-11. **Forms have no field-level validation or impact preview** (`crates/rcaster-service/src/admin.rs:4112`, `crates/rcaster-service/src/admin.rs:4113`, `crates/rcaster-service/src/admin.rs:4175`)
+11. **[Fixed] Forms have no field-level validation or impact preview** (`crates/rcaster-service/src/admin.rs:4112`, `crates/rcaster-service/src/admin.rs:4113`, `crates/rcaster-service/src/admin.rs:4175`)
     - **What this is:** Coordinates, coverage, JSON, owner IDs and passwords are sent first and validated by the server.
     - **Problem:** Blank owner, longitude without latitude, invalid JSON or radius zero only produce a generic error after a round trip.
     - **Fix:** Add required/paired-field checks, JSON parse feedback and a summary of affected sessions/sources before disabling/deleting. Keep the server validation.
     - **If we skip it:** Users discover basic errors late and cannot see the impact before a destructive action.
 
-12. **[Partially fixed] Raw JSON fields are too risky for routine administration** (`crates/rcaster-service/src/admin.rs:4113`, `crates/rcaster-service/src/admin.rs:4121`)
+12. **[Fixed for the local browser scope] Raw JSON fields are too risky for routine administration** (`crates/rcaster-service/src/admin.rs:4113`, `crates/rcaster-service/src/admin.rs:4121`)
     - **What this is:** STR fields, source expectations and the full caster config are edited as JSON.
     - **Problem:** One missing quote or comma loses the edit context and yields a raw parse error. There is no schema example, format button or diff before Apply.
     - **Fix:** Add JSON validation on blur, collapsible field help/examples, and a read-only diff preview before applying config.
     - **If we skip it:** Configuration mistakes become likely during incident response.
 
-13. **Destructive controls have weak context and no busy state** (`crates/rcaster-service/src/admin.rs:4163`, `crates/rcaster-service/src/admin.rs:4170`, `crates/rcaster-service/src/admin.rs:4176`, `crates/rcaster-service/src/admin.rs:4184`)
+13. **[Fixed] Destructive controls have weak context and no busy state** (`crates/rcaster-service/src/admin.rs:4163`, `crates/rcaster-service/src/admin.rs:4170`, `crates/rcaster-service/src/admin.rs:4176`, `crates/rcaster-service/src/admin.rs:4184`)
     - **What this is:** Source/session/user/mountpoint/token actions use `confirm()` and then send the request.
     - **Problem:** The dialog does not show affected users, sessions or active source state, and can be triggered twice before the row refreshes.
     - **Fix:** Use one shared accessible confirmation dialog with target and impact count; disable the action while pending. Keep typed confirmation only for cluster-wide operations.
@@ -158,7 +173,7 @@ Implementation progress:
     - **Fix:** Add a table scroll container, stack form fields under a mobile breakpoint, and test 390×844 plus 768×1024 with touch.
     - **If we skip it:** Public station lookup and admin actions are hard to use on phones and tablets.
 
-15. **Offline and slow-network behavior is untested and has no stale-data state** (`crates/rcaster-service/src/admin.rs:4144`, `crates/rcaster-service/src/public.rs:1384`)
+15. **[Fixed for browser data refresh] Offline and slow-network behavior is untested and has no stale-data state** (`crates/rcaster-service/src/admin.rs:4144`, `crates/rcaster-service/src/public.rs:1384`)
     - **What this is:** Both pages refresh on timers and replace data when requests succeed.
     - **Problem:** A failed refresh leaves old data without a timestamp or “stale” marker. Admin switches back to the login screen for most failures; public leaves the last map/table visible.
     - **Fix:** Track last-success time, show “Data stale” without hiding the current view, add bounded retry/backoff, and test offline → online recovery.
@@ -168,9 +183,16 @@ Implementation progress:
     - **What it is:** The batch selector exposes only `users.disable` and `sessions.drop`; operation lookup has no Cancel/Retry; upgrade UI is lookup-only.
     - **Problem:** Backend actions for user delete, mountpoint disable, owner change, cancel, retry, approve and rollback cannot be exercised through the browser.
     - **Fix:** Add controls in the same existing sections and browser tests for each action’s preview, permission and failure states.
-    - **If we skip it:** The API tests pass but the real operator workflow remains unproven.
+   - **Current state:** All five batch action types, operation Cancel/Retry,
+     upgrade Preview/Start/Approve/Cancel/Rollback and read-only control hiding
+     are present. Batch preview/start is exercised in the clustered browser
+     run. A real signed upgrade mutation is still intentionally not driven from
+     the local browser gate because it would stop/update the test Caster before
+     the remaining assertions complete.
+   - **Remaining proof:** Run the browser upgrade controls against an isolated
+     disposable Caster whose shutdown is part of the test.
 
-17. **Current browser gate is a single happy-path Chromium test** (`tools/web-e2e/run_browser_e2e.py:300`)
+17. **[Fixed for Chromium plus Firefox smoke] Current browser gate is a single happy-path Chromium test** (`tools/web-e2e/run_browser_e2e.py:300`)
     - **What it is:** The harness covers broad CRUD and socket behavior, but forces `confirm=true`, uses one headless Chromium, and does not test malformed input or failures.
     - **Problem:** Keyboard, focus, screen reader, touch, offline, duplicate click, stale ETag, login lockout and WebSocket reconnect regressions can all ship green.
     - **Fix:** Split into small scenario tests and add a second browser engine plus mobile viewport, accessibility tree checks and network-failure cases.

@@ -186,6 +186,11 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
     assert!(page.contains("tile-layer"));
     assert!(page.contains("https://tiles.example.test"));
     assert!(page.contains("/api/v1/public/map/stations"));
+    assert!(page.contains("data-freshness"));
+    assert!(page.contains("Data stale."));
+    assert!(page.contains("refreshPublicSession"));
+    assert!(page.contains("if(socket!==next)return"));
+    assert!(page.contains("status.textContent='Live: '+mountpoint"));
 
     let str = request(address, "/api/v1/public/str").await;
     assert!(str.contains("\"mountpoint\":\"C63\""));

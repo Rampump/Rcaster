@@ -168,6 +168,142 @@ def new_page(debug_port: int, url: str) -> Cdp:
     return page
 
 
+def accept_confirmation(page: Cdp) -> dict:
+    page.wait_for("document.getElementById('confirm-dialog')?.open===true")
+    details = page.evaluate(
+        "({title:document.getElementById('confirm-title').textContent,"
+        "message:document.getElementById('confirm-message').textContent,"
+        "impact:document.getElementById('confirm-impact').textContent})"
+    )
+    page.evaluate("document.getElementById('confirm-accept').click(); true")
+    return details
+
+
+def run_firefox_smoke(public_url: str, admin_url: str) -> dict:
+    firefox = shutil.which("firefox-esr") or shutil.which("firefox")
+    geckodriver = shutil.which("geckodriver") or str(
+        Path.home() / ".local/bin/geckodriver"
+    )
+    if firefox is None or not Path(geckodriver).is_file():
+        return {"available": False}
+
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.firefox.service import Service
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    options = Options()
+    options.binary_location = firefox
+    options.add_argument("-headless")
+    options.add_argument("--width=1280")
+    options.add_argument("--height=900")
+    options.accept_insecure_certs = True
+    options.set_preference("dom.webdriver.enabled", True)
+    driver = webdriver.Firefox(options=options, service=Service(geckodriver))
+    try:
+        wait = WebDriverWait(driver, 25)
+        driver.get(public_url)
+        wait.until(
+            lambda current: "C63"
+            in current.find_element("css selector", "#mounts").text
+        )
+        driver.execute_script(
+            "window.__ffErrors=[];"
+            "window.addEventListener('error',event=>window.__ffErrors.push(event.message));"
+            "window.addEventListener('unhandledrejection',event=>"
+            "window.__ffErrors.push(String(event.reason)));"
+        )
+        public_state = driver.execute_script(
+            "return {mounts:document.getElementById('mounts').textContent,"
+            "maps:document.querySelectorAll('#map circle').length,"
+            "tiles:document.querySelectorAll('#tile-layer img').length};"
+        )
+        driver.execute_script(
+            "document.getElementById('username').value='owner';"
+            "document.getElementById('password').value='secret';"
+            "login();"
+        )
+        wait.until(
+            lambda current: "Signed in as owner"
+            in current.find_element("css selector", "#session-status").text
+        )
+        driver.execute_script(
+            "document.querySelector('#mounts button').click();"
+        )
+        wait.until(
+            lambda current: "monitor_snapshot"
+            in current.find_element("css selector", "#monitor").text
+        )
+        driver.set_window_size(390, 844)
+        driver.save_screenshot(str(OUTPUT / "firefox-public.png"))
+        public_errors = driver.execute_script("return window.__ffErrors || []")
+        driver.get(admin_url)
+        wait.until(
+            lambda current: current.find_element(
+                "css selector", "#username"
+            ).is_displayed()
+        )
+        driver.execute_script(
+            "window.__ffErrors=[];"
+            "window.addEventListener('error',event=>window.__ffErrors.push(event.message));"
+            "window.addEventListener('unhandledrejection',event=>"
+            "window.__ffErrors.push(String(event.reason)));"
+        )
+        driver.execute_script(
+            "document.getElementById('username').value='firefox-admin';"
+            "document.getElementById('password').value='firefox-secret';"
+            "login();"
+        )
+        wait.until(
+            lambda current: current.find_element(
+                "css selector", "#account-name"
+            ).text
+            == "firefox-admin"
+        )
+        wait.until(
+            lambda current: current.find_element(
+                "css selector", "#data-freshness"
+            ).text.startswith("Data current;")
+        )
+        driver.set_window_size(1280, 900)
+        driver.save_screenshot(str(OUTPUT / "firefox-admin.png"))
+        admin_state = driver.execute_script(
+            "return {account:document.getElementById('account-name').textContent,"
+            "sources:document.getElementById('sources').textContent,"
+            "freshness:document.getElementById('data-freshness').textContent,"
+            "upgradeControls:Boolean(document.getElementById('upgrade-preview')),"
+            "configPreview:Boolean(document.getElementById('config-preview'))};"
+        )
+        admin_state["cookies"] = [
+            {
+                "name": cookie["name"],
+                "path": cookie["path"],
+                "secure": cookie["secure"],
+                "httpOnly": cookie["httpOnly"],
+            }
+            for cookie in driver.get_cookies()
+        ]
+        admin_errors = driver.execute_script("return window.__ffErrors || []")
+        if public_errors or admin_errors:
+            raise RuntimeError(
+                f"Firefox runtime errors: public={public_errors} admin={admin_errors}"
+            )
+        return {
+            "available": True,
+            "browser": "Firefox",
+            "version": driver.capabilities.get("browserVersion", ""),
+            "public": public_state,
+            "admin": admin_state,
+            "runtimeErrors": {"public": public_errors, "admin": admin_errors},
+            "screenshots": [
+                f"tools/web-e2e/runs/{OUTPUT.name}/firefox-public.png",
+                f"tools/web-e2e/runs/{OUTPUT.name}/firefox-admin.png",
+            ],
+        }
+    finally:
+        driver.quit()
+
+
 def browser_problems(page: Cdp) -> tuple[list[str], list[str]]:
     console_errors: list[str] = []
     network_errors: list[str] = []
@@ -246,6 +382,22 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
             f"admin operation/JSON HCI failed: "
             f"{checks['admin_operation_json_hci']}"
         )
+    checks["admin_resilience"] = measure_admin_resilience(page)
+    resilience = checks["admin_resilience"]
+    if (
+        resilience["coordinateError"]["lat"] != "true"
+        or resilience["coordinateError"]["lon"] != "true"
+        or "together" not in resilience["coordinateError"]["message"]
+        or resilience["userError"]["password"] != "true"
+        or "Password" not in resilience["userError"]["message"]
+        or not resilience["stale"]["freshness"].startswith("Data stale.")
+        or resilience["stale"]["accountHidden"]
+        or resilience["recovered"]["accountHidden"]
+        or not resilience["recovered"]["freshness"].startswith("Data current;")
+        or not resilience["upgradeControls"]
+        or not resilience["operationWriteControl"]
+    ):
+        raise RuntimeError(f"admin resilience contract failed: {resilience}")
     page.evaluate("loadSources()")
     page.wait_for("document.getElementById('sources').textContent.includes('C63')")
     checks["admin_source_filter"] = page.evaluate(
@@ -317,9 +469,16 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
             "const config=JSON.parse(document.getElementById('config-json').value);"
             "config.source_health.alert_clear_s=31;"
             "document.getElementById('config-json').value=JSON.stringify(config,null,2);"
-            "return saveConfig();"
+            "return previewConfig();"
             "})()"
         )
+        page.wait_for("!document.getElementById('config-apply').hidden")
+        checks["config_diff"] = page.evaluate(
+            "document.getElementById('config-diff').textContent"
+        )
+        if "source_health.alert_clear_s" not in checks["config_diff"]:
+            raise RuntimeError(f"config diff missing change: {checks['config_diff']}")
+        page.evaluate("saveConfig()")
         page.wait_for(
             "(() => {const status=JSON.parse("
             "document.getElementById('config-status').textContent);"
@@ -558,6 +717,7 @@ def exercise_admin_mutations(
         "return true;"
         "})()"
     )
+    checks["mountpoint_delete_confirmation"] = accept_confirmation(page)
     page.wait_for(
         "!document.getElementById('mountpoints').textContent.includes('TMP1')"
     )
@@ -571,6 +731,7 @@ def exercise_admin_mutations(
         "return true;"
         "})()"
     )
+    checks["user_delete_confirmation"] = accept_confirmation(page)
     page.wait_for(
         "!document.getElementById('users').textContent.includes('browser-user')"
     )
@@ -614,6 +775,7 @@ def exercise_admin_mutations(
         "return true;"
         "})()"
     )
+    checks["blacklist_delete_confirmation"] = accept_confirmation(page)
     page.wait_for(
         "!document.getElementById('blacklist').textContent.includes('e2e-rule')"
     )
@@ -648,6 +810,7 @@ def exercise_admin_mutations(
         "return true;"
         "})()"
     )
+    checks["api_token_revoke_confirmation"] = accept_confirmation(page)
     page.wait_for(
         "!document.getElementById('api-tokens').textContent.includes('browser-token')"
     )
@@ -712,6 +875,7 @@ def exercise_admin_mutations(
             "return true;"
             "})()"
         )
+        accept_confirmation(page)
         page.wait_for(
             "!document.getElementById('users').textContent.includes('batch-user')"
         )
@@ -736,6 +900,7 @@ def exercise_admin_mutations(
         "return true;"
         "})()"
     )
+    checks["session_disconnect_confirmation"] = accept_confirmation(page)
     if not owner_client.wait_closed():
         raise RuntimeError("session disconnect did not close the NTRIP client")
     page.evaluate("load()")
@@ -754,6 +919,12 @@ def exercise_admin_mutations(
         "return true;"
         "})()"
     )
+    checks["source_disconnect_confirmation"] = accept_confirmation(page)
+    if "Subscribers:" not in checks["source_disconnect_confirmation"]["impact"]:
+        raise RuntimeError(
+            "source disconnect confirmation omitted impact: "
+            f"{checks['source_disconnect_confirmation']}"
+        )
     if not source.closed.wait(5):
         raise RuntimeError("source disconnect did not close the NTRIP source")
     page.evaluate("loadSources()")
@@ -1263,6 +1434,46 @@ def measure_admin_operation_and_json_hci(page: Cdp) -> dict:
     )
 
 
+def measure_admin_resilience(page: Cdp) -> dict:
+    return page.evaluate(
+        "(async()=>{"
+        "resetMount();"
+        "document.getElementById('mount-name').value='VALIDATION';"
+        "document.getElementById('mount-owner').value='owner-id';"
+        "document.getElementById('mount-latitude').value='31.2';"
+        "await saveMount();"
+        "const coordinateError={lat:document.getElementById('mount-latitude')"
+        ".getAttribute('aria-invalid'),lon:document.getElementById('mount-longitude')"
+        ".getAttribute('aria-invalid'),message:document.getElementById('mount-validation')"
+        ".textContent};"
+        "resetMount();"
+        "document.getElementById('user-id').value='missing-password';"
+        "document.getElementById('user-name').value='missing-password';"
+        "await saveUser();"
+        "const userError={password:document.getElementById('user-password')"
+        ".getAttribute('aria-invalid'),message:document.getElementById('user-validation')"
+        ".textContent};"
+        "resetUser();"
+        "const originalFetch=window.fetch;"
+        "window.fetch=(input,options)=>{const url=typeof input==='string'?input:input.url;"
+        "const parsed=new URL(url,location.origin);if(parsed.pathname==='/admin/v1/cluster/status')"
+        "{return Promise.resolve(new Response(JSON.stringify({code:'UNAVAILABLE',"
+        "message:'temporary failure'}),{status:503,headers:{'Content-Type':'application/json'}}))}"
+        "return originalFetch(input,options)};"
+        "let stale={};try{await load();stale={freshness:document.getElementById('data-freshness')"
+        ".textContent,accountHidden:document.getElementById('account').hidden,"
+        "status:document.getElementById('status').textContent}}finally{window.fetch=originalFetch}"
+        "await load();"
+        "const recovered={freshness:document.getElementById('data-freshness').textContent,"
+        "accountHidden:document.getElementById('account').hidden};"
+        "return {coordinateError,userError,stale,recovered,"
+        "upgradeControls:['upgrade-preview','upgrade-start','upgrade-approve',"
+        "'upgrade-cancel','upgrade-rollback'].every(id=>Boolean(document.getElementById(id))),"
+        "operationWriteControl:document.getElementById('operation-cancel')"
+        ".closest('.write-control')!==null};})()"
+    )
+
+
 def measure_api_token_double_submit(page: Cdp) -> dict:
     return page.evaluate(
         "(async()=>{"
@@ -1322,6 +1533,33 @@ def measure_public_monitor_recovery(page: Cdp) -> dict:
         "retryHidden:document.getElementById('monitor-retry').hidden,"
         "status:document.getElementById('status').textContent})"
     )
+    idle_session = page.evaluate(
+        "(async()=>{const original=window.fetch;"
+        "window.fetch=(input,options)=>{const url=typeof input==='string'"
+        "?input:input.url;if(url.endsWith('/api/v1/auth/session')){return Promise.resolve("
+        "new Response(JSON.stringify({code:'UNAUTHENTICATED'}),{status:401,"
+        "headers:{'Content-Type':'application/json'}}))}"
+        "return original(input,options)};"
+        "try{await refreshPublicSession()}finally{window.fetch=original}"
+        "return {signedIn,session:document.getElementById('session-status').textContent,"
+        "status:document.getElementById('status').textContent};})()"
+    )
+    page.evaluate(
+        "(() => {document.getElementById('username').value='owner';"
+        "document.getElementById('password').value='secret';return login();})()"
+    )
+    page.wait_for("signedIn===true")
+    stale = page.evaluate(
+        "(async()=>{const original=window.fetch;"
+        "window.fetch=(input,options)=>{const url=typeof input==='string'"
+        "?input:input.url;const parsed=new URL(url,location.origin);"
+        "if(parsed.pathname==='/api/v1/mountpoints'){return Promise.resolve(new Response("
+        "JSON.stringify({code:'UNAVAILABLE',message:'temporary failure'}),{status:503,"
+        "headers:{'Content-Type':'application/json'}}))}return original(input,options)};"
+        "let staleText='';try{await load();staleText=document.getElementById('data-freshness')"
+        ".textContent}finally{window.fetch=original}await load();"
+        "return {stale:staleText,recovered:document.getElementById('data-freshness').textContent};})()"
+    )
     session_expired = page.evaluate(
         "(async()=>{const original=window.fetch;"
         "window.fetch=(input,options)=>{const url=typeof input==='string'"
@@ -1333,7 +1571,12 @@ def measure_public_monitor_recovery(page: Cdp) -> dict:
         "try{await monitor('C63')}finally{window.fetch=original}"
         "return document.getElementById('status').textContent;})()"
     )
-    return {"reconnect": reconnect, "sessionExpiredStatus": session_expired}
+    return {
+        "reconnect": reconnect,
+        "idleSession": idle_session,
+        "stale": stale,
+        "sessionExpiredStatus": session_expired,
+    }
 
 
 def expected_resource_error(url: str, status: int) -> bool:
@@ -1454,7 +1697,9 @@ class AdminProxyServer(ThreadingHTTPServer):
         self.client_context = client_context
 
     def handle_error(self, request, client_address) -> None:
-        if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
+        if isinstance(
+            sys.exception(), (BrokenPipeError, ConnectionResetError, ssl.SSLError)
+        ):
             return
         super().handle_error(request, client_address)
 
@@ -1555,6 +1800,20 @@ def write_accounts(path: Path) -> None:
                 "user_id": "browser-admin",
                 "username": "browser-admin",
                 "password_hash": hash_password("admin-secret"),
+                "auth_version": 1,
+                "enabled": True,
+                "ntrip_enabled": False,
+                "web_enabled": True,
+                "role": "admin",
+                "created_at": now,
+                "updated_at": now,
+            },
+            {
+                "schema_version": 1,
+                "mod_revision": 1,
+                "user_id": "firefox-admin",
+                "username": "firefox-admin",
+                "password_hash": hash_password("firefox-secret"),
                 "auth_version": 1,
                 "enabled": True,
                 "ntrip_enabled": False,
@@ -1877,6 +2136,19 @@ def run_test(temp: Path, clustered: bool) -> dict:
         public.wait_for(
             "document.getElementById('mounts').textContent.includes('C63')"
         )
+        result["checks"]["firefox_smoke"] = run_firefox_smoke(
+            f"https://127.0.0.1:{public_port}/",
+            f"https://localhost:{admin_url_port}/admin/",
+        )
+        firefox_smoke = result["checks"]["firefox_smoke"]
+        if firefox_smoke.get("available") and (
+            "C63" not in firefox_smoke["public"]["mounts"]
+            or "C63" not in firefox_smoke["admin"]["sources"]
+            or not firefox_smoke["admin"]["freshness"].startswith("Data current;")
+            or not firefox_smoke["admin"]["upgradeControls"]
+            or not firefox_smoke["admin"]["configPreview"]
+        ):
+            raise RuntimeError(f"Firefox smoke failed: {firefox_smoke}")
         result["checks"]["public_map_bbox"] = public.evaluate("mapBbox()")
         public.evaluate("refreshMap()")
         result["checks"]["public_map_data"] = public.evaluate(
@@ -1931,12 +2203,13 @@ def run_test(temp: Path, clustered: bool) -> dict:
             "document.getElementById('username').value='owner';"
             "document.getElementById('password').value='secret';"
             "return login().then(() => ({"
-            "status:document.getElementById('status').textContent,csrf:Boolean(csrf)"
+            "status:document.getElementById('session-status').textContent,"
+            "csrf:Boolean(csrf),signedIn"
             "}));"
             "})()"
         )
         public.wait_for(
-            "document.getElementById('status')"
+            "document.getElementById('session-status')"
             ".textContent.includes('Signed in as owner')"
         )
         public.evaluate("document.querySelector('#mounts button').click(); true")
@@ -1961,6 +2234,21 @@ def run_test(temp: Path, clustered: bool) -> dict:
             or not result["checks"]["public_monitor_recovery"]["reconnect"][
                 "retryHidden"
             ]
+            or "Live: C63"
+            not in result["checks"]["public_monitor_recovery"]["reconnect"]["status"]
+            or result["checks"]["public_monitor_recovery"]["idleSession"][
+                "signedIn"
+            ]
+            or "Session expired"
+            not in result["checks"]["public_monitor_recovery"]["idleSession"][
+                "session"
+            ]
+            or not result["checks"]["public_monitor_recovery"]["stale"][
+                "stale"
+            ].startswith("Data stale.")
+            or not result["checks"]["public_monitor_recovery"]["stale"][
+                "recovered"
+            ].startswith("Updated ")
             or "Session expired"
             not in result["checks"]["public_monitor_recovery"][
                 "sessionExpiredStatus"
