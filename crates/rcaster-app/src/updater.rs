@@ -259,6 +259,7 @@ impl Updater {
         if matches!(slot, Slot::Initial) {
             return Err("invalid staging slot".into());
         }
+        ensure_staging_space(&self.config.work_dir, manifest.artifact_size)?;
         let staging = self
             .config
             .work_dir
@@ -501,6 +502,44 @@ fn terminal_upgrade_state(state: &Value) -> bool {
     )
 }
 
+fn ensure_staging_space(path: &Path, artifact_size: u64) -> UpdaterResult<()> {
+    fs::create_dir_all(path)?;
+    let available = available_disk_bytes(path)?;
+    if available < artifact_size {
+        return Err(format!(
+            "artifact staging requires {artifact_size} bytes, but only {available} bytes are available"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn available_disk_bytes(path: &Path) -> io::Result<u64> {
+    use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let mut stats = MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stats = unsafe { stats.assume_init() };
+    let block_size = if stats.f_frsize == 0 {
+        stats.f_bsize
+    } else {
+        stats.f_frsize
+    };
+    Ok(u128::from(stats.f_bavail)
+        .saturating_mul(u128::from(block_size))
+        .min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(not(unix))]
+fn available_disk_bytes(_path: &Path) -> io::Result<u64> {
+    Ok(u64::MAX)
+}
+
 fn download_artifact(url: &str, path: &Path, expected_size: u64) -> UpdaterResult<()> {
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
@@ -580,8 +619,8 @@ mod tests {
     };
 
     use super::{
-        Slot, download_artifact, inactive_slot, probe_health, request_graceful_stop,
-        terminal_upgrade_state,
+        Slot, download_artifact, ensure_staging_space, inactive_slot, probe_health,
+        request_graceful_stop, terminal_upgrade_state,
     };
 
     #[test]
@@ -606,6 +645,16 @@ mod tests {
             &serde_json::json!({"status":"ROLLED_BACK"})
         ));
         assert!(!terminal_upgrade_state(&serde_json::json!({})));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_artifacts_larger_than_available_staging_space() {
+        let path =
+            std::env::temp_dir().join(format!("rcaster-updater-space-{}", std::process::id()));
+        ensure_staging_space(&path, 0).expect("zero-byte staging");
+        assert!(ensure_staging_space(&path, u64::MAX).is_err());
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[tokio::test]
