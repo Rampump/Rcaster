@@ -1411,9 +1411,14 @@ async fn handle_local_command(
     let Some(operation_id) = command["operation_id"].as_str() else {
         return false;
     };
-    if !valid || !triggered.insert(operation_id.to_owned()) {
+    if !valid || triggered.contains(operation_id) {
         return false;
     }
+    let action = command["action"].as_str().unwrap_or_default();
+    if !local_command_is_active(client, context, operation_id, action).await {
+        return false;
+    }
+    triggered.insert(operation_id.to_owned());
     context.health.set_ready(false);
     if let Some(connections) = context.connections {
         connections.cancel_all();
@@ -1437,6 +1442,49 @@ async fn handle_local_command(
     }
     let _ = context.shutdown.send(true);
     true
+}
+
+async fn local_command_is_active(
+    client: &mut Client,
+    context: &LocalCommandContext<'_>,
+    operation_id: &str,
+    action: &str,
+) -> bool {
+    let operation_key = format!(
+        "/rcaster/{}/runtime/upgrades/{operation_id}",
+        context.cluster_id
+    );
+    let Ok(response) = client.get(operation_key, None).await else {
+        return false;
+    };
+    let Some(value) = response.kvs().first() else {
+        return false;
+    };
+    let Ok(operation) = serde_json::from_slice::<Value>(value.value()) else {
+        return false;
+    };
+    let expected_status = if action == "apply" {
+        "RUNNING"
+    } else {
+        "ROLLING_BACK"
+    };
+    let current_node = operation["current_node"].as_u64().unwrap_or(u64::MAX) as usize;
+    if operation["status"] != expected_status
+        || !operation["nodes"]
+            .get(current_node)
+            .is_some_and(|node| node["caster_id"] == context.caster_id)
+    {
+        return false;
+    }
+    let state_key = format!(
+        "/rcaster/{}/runtime/upgrade-states/{operation_id}/{}",
+        context.cluster_id, context.caster_id
+    );
+    client
+        .get(state_key, None)
+        .await
+        .map(|response| response.kvs().is_empty())
+        .unwrap_or(false)
 }
 
 async fn stop_or_sleep(stop: &mut oneshot::Receiver<()>, duration: Duration) -> bool {

@@ -211,6 +211,18 @@ async fn upgrade_requires_a_different_administrator_to_approve() {
 async fn local_command_marks_node_unready_and_requests_shutdown() {
     let cluster = unique("upgrade-local");
     let mut etcd = connect().await;
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrades/op-1"),
+        serde_json::to_vec(&json!({
+            "status": "RUNNING",
+            "current_node": 0,
+            "nodes": [{"caster_id": "edge-1", "status": "COMMANDED"}]
+        }))
+        .expect("operation JSON"),
+        None,
+    )
+    .await
+    .expect("operation");
     let health = Arc::new(HealthState::default());
     health.set_ready(true);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -250,6 +262,86 @@ async fn local_command_marks_node_unready_and_requests_shutdown() {
         .await
         .expect("state");
     assert!(String::from_utf8_lossy(state.kvs()[0].value()).contains("\"status\":\"DRAINING\""));
+    watcher.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_or_already_handled_local_commands_do_not_trigger_shutdown() {
+    let cluster = unique("upgrade-local-stale");
+    let mut etcd = connect().await;
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrades/op-2"),
+        serde_json::to_vec(&json!({
+            "status": "SUCCEEDED",
+            "current_node": 0,
+            "nodes": [{"caster_id": "edge-1", "status": "SUCCEEDED"}]
+        }))
+        .expect("operation JSON"),
+        None,
+    )
+    .await
+    .expect("operation");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-commands/op-2/edge-1"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "operation_id": "op-2",
+            "caster_id": "edge-1",
+            "action": "apply",
+            "target_version": "0.2.0"
+        }))
+        .expect("command JSON"),
+        None,
+    )
+    .await
+    .expect("command");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrades/op-3"),
+        serde_json::to_vec(&json!({
+            "status": "RUNNING",
+            "current_node": 0,
+            "nodes": [{"caster_id": "edge-1", "status": "COMMANDED"}]
+        }))
+        .expect("operation JSON"),
+        None,
+    )
+    .await
+    .expect("running operation");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-commands/op-3/edge-1"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "operation_id": "op-3",
+            "caster_id": "edge-1",
+            "action": "apply",
+            "target_version": "0.2.0"
+        }))
+        .expect("command JSON"),
+        None,
+    )
+    .await
+    .expect("active command");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-states/op-3/edge-1"),
+        br#"{"status":"APPLIED"}"#.to_vec(),
+        None,
+    )
+    .await
+    .expect("handled state");
+    let health = Arc::new(HealthState::default());
+    health.set_ready(true);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let watcher = UpgradeCommandWatcher::start(
+        connect().await,
+        cluster.clone(),
+        "edge-1".to_owned(),
+        Arc::clone(&health),
+        None,
+        shutdown_tx,
+    );
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(!*shutdown_rx.borrow());
+    assert!(health.is_ready());
     watcher.shutdown().await;
 }
 
