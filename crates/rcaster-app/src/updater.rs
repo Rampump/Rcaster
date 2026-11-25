@@ -75,6 +75,9 @@ pub async fn run_supervisor(config_path: PathBuf) -> UpdaterResult<()> {
         if let Err(error) = updater.poll_commands(&mut seen).await {
             eprintln!("rcaster-updater: command poll failed: {error}");
         }
+        if let Err(error) = updater.ensure_service().await {
+            eprintln!("rcaster-updater: service supervision failed: {error}");
+        }
     }
 }
 
@@ -142,6 +145,20 @@ impl Updater {
             }
         }
         Ok(())
+    }
+
+    async fn ensure_service(&mut self) -> UpdaterResult<()> {
+        if let Some(child) = &mut self.child {
+            match child.try_wait()? {
+                None => return Ok(()),
+                Some(status) => {
+                    self.child = None;
+                    eprintln!("rcaster-updater: service exited unexpectedly: {status}");
+                }
+            }
+        }
+        self.start_child().await?;
+        self.wait_healthy().await
     }
 
     async fn apply_command(&mut self, command: &Value) -> UpdaterResult<()> {
