@@ -221,6 +221,8 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
         or not checks["admin_hci"]["statusPreserved"]
         or "Editing" not in checks["admin_hci"]["editMode"]
         or checks["admin_hci"]["resetMode"] != "New user"
+        or "Editing" not in checks["admin_hci"]["mountEditMode"]
+        or checks["admin_hci"]["mountResetMode"] != "New mountpoint"
     ):
         raise RuntimeError(f"admin HCI contract failed: {checks['admin_hci']}")
     page.evaluate("loadSources()")
@@ -248,6 +250,16 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
         "message_numbers:value.profile.message_numbers};"
         "})()"
     )
+    if not clustered:
+        checks["admin_monitor_reconnect"] = measure_admin_monitor_reconnect(page)
+        if (
+            not checks["admin_monitor_reconnect"]["open"]
+            or not checks["admin_monitor_reconnect"]["retryHidden"]
+        ):
+            raise RuntimeError(
+                f"admin monitor reconnect failed: "
+                f"{checks['admin_monitor_reconnect']}"
+            )
     page.evaluate("showSourceHistory('C63')")
     page.wait_for(
         "document.getElementById('source-health')"
@@ -1169,9 +1181,18 @@ def measure_admin_hci(page: Cdp) -> dict:
         "const editMode=mode?.textContent||'';"
         "if(cancel)cancel.click();"
         "const resetMode=mode?.textContent||'';"
+        "const mountEdit=[...document.querySelectorAll('#mountpoints tr')]"
+        ".find(row=>row.textContent.includes('C63')).querySelector('button');"
+        "const mountMode=document.getElementById('mount-mode');"
+        "const mountCancel=document.getElementById('mount-cancel');"
+        "mountEdit.click();"
+        "const mountEditMode=mountMode?.textContent||'';"
+        "if(mountCancel)mountCancel.click();"
+        "const mountResetMode=mountMode?.textContent||'';"
         "return {statusRole:status.getAttribute('role')||'',"
         "statusLive:status.getAttribute('aria-live')||'',"
-        "focusPreserved,statusPreserved,editMode,resetMode};})()"
+        "focusPreserved,statusPreserved,editMode,resetMode,"
+        "mountEditMode,mountResetMode};})()"
     )
 
 
@@ -1201,6 +1222,51 @@ def measure_api_token_double_submit(page: Cdp) -> dict:
         "created:created.length,secret:document.getElementById('api-token-secret')"
         ".textContent.startsWith('rcaster_')};})()"
     )
+
+
+def measure_admin_monitor_reconnect(page: Cdp) -> dict:
+    page.evaluate("monitorSource('C63')")
+    page.wait_for("monitorSocket?.readyState===1", timeout=25)
+    page.evaluate("monitorSocket.close()")
+    page.wait_for("!document.getElementById('live-retry').hidden")
+    page.evaluate("document.getElementById('live-retry').click()")
+    page.wait_for("monitorSocket?.readyState===1", timeout=25)
+    return page.evaluate(
+        "({open:monitorSocket.readyState===1,"
+        "retryHidden:document.getElementById('live-retry').hidden,"
+        "status:document.getElementById('status').textContent})"
+    )
+
+
+def measure_public_monitor_recovery(page: Cdp) -> dict:
+    page.evaluate("socket.close()")
+    page.wait_for("!document.getElementById('monitor-retry').hidden")
+    page.evaluate(
+        "document.getElementById('monitor').textContent='';"
+        "document.getElementById('monitor-retry').click()"
+    )
+    page.wait_for(
+        "document.getElementById('monitor')"
+        ".textContent.includes('monitor_snapshot')",
+        timeout=25,
+    )
+    reconnect = page.evaluate(
+        "({open:socket.readyState===1,"
+        "retryHidden:document.getElementById('monitor-retry').hidden,"
+        "status:document.getElementById('status').textContent})"
+    )
+    session_expired = page.evaluate(
+        "(async()=>{const original=window.fetch;"
+        "window.fetch=(input,options)=>{const url=typeof input==='string'"
+        "?input:input.url;if(url.includes('/api/v1/monitors/')"
+        "&&url.endsWith('/ticket')){return Promise.resolve(new Response("
+        "JSON.stringify({message:'session expired'}),{status:401,"
+        "headers:{'Content-Type':'application/json'}}))}"
+        "return original(input,options)};"
+        "try{await monitor('C63')}finally{window.fetch=original}"
+        "return document.getElementById('status').textContent;})()"
+    )
+    return {"reconnect": reconnect, "sessionExpiredStatus": session_expired}
 
 
 def expected_resource_error(url: str, status: int) -> bool:
@@ -1817,6 +1883,23 @@ def run_test(temp: Path, clustered: bool) -> dict:
             "msm_observation_count:value.snapshot.profile.msm_observation_count};"
             "})()"
         )
+        result["checks"]["public_monitor_recovery"] = (
+            measure_public_monitor_recovery(public)
+        )
+        if (
+            not result["checks"]["public_monitor_recovery"]["reconnect"]["open"]
+            or not result["checks"]["public_monitor_recovery"]["reconnect"][
+                "retryHidden"
+            ]
+            or "Session expired"
+            not in result["checks"]["public_monitor_recovery"][
+                "sessionExpiredStatus"
+            ]
+        ):
+            raise RuntimeError(
+                f"public monitor recovery failed: "
+                f"{result['checks']['public_monitor_recovery']}"
+            )
         result["checks"].update(
             exercise_admin_mutations(
                 admin,
