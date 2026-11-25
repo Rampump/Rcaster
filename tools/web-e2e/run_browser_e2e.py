@@ -34,10 +34,6 @@ ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target/release/rcaster"
 CAPTURE = ROOT / "target/com3-rtcm3-capture.bin"
 OUTPUT = ROOT / "tools/web-e2e/runs" / datetime.now().strftime("%Y%m%d-%H%M%S")
-TILE_PIXEL = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
-    "/A8AAusB9Wl2nWQAAAAASUVORK5CYII="
-)
 CRTK_SNAPSHOT = ROOT / "tools/near-e2e/data/crtk-str-20261125.json"
 sys.path.insert(0, str(ROOT / "tools/near-e2e"))
 import rtcm  # noqa: E402
@@ -964,6 +960,13 @@ def measure_crtk_map(page: Cdp, coordinate_system: str, mode: str) -> dict:
         "x:Number(circle.getAttribute('cx')),y:Number(circle.getAttribute('cy'))}))};})"
         f"({subset_json})"
     )
+    page.wait_for(
+        "[...document.querySelectorAll('#tile-layer img')].length > 0"
+        " && [...document.querySelectorAll('#tile-layer img')]"
+        ".every(image=>image.complete&&image.naturalWidth===256"
+        "&&image.naturalHeight===256)"
+    )
+    time.sleep(0.3)
     size = 256.0 * 2.0 ** int(local_result["zoom"])
     left = local_result["centerX"] * size - local_result["width"] / 2.0
     top = local_result["centerY"] * size - local_result["height"] / 2.0
@@ -1025,6 +1028,41 @@ def measure_crtk_map(page: Cdp, coordinate_system: str, mode: str) -> dict:
         "gcj02_beijing_offset_m": round(control_offset_m, 3),
         "screenshot": str(screenshot_path.relative_to(ROOT)),
     }
+
+
+def capture_amap_china_view(page: Cdp) -> dict:
+    page.evaluate(
+        "(() => {"
+        "const feature={type:'Feature',geometry:{type:'Point',"
+        "coordinates:[121.4,31.2]},properties:{mountpoint:'C63',"
+        "identifier:'Shanghai map tile control',format:'RTCM 3.3',"
+        "network:'RCaster',region:'browser-test',coverage_m:25000}};"
+        "mapData={type:'FeatureCollection',features:[feature]};"
+        "const point=displayPosition(121.4,31.2);"
+        "mapCamera.centerX=longitudeX(point[0]);"
+        "mapCamera.centerY=latitudeY(point[1]);"
+        "mapCamera.zoom=12;mapCamera.initialized=true;drawMap();"
+        "document.getElementById('map-shell')"
+        ".scrollIntoView({block:'center'});return true;})()"
+    )
+    page.wait_for(
+        "[...document.querySelectorAll('#tile-layer img')].length > 0"
+        " && [...document.querySelectorAll('#tile-layer img')]"
+        ".every(image=>image.complete&&image.naturalWidth===256"
+        "&&image.naturalHeight===256)"
+    )
+    time.sleep(0.3)
+    screenshot = page.send("Page.captureScreenshot", {"format": "png"})
+    screenshot_path = OUTPUT / "map-amap-china.png"
+    screenshot_path.write_bytes(base64.b64decode(screenshot["data"]))
+    return page.evaluate(
+        "(() => {const images=[...document.querySelectorAll('#tile-layer img')];"
+        "return {zoom:mapCamera.zoom,count:images.length,"
+        "loaded:images.filter(image=>image.naturalWidth===256).length,"
+        "hosts:[...new Set(images.map(image=>new URL(image.src).host))],"
+        "screenshot:'tools/web-e2e/runs/"
+        f"{OUTPUT.name}/map-amap-china.png'}};}})()"
+    )
 
 
 def expected_resource_error(url: str, status: int) -> bool:
@@ -1148,29 +1186,6 @@ class AdminProxyServer(ThreadingHTTPServer):
         if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
             return
         super().handle_error(request, client_address)
-
-
-class TileServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class TileHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *_args) -> None:
-        pass
-
-    def do_GET(self) -> None:
-        if not self.path.endswith(".png"):
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "image/png")
-        self.send_header("Content-Length", str(len(TILE_PIXEL)))
-        self.send_header("Cache-Control", "public, max-age=60")
-        self.end_headers()
-        self.wfile.write(TILE_PIXEL)
 
 
 class AdminProxyHandler(BaseHTTPRequestHandler):
@@ -1301,11 +1316,10 @@ def write_accounts(path: Path) -> None:
 
 def run_test(temp: Path, clustered: bool) -> dict:
     temp.mkdir(parents=True, exist_ok=True)
-    ports = free_ports(10 if clustered else 6)
+    ports = free_ports(9 if clustered else 5)
     clear_port, public_port, admin_port, health_port, debug_port = ports[:5]
-    tile_port = ports[5]
     etcd_client_port, etcd_peer_port, tls_port, admin_proxy_port = (
-        ports[6:] if clustered else (None, None, None, None)
+        ports[5:] if clustered else (None, None, None, None)
     )
     subprocess.run(
         [
@@ -1404,9 +1418,9 @@ def run_test(temp: Path, clustered: bool) -> dict:
                 "https://webst01.is.autonavi.com/appmaptile"
                 "?style=6&x={x}&y={y}&z={z}"
                 if clustered
-                else f"https://127.0.0.1:{tile_port}/{{z}}/{{x}}/{{y}}.png"
+                else "https://a.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png"
             ),
-            "attribution": "© 高德地图" if clustered else "OSM-compatible test tiles",
+            "attribution": "© 高德地图" if clustered else "© OpenStreetMap contributors",
             "min_zoom": 0,
             "max_zoom": 19 if not clustered else 18,
             "coordinate_system": "gcj02" if clustered else "wgs84",
@@ -1479,22 +1493,6 @@ def run_test(temp: Path, clustered: bool) -> dict:
             check=True,
             capture_output=True,
         )
-    tile_server = TileServer(("127.0.0.1", tile_port), TileHandler)
-    tile_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tile_context.load_cert_chain(
-        str(temp / "server.crt"),
-        str(temp / "server.key"),
-    )
-    tile_server.socket = tile_context.wrap_socket(
-        tile_server.socket,
-        server_side=True,
-    )
-    tile_thread = threading.Thread(
-        target=tile_server.serve_forever,
-        name="browser-e2e-tile-server",
-        daemon=True,
-    )
-    tile_thread.start()
     caster_log = (temp / "caster.log").open("w+", encoding="utf-8")
     caster = subprocess.Popen(
         [str(BINARY), "serve", "--config", str(temp / "caster.json")],
@@ -1638,6 +1636,10 @@ def run_test(temp: Path, clustered: bool) -> dict:
             result["checks"]["public_map_tiles"]["coordinate_system"],
             "clustered" if clustered else "standalone",
         )
+        if clustered:
+            result["checks"]["public_map_amap_china"] = capture_amap_china_view(
+                public
+            )
         result["checks"]["public_login_result"] = public.evaluate(
             "(() => {"
             "document.getElementById('username').value='owner';"
@@ -1738,9 +1740,6 @@ def run_test(temp: Path, clustered: bool) -> dict:
             admin_proxy.server_close()
         if proxy_thread is not None:
             proxy_thread.join(timeout=3)
-        tile_server.shutdown()
-        tile_server.server_close()
-        tile_thread.join(timeout=3)
         for process in (chrome, caster, etcd):
             if process is not None and process.poll() is None:
                 try:

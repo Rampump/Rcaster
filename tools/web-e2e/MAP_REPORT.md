@@ -21,13 +21,14 @@ Release SHA-256:
 
 Evidence:
 
-- `tools/web-e2e/runs/20261126-005946/result.json`
-- `tools/web-e2e/runs/20261126-005946/map-standalone.png`
-- `tools/web-e2e/runs/20261126-005946/map-clustered.png`
+- `tools/web-e2e/runs/20261126-011355/result.json`
+- `tools/web-e2e/runs/20261126-011355/map-standalone.png`
+- `tools/web-e2e/runs/20261126-011355/map-clustered.png`
+- `tools/web-e2e/runs/20261126-011355/map-amap-china.png`
 
 | Mode | Tile projection | Features | Global clusters | Dense markers | Max pixel error |
 |---|---|---:|---:|---:|---:|
-| standalone | XYZ / WGS-84 | 1,301 | 17 | 15/15 visible | 0.0 px |
+| standalone | OSM XYZ / WGS-84 | 1,301 | 17 | 15/15 visible | 0.0 px |
 | clustered | AMap GCJ-02 | 1,301 | 17 | 15/15 visible | 0.0 px |
 
 The dense cluster was centred on CRTK station `IREN` and contained 15 stations
@@ -44,13 +45,15 @@ Direct request checks from the Windows host:
 
 - OSM `https://tile.openstreetmap.org/5/26/11.png`: HTTP 200, `image/png`,
   18,750 bytes.
+- OSM France mirror
+  `https://a.tile.openstreetmap.fr/osmfr/5/17/11.png`: HTTP 200,
+  48,104 bytes.
 - AMap satellite
   `https://webst01.is.autonavi.com/appmaptile?style=6&x=26&y=11&z=5`:
   HTTP 200, `image/jpeg`, 8,551 bytes.
-- AMap satellite loaded 15/15 visible browser tiles in clustered mode.
-- OSM was not reachable from the WSL Chromium egress during this run, so the
-  standalone browser test uses a local HTTPS XYZ/PNG server with identical
-  WGS-84 tile semantics. The real OSM endpoint was verified independently
-  from Windows.
+- OSM loaded 15/15 visible 256×256 browser tiles in standalone mode.
+- AMap loaded 15/15 visible 256×256 browser tiles in clustered mode.
+- A separate Shanghai zoom-12 view verifies detailed AMap satellite imagery and
+  the WGS-84-to-GCJ-02 `C63` marker alignment.
 
 Configuration examples are in `docs/runbooks/public-map-tiles.md`.

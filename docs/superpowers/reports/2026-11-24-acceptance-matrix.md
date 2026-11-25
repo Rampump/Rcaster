@@ -91,7 +91,7 @@ Final current-tree verification on 2026-11-25:
   all L2a static/boundary/hysteresis/switch/rate/jump/HDOP/TTL/failover/
   no-alternative-timeout/concurrency checks, and the 1,301-source / 50
   non-station-query L2b sample pass.
-- Browser validation: `tools/web-e2e/runs/20261126-005946/result.json`.
+- Browser validation: `tools/web-e2e/runs/20261126-011355/result.json`.
   Standalone admin/public browser flows and clustered etcd/mTLS/public flows
   pass with no unexpected console or network failures.
 - CRTK map validation: `tools/web-e2e/MAP_REPORT.md` records 1,301 stations,

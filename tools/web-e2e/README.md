@@ -36,5 +36,7 @@ Disabling an active mountpoint is also verified to close its live source.
 The public map test also injects the 1,301-station CRTK.NET snapshot into the
 production map JavaScript, verifies low-zoom cluster totals, and compares 15
 individual marker pixel positions against an independent WGS-84/Web-Mercator
-calculation. Standalone uses WGS-84 XYZ tiles; clustered uses GCJ-02 AMap
-satellite tiles. See `MAP_REPORT.md`.
+calculation. Standalone loads real OpenStreetMap WGS-84 XYZ tiles; clustered
+loads real GCJ-02 AMap satellite tiles and captures a Shanghai zoom-12 view.
+Every screenshot waits for all visible tile images to decode at 256×256.
+See `MAP_REPORT.md`.
