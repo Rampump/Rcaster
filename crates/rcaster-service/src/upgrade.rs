@@ -1448,7 +1448,9 @@ async fn handle_local_command(
     };
     let valid = command["schema_version"] == 1
         && command["caster_id"] == context.caster_id
-        && matches!(command["action"].as_str(), Some("apply" | "rollback"));
+        && matches!(command["action"].as_str(), Some("apply" | "rollback"))
+        && command["target_version"].as_str()
+            == command["signed_manifest"]["manifest"]["version"].as_str();
     let Some(operation_id) = command["operation_id"].as_str() else {
         return false;
     };

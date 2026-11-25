@@ -322,7 +322,8 @@ async fn local_command_marks_node_unready_and_requests_shutdown() {
             "operation_id": "op-1",
             "caster_id": "edge-1",
             "action": "apply",
-            "target_version": "0.2.0"
+            "target_version": "0.2.0",
+            "signed_manifest": {"manifest": {"version": "0.2.0"}}
         }))
         .expect("command JSON"),
         None,
@@ -369,7 +370,8 @@ async fn stale_or_already_handled_local_commands_do_not_trigger_shutdown() {
             "operation_id": "op-2",
             "caster_id": "edge-1",
             "action": "apply",
-            "target_version": "0.2.0"
+            "target_version": "0.2.0",
+            "signed_manifest": {"manifest": {"version": "0.2.0"}}
         }))
         .expect("command JSON"),
         None,
@@ -395,7 +397,8 @@ async fn stale_or_already_handled_local_commands_do_not_trigger_shutdown() {
             "operation_id": "op-3",
             "caster_id": "edge-1",
             "action": "apply",
-            "target_version": "0.2.0"
+            "target_version": "0.2.0",
+            "signed_manifest": {"manifest": {"version": "0.2.0"}}
         }))
         .expect("command JSON"),
         None,
@@ -449,7 +452,8 @@ async fn draining_state_does_not_overwrite_terminal_state() {
             "operation_id": "op-4",
             "caster_id": "edge-1",
             "action": "apply",
-            "target_version": "0.2.0"
+            "target_version": "0.2.0",
+            "signed_manifest": {"manifest": {"version": "0.2.0"}}
         }))
         .expect("command JSON"),
         None,
@@ -496,6 +500,54 @@ async fn draining_state_does_not_overwrite_terminal_state() {
         String::from_utf8_lossy(state.kvs()[0].value()).contains("\"status\":\"APPLIED\""),
         "DRAINING must not overwrite a concurrent terminal state"
     );
+    watcher.shutdown().await;
+}
+
+#[tokio::test]
+async fn mismatched_local_command_target_does_not_trigger_shutdown() {
+    let cluster = unique("upgrade-local-version-mismatch");
+    let mut etcd = connect().await;
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrades/op-5"),
+        serde_json::to_vec(&json!({
+            "status": "RUNNING",
+            "current_node": 0,
+            "nodes": [{"caster_id": "edge-1", "status": "COMMANDED"}]
+        }))
+        .expect("operation JSON"),
+        None,
+    )
+    .await
+    .expect("operation");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-commands/op-5/edge-1"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "operation_id": "op-5",
+            "caster_id": "edge-1",
+            "action": "apply",
+            "target_version": "0.2.0",
+            "signed_manifest": {"manifest": {"version": "0.1.0"}}
+        }))
+        .expect("command JSON"),
+        None,
+    )
+    .await
+    .expect("command");
+    let health = Arc::new(HealthState::default());
+    health.set_ready(true);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let watcher = UpgradeCommandWatcher::start(
+        connect().await,
+        cluster,
+        "edge-1".to_owned(),
+        Arc::clone(&health),
+        None,
+        shutdown_tx,
+    );
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(!*shutdown_rx.borrow());
+    assert!(health.is_ready());
     watcher.shutdown().await;
 }
 
