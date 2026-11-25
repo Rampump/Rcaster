@@ -49,7 +49,7 @@ Implementation progress:
   upgrade mutation controls remain.
 - Browser evidence:
   `tools/web-e2e/runs/20261126-015339/result.json`.
-- Findings 3, 10-13, 15, 17 and 18 are now closed for the local browser
+- Findings 3, 10-18 are now closed for the local browser
   scope:
   - configuration changes require a field-level diff preview before Apply;
   - destructive actions use an accessible impact dialog with pending disable;
@@ -64,7 +64,7 @@ Implementation progress:
   are served as same-origin `text/javascript` resources, and are covered by
   direct asset endpoint tests instead of being embedded in Rust/HTML strings.
 - Final local evidence:
-  `tools/web-e2e/runs/20261126-024303/result.json`.
+  `tools/web-e2e/runs/20261126-025403/result.json`.
 - Firefox found and verified a startup auth race where an old anonymous 401
   could clear a newly authenticated admin session. `api()` now binds 401
   handling to the auth generation captured when the request started.
@@ -183,18 +183,19 @@ Implementation progress:
     - **Fix:** Track last-success time, show “Data stale” without hiding the current view, add bounded retry/backoff, and test offline → online recovery.
     - **If we skip it:** Operators may mistake old state for current state.
 
-16. **[Partially fixed] Batch operation and upgrade UI cover only part of the backend** (`crates/rcaster-service/src/admin.rs:4123`)
+16. **[Fixed for the isolated browser scope] Batch operation and upgrade UI cover only part of the backend** (`crates/rcaster-service/src/admin.rs:4123`)
     - **What it is:** The batch selector exposes only `users.disable` and `sessions.drop`; operation lookup has no Cancel/Retry; upgrade UI is lookup-only.
     - **Problem:** Backend actions for user delete, mountpoint disable, owner change, cancel, retry, approve and rollback cannot be exercised through the browser.
     - **Fix:** Add controls in the same existing sections and browser tests for each action’s preview, permission and failure states.
    - **Current state:** All five batch action types, operation Cancel/Retry,
      upgrade Preview/Start/Approve/Cancel/Rollback and read-only control hiding
-     are present. Batch preview/start is exercised in the clustered browser
-     run. A real signed upgrade mutation is still intentionally not driven from
-     the local browser gate because it would stop/update the test Caster before
-     the remaining assertions complete.
-   - **Remaining proof:** Run the browser upgrade controls against an isolated
-     disposable Caster whose shutdown is part of the test.
+     are present. The clustered browser run now uses a signed manifest and a
+     disposable isolated Caster to verify Preview, pending approval, Cancel,
+     Rollback preview digest propagation, Rollback Cancel, and second-admin
+     Approve to `RUNNING`; the approved command then shuts down that test
+     Caster by design.
+   - **Remaining proof:** A real multi-node signed rollout and rollback under
+     production traffic remains external acceptance.
 
 17. **[Fixed for Chromium plus Firefox smoke] Current browser gate is a single happy-path Chromium test** (`tools/web-e2e/run_browser_e2e.py:300`)
     - **What it is:** The harness covers broad CRUD and socket behavior, but forces `confirm=true`, uses one headless Chromium, and does not test malformed input or failures.

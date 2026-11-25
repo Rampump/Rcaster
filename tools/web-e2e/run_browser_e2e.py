@@ -8,6 +8,7 @@ inside one WSL Linux network namespace. It never contacts the soak cluster.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import shutil
@@ -300,6 +301,61 @@ def run_firefox_smoke(public_url: str, admin_url: str) -> dict:
                 f"tools/web-e2e/runs/{OUTPUT.name}/firefox-admin.png",
             ],
         }
+    finally:
+        driver.quit()
+
+
+def approve_upgrade_firefox(admin_url: str, operation_id: str) -> dict:
+    firefox = shutil.which("firefox-esr") or shutil.which("firefox")
+    geckodriver = shutil.which("geckodriver") or str(
+        Path.home() / ".local/bin/geckodriver"
+    )
+    if firefox is None or not Path(geckodriver).is_file():
+        raise RuntimeError("Firefox and geckodriver are required for approval E2E")
+
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.firefox.service import Service
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    options = Options()
+    options.binary_location = firefox
+    options.add_argument("-headless")
+    options.accept_insecure_certs = True
+    driver = webdriver.Firefox(options=options, service=Service(geckodriver))
+    try:
+        wait = WebDriverWait(driver, 25)
+        driver.get(admin_url)
+        wait.until(
+            lambda current: current.find_element(
+                "css selector", "#username"
+            ).is_displayed()
+        )
+        driver.execute_script(
+            "document.getElementById('username').value='firefox-admin';"
+            "document.getElementById('password').value='firefox-secret';"
+            "login();"
+        )
+        wait.until(
+            lambda current: current.find_element(
+                "css selector", "#data-freshness"
+            ).text.startswith("Data current;")
+        )
+        driver.execute_script(
+            "document.getElementById('upgrade-id').value=arguments[0];"
+            "controlUpgrade('approve');",
+            operation_id,
+        )
+        wait.until(
+            lambda current: current.execute_script(
+                "try{return JSON.parse(document.getElementById('upgrade')"
+                ".textContent).status}catch(_){return ''}"
+            )
+            == "RUNNING"
+        )
+        return driver.execute_script(
+            "return JSON.parse(document.getElementById('upgrade').textContent);"
+        )
     finally:
         driver.quit()
 
@@ -1579,6 +1635,110 @@ def measure_public_monitor_recovery(page: Cdp) -> dict:
     }
 
 
+def exercise_signed_upgrade_browser(
+    debug_port: int,
+    admin_url: str,
+    request_body: dict,
+) -> dict:
+    page = new_page(debug_port, admin_url)
+    try:
+        page.wait_for("document.querySelector('#username')")
+        page.evaluate(
+            "(() => {"
+            "document.getElementById('username').value='browser-admin';"
+            "document.getElementById('password').value='admin-secret';"
+            "return login();"
+            "})()"
+        )
+        page.wait_for(
+            "document.getElementById('data-freshness')"
+            ".textContent.startsWith('Data current;')"
+        )
+        payload = json.dumps(request_body)
+        page.evaluate(
+            "document.getElementById('upgrade-json').value="
+            + json.dumps(payload)
+            + "; true"
+        )
+        page.evaluate("previewUpgrade()")
+        page.wait_for("!document.getElementById('upgrade-start').hidden")
+        page.evaluate("startUpgrade()")
+        page.wait_for("document.getElementById('upgrade-id').value.length > 0")
+        first_id = page.evaluate("document.getElementById('upgrade-id').value")
+        first_status = page.evaluate(
+            "api('/admin/v1/upgrades/'+encodeURIComponent("
+            "document.getElementById('upgrade-id').value))"
+            ".then(operation=>operation.status)"
+        )
+        if first_status != "PENDING_APPROVAL":
+            raise RuntimeError(f"upgrade did not await approval: {first_status}")
+
+        page.evaluate(
+            "(() => {controlUpgrade('cancel'); return true;})()"
+        )
+        accept_confirmation(page)
+        page.wait_for(
+            "api('/admin/v1/upgrades/'+encodeURIComponent("
+            "document.getElementById('upgrade-id').value))"
+            ".then(operation=>operation.status==='CANCELED')"
+        )
+
+        page.evaluate("previewUpgrade()")
+        page.wait_for("!document.getElementById('upgrade-start').hidden")
+        page.evaluate(
+            "(() => {controlUpgrade('rollback'); return true;})()"
+        )
+        accept_confirmation(page)
+        page.wait_for(
+            "document.getElementById('upgrade-id').value !== "
+            + json.dumps(first_id)
+        )
+        rollback_id = page.evaluate(
+            "document.getElementById('upgrade-id').value"
+        )
+        rollback_status = page.evaluate(
+            "api('/admin/v1/upgrades/'+encodeURIComponent("
+            "document.getElementById('upgrade-id').value))"
+            ".then(operation=>operation.status)"
+        )
+        if rollback_status != "PENDING_APPROVAL":
+            raise RuntimeError(
+                f"rollback did not await approval: {rollback_status}"
+            )
+
+        page.evaluate(
+            "(() => {controlUpgrade('cancel'); return true;})()"
+        )
+        accept_confirmation(page)
+        page.wait_for(
+            "api('/admin/v1/upgrades/'+encodeURIComponent("
+            "document.getElementById('upgrade-id').value))"
+            ".then(operation=>operation.status==='CANCELED')"
+        )
+
+        page.evaluate("previewUpgrade()")
+        page.wait_for("!document.getElementById('upgrade-start').hidden")
+        page.evaluate("startUpgrade()")
+        page.wait_for(
+            "document.getElementById('upgrade-id').value !== "
+            + json.dumps(rollback_id)
+        )
+        approval_id = page.evaluate(
+            "document.getElementById('upgrade-id').value"
+        )
+        return {
+            "first_id": first_id,
+            "first_status": first_status,
+            "first_canceled": True,
+            "rollback_id": rollback_id,
+            "rollback_status": rollback_status,
+            "rollback_canceled": True,
+            "approval_id": approval_id,
+        }
+    finally:
+        page.close()
+
+
 def expected_resource_error(url: str, status: int) -> bool:
     return (
         url.endswith("/favicon.ico")
@@ -1776,6 +1936,57 @@ def hash_password(password: str) -> str:
     return result.stdout.strip()
 
 
+UPGRADE_PRIVATE_KEY = "0b" * 32
+UPGRADE_PUBLIC_KEY = (
+    "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a"
+)
+
+
+def signed_upgrade_request(temp: Path) -> dict:
+    private_key = temp / "upgrade.key"
+    private_key.write_text(UPGRADE_PRIVATE_KEY + "\n", encoding="utf-8")
+    os.chmod(private_key, 0o600)
+    digest = hashlib.sha256(BINARY.read_bytes()).hexdigest()
+    manifest = {
+        "schema_version": 1,
+        "version": "browser-e2e",
+        "os": "linux",
+        "arch": "x86_64",
+        "config_schema": 1,
+        "etcd_schema": 1,
+        "api_schema": 1,
+        "artifact_url": "https://artifacts.example.test/rcaster",
+        "artifact_size": BINARY.stat().st_size,
+        "artifact_sha256": digest,
+    }
+    manifest_path = temp / "upgrade-manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    signer = BINARY.with_name("rcaster-upgrade-signer")
+    signed = subprocess.run(
+        [
+            str(signer),
+            "--private-key",
+            str(private_key),
+            "--manifest",
+            str(manifest_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    request = json.loads(signed.stdout)
+    request.update(
+        {
+            "nodes": [{"caster_id": "browser-caster", "role": "core"}],
+            "max_unavailable_core": 1,
+            "max_unavailable_edge": 1,
+            "post_upgrade_stability_s": 0,
+            "auto_rollback": True,
+        }
+    )
+    return request
+
+
 def write_accounts(path: Path) -> None:
     now = "2026-11-25T00:00:00Z"
     accounts = {
@@ -1956,6 +2167,7 @@ def run_test(temp: Path, clustered: bool) -> dict:
             "coordinate_system": "gcj02" if clustered else "wgs84",
         },
     }
+    upgrade_request = None
     if clustered:
         config["tls_bind"] = f"127.0.0.1:{tls_port}"
         config["cluster"] = {
@@ -1972,6 +2184,12 @@ def run_test(temp: Path, clustered: bool) -> dict:
                 "service_token": "browser-e2e",
             },
         }
+        config["upgrade"] = {
+            "trusted_public_keys": [UPGRADE_PUBLIC_KEY],
+            "artifact_hosts": ["artifacts.example.test"],
+            "require_approval": True,
+        }
+        upgrade_request = signed_upgrade_request(temp)
     (temp / "caster.json").write_text(json.dumps(config), encoding="utf-8")
 
     result: dict = {
@@ -2304,6 +2522,23 @@ def run_test(temp: Path, clustered: bool) -> dict:
                     }
                 )
             )
+        if clustered:
+            if upgrade_request is None:
+                raise RuntimeError("signed upgrade test request is unavailable")
+            upgrade_check = exercise_signed_upgrade_browser(
+                debug_port,
+                f"https://127.0.0.1:{admin_url_port}/admin/",
+                upgrade_request,
+            )
+            approved = approve_upgrade_firefox(
+                f"https://localhost:{admin_url_port}/admin/",
+                upgrade_check["approval_id"],
+            )
+            if approved.get("status") != "RUNNING":
+                raise RuntimeError(f"upgrade approval failed: {approved}")
+            upgrade_check["approved"] = approved
+            result["checks"]["signed_upgrade_browser"] = upgrade_check
+            caster.wait(timeout=10)
         result["pass"] = True
     except Exception as error:
         result["pass"] = False

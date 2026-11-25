@@ -42,6 +42,12 @@ idle public-session expiry, reconnect status from the active socket, and
 single-flight mutation controls. Batch preview/start and operation Cancel/Retry
 are exercised when the local etcd-backed mode is available.
 
+The clustered run also configures a trusted Ed25519 upgrade key and drives the
+browser upgrade UI through signed Preview, Start, pending approval, Cancel,
+Rollback, Rollback Cancel, and a second-administrator Approve to `RUNNING`.
+That approval is the final assertion because the isolated Caster intentionally
+receives the upgrade command and shuts down.
+
 When Firefox prerequisites are present, both modes also run a Firefox 153.7 ESR
 smoke covering public directory rendering, login, monitor snapshot, OSM/AMap
 tile requests, administrator login, source rendering, configuration-preview
