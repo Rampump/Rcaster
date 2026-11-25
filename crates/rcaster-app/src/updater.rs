@@ -193,6 +193,9 @@ impl Updater {
         let signed: SignedUpgradeManifest =
             serde_json::from_value(command["signed_manifest"].clone())?;
         let manifest = self.policy.verify(&signed)?;
+        if !command_target_matches(command, &manifest.version) {
+            return Err("upgrade command target version does not match its signed manifest".into());
+        }
         let mut state = self.read_state()?;
         let old = state.current;
         let replacement = if action == "apply" {
@@ -547,6 +550,10 @@ fn read_slot_state(path: &Path) -> UpdaterResult<Option<SlotState>> {
     }
 }
 
+fn command_target_matches(command: &Value, manifest_version: &str) -> bool {
+    command["target_version"].as_str() == Some(manifest_version)
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -672,9 +679,9 @@ mod tests {
     };
 
     use super::{
-        Slot, SlotState, Updater, connect_etcd, download_artifact, ensure_staging_space,
-        inactive_slot, probe_health, read_slot_state, repaired_slot_state, request_graceful_stop,
-        terminal_upgrade_state, valid_identifier,
+        Slot, SlotState, Updater, command_target_matches, connect_etcd, download_artifact,
+        ensure_staging_space, inactive_slot, probe_health, read_slot_state, repaired_slot_state,
+        request_graceful_stop, terminal_upgrade_state, valid_identifier,
     };
     use crate::config::UpdaterConfig;
     use rcaster_service::upgrade::UpgradePolicy;
@@ -716,6 +723,19 @@ mod tests {
         assert!(!valid_identifier("../escape"));
         assert!(!valid_identifier("a/b"));
         assert!(!valid_identifier(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn command_target_version_must_match_signed_manifest() {
+        assert!(command_target_matches(
+            &serde_json::json!({"target_version":"0.2.0"}),
+            "0.2.0"
+        ));
+        assert!(!command_target_matches(
+            &serde_json::json!({"target_version":"0.1.0"}),
+            "0.2.0"
+        ));
+        assert!(!command_target_matches(&serde_json::json!({}), "0.2.0"));
     }
 
     #[test]
