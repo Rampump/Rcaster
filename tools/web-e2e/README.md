@@ -31,3 +31,4 @@ session and disconnect a live source. The clustered mode additionally applies
 configuration with generation advancement and previews/completes a batch
 user-disable operation through the browser. Console exceptions, uncaught
 errors, failed network requests, and unexpected HTTP errors fail the run.
+Disabling an active mountpoint is also verified to close its live source.

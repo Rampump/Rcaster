@@ -3492,9 +3492,8 @@ async fn standalone_account_write(
             .snapshot()
             .mountpoint(mountpoint_name)?
             .clone();
-        if body.get("enabled").and_then(Value::as_bool) != Some(false)
-            && state.hub.source_profile(mountpoint_name).is_some()
-        {
+        let disabling = body.get("enabled").and_then(Value::as_bool) == Some(false);
+        if !disabling && state.hub.source_profile(mountpoint_name).is_some() {
             return Some(response(
                 409,
                 json!({"code":"ACTIVE_SOURCE","message":"mountpoint has an active source"}),
@@ -3600,16 +3599,32 @@ async fn standalone_account_write(
                 .await
             {
                 Ok(revision) => {
+                    let disconnect_pending = disabling
+                        && state.hub.source_profile(mountpoint_name).is_some()
+                        && !state.connections.cancel_source(mountpoint_name);
                     audit(
                         state,
                         source_ip,
                         access_actor(access),
                         "mountpoint.update",
                         mountpoint_name,
-                        "success",
-                        json!({"revision": revision}),
+                        if disconnect_pending {
+                            "partial"
+                        } else {
+                            "success"
+                        },
+                        json!({
+                            "revision": revision,
+                            "disconnect_pending": disconnect_pending,
+                        }),
                     );
-                    response(200, json!({"revision": revision}))
+                    response(
+                        if disconnect_pending { 503 } else { 200 },
+                        json!({
+                            "revision": revision,
+                            "disconnect_pending": disconnect_pending,
+                        }),
+                    )
                 }
                 Err(error) => {
                     audit(

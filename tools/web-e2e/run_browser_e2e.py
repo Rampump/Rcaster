@@ -704,6 +704,43 @@ def exercise_admin_mutations(
         "!document.getElementById('sources').textContent.includes('C63')"
     )
     checks["source_disconnect_kicks_source"] = True
+
+    mount_source = LocalSource(clear_port, source.payload)
+    page.evaluate("loadSources()")
+    page.wait_for(
+        "document.getElementById('sources').textContent.includes('C63')"
+    )
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#mountpoints tr')]"
+        ".find(row=>row.textContent.includes('C63'));"
+        "row.querySelectorAll('button')[0].click();"
+        "document.getElementById('mount-enabled').checked=false;"
+        "return saveMount();"
+        "})()"
+    )
+    if not mount_source.closed.wait(5):
+        raise RuntimeError("disabling mountpoint did not close the NTRIP source")
+    page.wait_for(
+        "fetch('/admin/v1/mountpoints/C63')"
+        ".then(response=>response.json())"
+        ".then(result=>result.mountpoint.enabled===false)"
+    )
+    checks["mountpoint_disable_kicks_source"] = True
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#mountpoints tr')]"
+        ".find(row=>row.textContent.includes('C63'));"
+        "row.querySelectorAll('button')[0].click();"
+        "document.getElementById('mount-enabled').checked=true;"
+        "return saveMount();"
+        "})()"
+    )
+    page.wait_for(
+        "fetch('/admin/v1/mountpoints/C63')"
+        ".then(response=>response.json())"
+        ".then(result=>result.mountpoint.enabled===true)"
+    )
     page.evaluate("logout()")
     page.wait_for(
         "!document.getElementById('login').hidden"
