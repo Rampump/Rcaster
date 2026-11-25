@@ -193,7 +193,7 @@ impl Updater {
         let signed: SignedUpgradeManifest =
             serde_json::from_value(command["signed_manifest"].clone())?;
         let manifest = self.policy.verify(&signed)?;
-        let mut state = self.read_state();
+        let mut state = self.read_state()?;
         let old = state.current;
         let replacement = if action == "apply" {
             let slot = inactive_slot(old);
@@ -342,7 +342,7 @@ impl Updater {
 
     async fn start_child(&mut self) -> UpdaterResult<()> {
         self.stop_child().await;
-        let state = self.read_state();
+        let state = self.read_state()?;
         let (selected, program) = [
             state.current,
             state.previous.unwrap_or(Slot::Initial),
@@ -436,17 +436,18 @@ impl Updater {
         }
     }
 
-    fn read_state(&self) -> SlotState {
+    fn read_state(&self) -> UpdaterResult<SlotState> {
         let current = self.config.work_dir.join("slots.json");
         let previous = self.config.work_dir.join("slots.old");
         [current, previous]
             .into_iter()
-            .find_map(|path| {
-                fs::read(path)
-                    .ok()
-                    .and_then(|value| serde_json::from_slice(&value).ok())
+            .find_map(|path| match read_slot_state(&path) {
+                Ok(Some(state)) => Some(Ok(state)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
             })
-            .unwrap_or_default()
+            .transpose()
+            .map(|state| state.unwrap_or_default())
     }
 
     fn write_slot_state(&self, state: &SlotState) -> UpdaterResult<()> {
@@ -534,6 +535,16 @@ fn terminal_upgrade_state(state: &Value) -> bool {
         state["status"].as_str(),
         Some("APPLIED" | "FAILED" | "ROLLED_BACK")
     )
+}
+
+fn read_slot_state(path: &Path) -> UpdaterResult<Option<SlotState>> {
+    match fs::read(path) {
+        Ok(value) => serde_json::from_slice(&value)
+            .map(Some)
+            .map_err(|error| format!("{} is corrupt: {error}", path.display()).into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{} cannot be read: {error}", path.display()).into()),
+    }
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -662,7 +673,7 @@ mod tests {
 
     use super::{
         Slot, SlotState, Updater, connect_etcd, download_artifact, ensure_staging_space,
-        inactive_slot, probe_health, repaired_slot_state, request_graceful_stop,
+        inactive_slot, probe_health, read_slot_state, repaired_slot_state, request_graceful_stop,
         terminal_upgrade_state, valid_identifier,
     };
     use crate::config::UpdaterConfig;
@@ -705,6 +716,17 @@ mod tests {
         assert!(!valid_identifier("../escape"));
         assert!(!valid_identifier("a/b"));
         assert!(!valid_identifier(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn corrupt_slot_state_is_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "rcaster-updater-slot-state-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"{not-json").expect("corrupt state");
+        assert!(read_slot_state(&path).is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
