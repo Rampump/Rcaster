@@ -96,6 +96,29 @@ async fn signed_rollout_is_previewed_locked_and_advanced() {
         .await
         .expect("commands");
     assert_eq!(commands.kvs().len(), 2);
+    etcd.delete(
+        format!("/rcaster/{cluster}/runtime/upgrade-commands/{operation_id}/core-1"),
+        None,
+    )
+    .await
+    .expect("delete next-node command");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let command = etcd
+                .get(
+                    format!("/rcaster/{cluster}/runtime/upgrade-commands/{operation_id}/core-1"),
+                    None,
+                )
+                .await
+                .expect("next-node command");
+            if !command.kvs().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("next-node command recovery timeout");
 
     let canceled = manager.cancel(&operation_id).await.expect("cancel");
     assert_eq!(canceled["status"], "CANCELED");

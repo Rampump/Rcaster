@@ -877,6 +877,14 @@ impl UpgradeInner {
                 UpgradeError::InvalidManifest("operation has no current node".to_owned())
             })?;
         let state = self.node_state(&operation_id, &node.caster_id).await?;
+        if state.is_none()
+            && matches!(
+                operation.status,
+                OperationStatus::Running | OperationStatus::RollingBack
+            )
+        {
+            self.ensure_command(&operation).await?;
+        }
         let now = now_timestamp();
         if let Some(ref state) = state {
             let status = state["status"].as_str().unwrap_or_default();
@@ -1166,6 +1174,24 @@ impl UpgradeInner {
                 serde_json::to_vec(command)?,
                 None,
             )
+            .await?;
+        Ok(())
+    }
+
+    async fn ensure_command(&mut self, operation: &UpgradeOperation) -> Result<(), UpgradeError> {
+        let caster_id = &operation.nodes[operation.current_node].caster_id;
+        let key = self.command_key(&operation.operation_id, caster_id);
+        if !self.client.get(key.clone(), None).await?.kvs().is_empty() {
+            return Ok(());
+        }
+        let action = if operation.status == OperationStatus::RollingBack {
+            "rollback"
+        } else {
+            "apply"
+        };
+        let command = self.command(operation, action)?;
+        self.client
+            .put(key, serde_json::to_vec(&command)?, None)
             .await?;
         Ok(())
     }
