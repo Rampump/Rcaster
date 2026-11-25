@@ -599,6 +599,12 @@ async fn handle(
             }
         };
     }
+    if state.runtime.is_none()
+        && let Some(result) =
+            standalone_account_write(state, &access, source_ip, method, path, &headers, body).await
+    {
+        return Ok(result);
+    }
     if method != "GET" {
         let Some(runtime) = &state.runtime else {
             return Ok(response(
@@ -3075,6 +3081,400 @@ fn account_error_response(error: AccountDirectoryError) -> Vec<u8> {
             json!({"code":"UNAVAILABLE","message":"account directory unavailable"}),
         ),
     }
+}
+
+async fn standalone_account_write(
+    state: &AdminState,
+    access: &Access,
+    source_ip: Option<std::net::IpAddr>,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: &str,
+) -> Option<Vec<u8>> {
+    if method == "POST" && path == "/admin/v1/users" {
+        let body = serde_json::from_str::<Value>(body).ok()?;
+        let user_id = body.get("user_id")?.as_str()?.to_owned();
+        let username = body.get("username")?.as_str()?.to_owned();
+        let password = body.get("password")?.as_str()?.to_owned();
+        let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+            .await
+            .ok()?
+            .ok()?;
+        let role = match body.get("role").and_then(Value::as_str) {
+            Some("admin") => UserRole::Admin,
+            Some("user") | None => UserRole::User,
+            Some(_) => {
+                return Some(response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"invalid role"}),
+                ));
+            }
+        };
+        let now = now_timestamp();
+        let user = User {
+            schema_version: 1,
+            mod_revision: 0,
+            user_id: user_id.clone(),
+            username,
+            password_hash,
+            auth_version: 1,
+            enabled: body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            ntrip_enabled: body
+                .get("ntrip_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            web_enabled: body
+                .get("web_enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(role == UserRole::Admin),
+            role,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        return Some(match state.accounts.upsert_user(user, None).await {
+            Ok(revision) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(access),
+                    "user.create",
+                    &user_id,
+                    "success",
+                    json!({"username": body["username"]}),
+                );
+                response(201, json!({"revision": revision}))
+            }
+            Err(error) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(access),
+                    "user.create",
+                    &user_id,
+                    "failure",
+                    json!({"error": error.to_string()}),
+                );
+                account_error_response(error)
+            }
+        });
+    }
+    if method == "PATCH" && path.starts_with("/admin/v1/users/") {
+        let user_id = &path["/admin/v1/users/".len()..];
+        let Some(revision) = header(headers, "if-match").and_then(parse_revision) else {
+            return Some(response(
+                428,
+                json!({"code":"PRECONDITION_REQUIRED","message":"If-Match required"}),
+            ));
+        };
+        let body = serde_json::from_str::<Value>(body).ok()?;
+        let current = state.accounts.snapshot().user_by_id(user_id).cloned()?;
+        let mut updated = current.clone();
+        if body
+            .get("username")
+            .and_then(Value::as_str)
+            .is_some_and(|username| username != current.username)
+        {
+            return Some(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"username cannot be changed"}),
+            ));
+        }
+        if let Some(password) = body.get("password").and_then(Value::as_str) {
+            let password = password.to_owned();
+            let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+                .await
+                .ok()?
+                .ok()?;
+            updated.password_hash = password_hash;
+            updated.auth_version = updated.auth_version.saturating_add(1);
+        }
+        if let Some(role) = body.get("role").and_then(Value::as_str) {
+            let role = match role {
+                "admin" => UserRole::Admin,
+                "user" => UserRole::User,
+                _ => {
+                    return Some(response(
+                        400,
+                        json!({"code":"BAD_REQUEST","message":"invalid role"}),
+                    ));
+                }
+            };
+            if role != updated.role {
+                updated.role = role;
+                updated.auth_version = updated.auth_version.saturating_add(1);
+            }
+        }
+        if let Some(enabled) = body.get("enabled").and_then(Value::as_bool)
+            && enabled != updated.enabled
+        {
+            updated.enabled = enabled;
+            updated.auth_version = updated.auth_version.saturating_add(1);
+        }
+        if let Some(enabled) = body.get("ntrip_enabled").and_then(Value::as_bool) {
+            updated.ntrip_enabled = enabled;
+        }
+        updated.updated_at = now_timestamp();
+        return Some(
+            match state.accounts.upsert_user(updated, Some(revision)).await {
+                Ok(revision) => {
+                    if body.get("enabled").and_then(Value::as_bool) == Some(false) {
+                        state.connections.cancel_user(user_id);
+                        state.connections.cancel_web_user(user_id);
+                    }
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "user.update",
+                        user_id,
+                        "success",
+                        json!({"revision": revision}),
+                    );
+                    response(200, json!({"revision": revision}))
+                }
+                Err(error) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "user.update",
+                        user_id,
+                        "failure",
+                        json!({"error": error.to_string()}),
+                    );
+                    account_error_response(error)
+                }
+            },
+        );
+    }
+    if method == "DELETE" && path.starts_with("/admin/v1/users/") {
+        let user_id = &path["/admin/v1/users/".len()..];
+        let Some(revision) = header(headers, "if-match").and_then(parse_revision) else {
+            return Some(response(
+                428,
+                json!({"code":"PRECONDITION_REQUIRED","message":"If-Match required"}),
+            ));
+        };
+        return Some(match state.accounts.delete_user(user_id, revision).await {
+            Ok(()) => {
+                state.connections.cancel_user(user_id);
+                state.connections.cancel_web_user(user_id);
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(access),
+                    "user.delete",
+                    user_id,
+                    "success",
+                    json!({}),
+                );
+                response(204, Value::Null)
+            }
+            Err(error) => {
+                audit(
+                    state,
+                    source_ip,
+                    access_actor(access),
+                    "user.delete",
+                    user_id,
+                    "failure",
+                    json!({"error": error.to_string()}),
+                );
+                account_error_response(error)
+            }
+        });
+    }
+    if method == "POST" && path == "/admin/v1/mountpoints" {
+        let body = serde_json::from_str::<Value>(body).ok()?;
+        let mountpoint_name = body.get("mountpoint")?.as_str()?.to_owned();
+        let owner_user_id = body.get("owner_user_id")?.as_str()?.to_owned();
+        let ntrip1_upload_password_hash =
+            match body.get("ntrip1_upload_password").and_then(Value::as_str) {
+                Some(password) if !password.is_empty() => {
+                    let password = password.to_owned();
+                    Some(
+                        tokio::task::spawn_blocking(move || hash_password(&password))
+                            .await
+                            .ok()?
+                            .ok()?,
+                    )
+                }
+                _ => None,
+            };
+        let now = now_timestamp();
+        let mountpoint = Mountpoint {
+            schema_version: 1,
+            mod_revision: 0,
+            mountpoint: mountpoint_name.clone(),
+            owner_user_id,
+            enabled: body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            ntrip1_upload_password_hash,
+            advertise: body
+                .get("advertise")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            region: body
+                .get("region")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            latitude: parse_optional_number(&body, "latitude").ok()?,
+            longitude: parse_optional_number(&body, "longitude").ok()?,
+            coverage_radius_m: parse_optional_number(&body, "coverage_radius_m").ok()?,
+            str_fields: parse_optional_str_fields(&body).ok()?,
+            source_expectation: body
+                .get("source_expectation")
+                .filter(|value| !value.is_null())
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        return Some(
+            match state.accounts.upsert_mountpoint(mountpoint, None).await {
+                Ok(revision) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "mountpoint.create",
+                        &mountpoint_name,
+                        "success",
+                        json!({}),
+                    );
+                    response(201, json!({"revision": revision}))
+                }
+                Err(error) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "mountpoint.create",
+                        &mountpoint_name,
+                        "failure",
+                        json!({"error": error.to_string()}),
+                    );
+                    account_error_response(error)
+                }
+            },
+        );
+    }
+    if method == "PATCH" && path.starts_with("/admin/v1/mountpoints/") {
+        let mountpoint_name = &path["/admin/v1/mountpoints/".len()..];
+        let Some(revision) = header(headers, "if-match").and_then(parse_revision) else {
+            return Some(response(
+                428,
+                json!({"code":"PRECONDITION_REQUIRED","message":"If-Match required"}),
+            ));
+        };
+        let body = serde_json::from_str::<Value>(body).ok()?;
+        let mut updated = state
+            .accounts
+            .snapshot()
+            .mountpoint(mountpoint_name)?
+            .clone();
+        if body.get("enabled").and_then(Value::as_bool) != Some(false)
+            && state.hub.source_profile(mountpoint_name).is_some()
+        {
+            return Some(response(
+                409,
+                json!({"code":"ACTIVE_SOURCE","message":"mountpoint has an active source"}),
+            ));
+        }
+        if let Some(owner) = body.get("owner_user_id").and_then(Value::as_str) {
+            updated.owner_user_id = owner.to_owned();
+        }
+        if let Some(enabled) = body.get("enabled").and_then(Value::as_bool) {
+            updated.enabled = enabled;
+        }
+        if let Some(advertise) = body.get("advertise").and_then(Value::as_bool) {
+            updated.advertise = advertise;
+        }
+        if let Some(region) = body.get("region") {
+            updated.region = region.as_str().map(str::to_owned);
+        }
+        updated.updated_at = now_timestamp();
+        return Some(
+            match state
+                .accounts
+                .upsert_mountpoint(updated, Some(revision))
+                .await
+            {
+                Ok(revision) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "mountpoint.update",
+                        mountpoint_name,
+                        "success",
+                        json!({"revision": revision}),
+                    );
+                    response(200, json!({"revision": revision}))
+                }
+                Err(error) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "mountpoint.update",
+                        mountpoint_name,
+                        "failure",
+                        json!({"error": error.to_string()}),
+                    );
+                    account_error_response(error)
+                }
+            },
+        );
+    }
+    if method == "DELETE" && path.starts_with("/admin/v1/mountpoints/") {
+        let mountpoint_name = &path["/admin/v1/mountpoints/".len()..];
+        let Some(revision) = header(headers, "if-match").and_then(parse_revision) else {
+            return Some(response(
+                428,
+                json!({"code":"PRECONDITION_REQUIRED","message":"If-Match required"}),
+            ));
+        };
+        if state.hub.source_profile(mountpoint_name).is_some() {
+            return Some(response(
+                409,
+                json!({"code":"ACTIVE_SOURCE","message":"mountpoint has an active source"}),
+            ));
+        }
+        return Some(
+            match state
+                .accounts
+                .delete_mountpoint(mountpoint_name, revision)
+                .await
+            {
+                Ok(()) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "mountpoint.delete",
+                        mountpoint_name,
+                        "success",
+                        json!({}),
+                    );
+                    response(204, Value::Null)
+                }
+                Err(error) => {
+                    audit(
+                        state,
+                        source_ip,
+                        access_actor(access),
+                        "mountpoint.delete",
+                        mountpoint_name,
+                        "failure",
+                        json!({"error": error.to_string()}),
+                    );
+                    account_error_response(error)
+                }
+            },
+        );
+    }
+    None
 }
 
 fn blacklist_directory_error_response(error: AccountDirectoryError) -> Vec<u8> {

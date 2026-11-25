@@ -307,6 +307,7 @@ impl Updater {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        request_graceful_stop(&mut child);
         let deadline =
             tokio::time::Instant::now() + Duration::from_secs(self.config.drain_timeout_s);
         loop {
@@ -429,6 +430,21 @@ impl Updater {
     }
 }
 
+fn request_graceful_stop(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(process_id) = child.id() {
+        // SAFETY: process_id came from the live Child handle. SIGTERM targets
+        // only that process; failure means it already exited.
+        unsafe {
+            libc::kill(process_id as i32, libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.start_kill();
+    }
+}
+
 fn inactive_slot(current: Slot) -> Slot {
     match current {
         Slot::A => Slot::B,
@@ -510,15 +526,32 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         thread,
+        time::Duration,
     };
 
-    use super::{Slot, download_artifact, inactive_slot, probe_health};
+    use super::{Slot, download_artifact, inactive_slot, probe_health, request_graceful_stop};
 
     #[test]
     fn alternates_between_two_slots() {
         assert_eq!(inactive_slot(Slot::Initial), Slot::A);
         assert_eq!(inactive_slot(Slot::A), Slot::B);
         assert_eq!(inactive_slot(Slot::B), Slot::A);
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_sends_sigterm_before_kill() {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap 'exit 0' TERM; while :; do sleep 1; done")
+            .spawn()
+            .expect("service child");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        request_graceful_stop(&mut child);
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("service should exit after SIGTERM")
+            .expect("service wait");
+        assert!(status.success());
     }
 
     #[tokio::test]

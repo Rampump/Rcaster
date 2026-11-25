@@ -20,10 +20,10 @@ python3 tools/web-e2e/run_browser_e2e.py
 
 Results are written to `tools/web-e2e/runs/<timestamp>/result.json`.
 
-The standalone mode exercises administrator login, source filtering, health,
-history, unavailable config/operation behavior, public directory rendering,
-map auto-fit, public login, one-time ticket consumption, and the monitor
-WebSocket. The clustered mode exercises real mTLS admin config access, local
-etcd-backed STR publication, and the same public login/ticket/WebSocket flow.
-Console exceptions, uncaught errors, failed network requests, and unexpected
-HTTP errors fail the run.
+Both modes exercise administrator login, user create/update/disable/delete,
+mountpoint create/update/disable/delete, source filtering, health, history,
+public directory rendering, map auto-fit, public login, one-time ticket
+consumption, and the monitor WebSocket. The clustered mode additionally uses a
+real NTRIP client and source session to verify administrator session drop,
+user-disable disconnect and source disconnect. Console exceptions, uncaught
+errors, failed network requests, and unexpected HTTP errors fail the run.

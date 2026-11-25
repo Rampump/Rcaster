@@ -18,8 +18,12 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
+import base64
+import http.client
 import urllib.request
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from websockets.sync.client import connect
@@ -260,6 +264,197 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
     return checks
 
 
+def exercise_admin_mutations(
+    page: Cdp,
+    clustered: bool,
+    clear_port: int,
+    clients: list[LocalClient],
+    source: LocalSource,
+) -> dict:
+    page.evaluate("window.confirm=()=>true; true")
+    checks: dict = {}
+
+    page.evaluate(
+        "(() => {"
+        "userRevision=null;"
+        "document.getElementById('user-id').value='browser-user';"
+        "document.getElementById('user-name').value='browser-user';"
+        "document.getElementById('user-password').value='user-secret';"
+        "document.getElementById('user-role').value='user';"
+        "document.getElementById('user-enabled').checked=true;"
+        "return saveUser();"
+        "})()"
+    )
+    checks["user_create_status"] = page.evaluate(
+        "document.getElementById('status').textContent"
+    )
+    if checks["user_create_status"].startswith("Error:"):
+        raise RuntimeError(f"user create failed: {checks['user_create_status']}")
+    page.wait_for(
+        "document.getElementById('users').textContent.includes('browser-user')"
+    )
+    checks["user_create"] = True
+
+    if clustered:
+        page.wait_for(
+            "JSON.parse(document.getElementById('cluster').textContent).ready === true",
+            timeout=10,
+        )
+    user_client = connect_local_client(
+        clear_port,
+        "browser-user",
+        "user-secret",
+    )
+    clients.append(user_client)
+    page.evaluate("load()")
+    if clustered:
+        time.sleep(0.25)
+        checks["sessions_after_client"] = page.evaluate(
+            "fetch('/admin/v1/sessions').then(response=>response.json())"
+        )
+        page.wait_for(
+            "document.getElementById('sessions')"
+            ".textContent.includes('browser-user')"
+        )
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#users tr')]"
+        ".find(row=>row.textContent.includes('browser-user'));"
+        "row.querySelectorAll('button')[0].click();"
+        "document.getElementById('user-enabled').checked=false;"
+        "return saveUser();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('users').textContent"
+        ".includes('browser-useruserfalse')"
+    )
+    if not user_client.wait_closed():
+        raise RuntimeError("disabling user did not disconnect the NTRIP client")
+    checks["user_disable_kicks_client"] = True
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#users tr')]"
+        ".find(row=>row.textContent.includes('browser-user'));"
+        "row.querySelectorAll('button')[0].click();"
+        "document.getElementById('user-enabled').checked=true;"
+        "return saveUser();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('users').textContent"
+        ".includes('browser-userusertrue')"
+    )
+
+    page.evaluate(
+        "(() => {"
+        "mountRevision=null;"
+        "document.getElementById('mount-name').value='TMP1';"
+        "document.getElementById('mount-owner').value='browser-user';"
+        "document.getElementById('mount-password').value='upload-secret';"
+        "document.getElementById('mount-region').value='e2e';"
+        "document.getElementById('mount-enabled').checked=true;"
+        "document.getElementById('mount-advertise').checked=true;"
+        "return saveMount();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('mountpoints').textContent.includes('TMP1')"
+    )
+    checks["mountpoint_create"] = True
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#mountpoints tr')]"
+        ".find(row=>row.textContent.includes('TMP1'));"
+        "row.querySelectorAll('button')[0].click();"
+        "document.getElementById('mount-region').value='e2e-edited';"
+        "document.getElementById('mount-enabled').checked=false;"
+        "return saveMount();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('mountpoints').textContent.includes('TMP1browser-userfalse')"
+    )
+    checks["mountpoint_update_disable"] = True
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#mountpoints tr')]"
+        ".find(row=>row.textContent.includes('TMP1'));"
+        "row.querySelectorAll('button')[1].click();"
+        "return true;"
+        "})()"
+    )
+    page.wait_for(
+        "!document.getElementById('mountpoints').textContent.includes('TMP1')"
+    )
+    checks["mountpoint_delete"] = True
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#users tr')]"
+        ".find(row=>row.textContent.includes('browser-user'));"
+        "row.querySelectorAll('button')[1].click();"
+        "return true;"
+        "})()"
+    )
+    page.wait_for(
+        "!document.getElementById('users').textContent.includes('browser-user')"
+    )
+    checks["user_delete"] = True
+
+    owner_client = connect_local_client(clear_port, "owner", "secret")
+    clients.append(owner_client)
+    page.evaluate("load()")
+    if clustered:
+        page.wait_for(
+            "(() => {"
+            "const row=[...document.querySelectorAll('#sessions tr')]"
+            ".find(row=>row.textContent.includes('client')"
+            "&&row.textContent.includes('owner'));"
+            "return Boolean(row);"
+            "})()"
+        )
+        page.evaluate(
+            "(() => {"
+            "const row=[...document.querySelectorAll('#sessions tr')]"
+            ".find(row=>row.textContent.includes('client')"
+            "&&row.textContent.includes('owner'));"
+            "row.querySelector('button').click();"
+            "return true;"
+            "})()"
+        )
+        if not owner_client.wait_closed():
+            raise RuntimeError("session disconnect did not close the NTRIP client")
+        page.evaluate("load()")
+        page.wait_for(
+            "![...document.querySelectorAll('#sessions tr')]"
+            ".some(row=>row.textContent.includes('client')"
+            "&&row.textContent.includes('owner'))"
+        )
+        checks["session_disconnect_kicks_client"] = True
+
+        page.evaluate(
+            "(() => {"
+            "const row=[...document.querySelectorAll('#sources tr')]"
+            ".find(row=>row.textContent.includes('C63'));"
+            "row.querySelectorAll('button')[3].click();"
+            "return true;"
+            "})()"
+        )
+        if not source.closed.wait(5):
+            raise RuntimeError("source disconnect did not close the NTRIP source")
+        page.evaluate("loadSources()")
+        page.wait_for(
+            "!document.getElementById('sources').textContent.includes('C63')"
+        )
+        checks["source_disconnect_kicks_source"] = True
+    return checks
+
+
 def expected_resource_error(url: str, status: int) -> bool:
     return (
         url.endswith("/favicon.ico")
@@ -274,6 +469,7 @@ class LocalSource:
     def __init__(self, port: int, payload: bytes):
         self.payload = payload
         self.stop = threading.Event()
+        self.closed = threading.Event()
         self.error: str | None = None
         self.socket = socket.create_connection(("127.0.0.1", port), timeout=5)
         self.socket.sendall(
@@ -298,11 +494,149 @@ class LocalSource:
                 self.stop.wait(0.5)
         except OSError:
             self.error = "source socket closed"
+        finally:
+            self.closed.set()
 
     def close(self) -> None:
         self.stop.set()
         self.socket.close()
         self.thread.join(timeout=3)
+
+
+class LocalClient:
+    def __init__(self, port: int, username: str, password: str):
+        self.closed = threading.Event()
+        self.socket = socket.create_connection(("127.0.0.1", port), timeout=5)
+        credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+        self.socket.sendall(
+            (
+                "GET /C63 HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "Ntrip-Version: Ntrip/2.0\r\n"
+                f"Authorization: Basic {credentials}\r\n\r\n"
+            ).encode()
+        )
+        header = bytearray()
+        while b"\r\n\r\n" not in header:
+            chunk = self.socket.recv(1024)
+            if not chunk:
+                break
+            header.extend(chunk)
+        if b" 200 " not in header.split(b"\r\n", 1)[0]:
+            raise RuntimeError(f"client rejected: {bytes(header)!r}")
+        self.thread = threading.Thread(target=self.run, name="browser-e2e-client")
+        self.thread.start()
+
+    def run(self) -> None:
+        try:
+            while not self.closed.is_set():
+                if not self.socket.recv(4096):
+                    break
+        except OSError:
+            pass
+        finally:
+            self.closed.set()
+
+    def wait_closed(self, timeout: float = 5.0) -> bool:
+        return self.closed.wait(timeout)
+
+    def close(self) -> None:
+        self.closed.set()
+        self.socket.close()
+        self.thread.join(timeout=3)
+
+
+def connect_local_client(
+    port: int,
+    username: str,
+    password: str,
+    timeout: float = 10.0,
+) -> LocalClient:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return LocalClient(port, username, password)
+        except (OSError, RuntimeError) as error:
+            last_error = error
+            time.sleep(0.1)
+    raise RuntimeError(f"NTRIP client session could not be established: {last_error}")
+
+
+class AdminProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, address, upstream_port: int, client_context: ssl.SSLContext):
+        super().__init__(address, AdminProxyHandler)
+        self.upstream_port = upstream_port
+        self.client_context = client_context
+
+    def handle_error(self, request, client_address) -> None:
+        if isinstance(sys.exception(), (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
+class AdminProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args) -> None:
+        pass
+
+    def do_GET(self) -> None:
+        self.proxy()
+
+    def do_POST(self) -> None:
+        self.proxy()
+
+    def do_PATCH(self) -> None:
+        self.proxy()
+
+    def do_DELETE(self) -> None:
+        self.proxy()
+
+    def proxy(self) -> None:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length) if length else None
+        headers = {
+            name: value
+            for name, value in self.headers.items()
+            if name.lower() not in {"host", "connection", "content-length"}
+        }
+        headers["Host"] = f"127.0.0.1:{self.server.upstream_port}"
+        connection = http.client.HTTPSConnection(
+            "127.0.0.1",
+            self.server.upstream_port,
+            context=self.server.client_context,
+            timeout=20,
+        )
+        try:
+            connection.request(self.command, self.path, body=body, headers=headers)
+            response = connection.getresponse()
+            data = response.read()
+            self.send_response(response.status, response.reason)
+            for name, value in response.getheaders():
+                if name.lower() not in {
+                    "connection",
+                    "content-length",
+                    "transfer-encoding",
+                }:
+                    self.send_header(name, value)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as error:
+            data = json.dumps(
+                {"code": "PROXY_ERROR", "message": str(error)}
+            ).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        finally:
+            connection.close()
 
 
 def hash_password(password: str) -> str:
@@ -372,10 +706,10 @@ def write_accounts(path: Path) -> None:
 
 def run_test(temp: Path, clustered: bool) -> dict:
     temp.mkdir(parents=True, exist_ok=True)
-    ports = free_ports(8 if clustered else 5)
+    ports = free_ports(9 if clustered else 5)
     clear_port, public_port, admin_port, health_port, debug_port = ports[:5]
-    etcd_client_port, etcd_peer_port, tls_port = (
-        ports[5:] if clustered else (None, None, None)
+    etcd_client_port, etcd_peer_port, tls_port, admin_proxy_port = (
+        ports[5:] if clustered else (None, None, None, None)
     )
     subprocess.run(
         [
@@ -465,6 +799,7 @@ def run_test(temp: Path, clustered: bool) -> dict:
         "account_db": "accounts.redb",
         "tls_certificate": "server.crt",
         "tls_private_key": "server.key",
+        "client_auth_required": True,
         "client_auth_require_tls": False,
         "source_auth_require_tls": False,
         "head_timeout_ms": 5000,
@@ -548,6 +883,9 @@ def run_test(temp: Path, clustered: bool) -> dict:
     chrome = None
     admin = None
     public = None
+    admin_proxy = None
+    proxy_thread = None
+    clients: list[LocalClient] = []
     try:
         wait_http(f"http://127.0.0.1:{health_port}/health/live")
         wait_http(f"https://127.0.0.1:{public_port}/")
@@ -586,6 +924,35 @@ def run_test(temp: Path, clustered: bool) -> dict:
             env={**os.environ, "HOME": str(chrome_home)},
         )
         wait_http(f"http://127.0.0.1:{debug_port}/json/version")
+        if clustered:
+            client_context = ssl.create_default_context(
+                cafile=str(temp / "server.crt")
+            )
+            client_context.check_hostname = False
+            client_context.load_cert_chain(
+                str(temp / "client.crt"),
+                str(temp / "client.key"),
+            )
+            admin_proxy = AdminProxyServer(
+                ("127.0.0.1", admin_proxy_port),
+                admin_port,
+                client_context,
+            )
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(
+                str(temp / "server.crt"),
+                str(temp / "server.key"),
+            )
+            admin_proxy.socket = server_context.wrap_socket(
+                admin_proxy.socket,
+                server_side=True,
+            )
+            proxy_thread = threading.Thread(
+                target=admin_proxy.serve_forever,
+                name="browser-e2e-admin-proxy",
+                daemon=True,
+            )
+            proxy_thread.start()
 
         if clustered:
             with request_mtls(
@@ -607,9 +974,9 @@ def run_test(temp: Path, clustered: bool) -> dict:
             assert config_status["available"] is True
             assert config_status["generation"] == 1
             result["checks"]["cluster_mtls_admin_config"] = config_status
-        if not clustered:
-            admin = new_page(debug_port, f"https://127.0.0.1:{admin_port}/admin/")
-            result["checks"].update(exercise_admin(admin, clustered))
+        admin_url_port = admin_proxy_port if clustered else admin_port
+        admin = new_page(debug_port, f"https://127.0.0.1:{admin_url_port}/admin/")
+        result["checks"].update(exercise_admin(admin, clustered))
         if source.error:
             result["checks"]["source_error"] = source.error
 
@@ -655,6 +1022,15 @@ def run_test(temp: Path, clustered: bool) -> dict:
             "msm_observation_count:value.snapshot.profile.msm_observation_count};"
             "})()"
         )
+        result["checks"].update(
+            exercise_admin_mutations(
+                admin,
+                clustered,
+                clear_port,
+                clients,
+                source,
+            )
+        )
         with request(f"http://127.0.0.1:{health_port}/metrics") as response:
             metrics_text = response.read().decode("utf-8")
         required_metrics = [
@@ -696,6 +1072,7 @@ def run_test(temp: Path, clustered: bool) -> dict:
     except Exception as error:
         result["pass"] = False
         result["error"] = f"{type(error).__name__}: {error}"
+        result["traceback"] = traceback.format_exc()
         for name, page in (("admin", admin), ("public", public)):
             if page is not None:
                 try:
@@ -711,6 +1088,13 @@ def run_test(temp: Path, clustered: bool) -> dict:
                 page.close()
         if source is not None:
             source.close()
+        for client in clients:
+            client.close()
+        if admin_proxy is not None:
+            admin_proxy.shutdown()
+            admin_proxy.server_close()
+        if proxy_thread is not None:
+            proxy_thread.join(timeout=3)
         for process in (chrome, caster, etcd):
             if process is not None and process.poll() is None:
                 try:

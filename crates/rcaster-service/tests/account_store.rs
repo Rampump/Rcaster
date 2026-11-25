@@ -139,6 +139,77 @@ async fn standalone_blacklist_directory_reloads_limiter_state() {
     );
 }
 
+#[tokio::test]
+async fn standalone_account_directory_crud_persists_users_and_mountpoints() {
+    let path = TempDatabase::new();
+    let store = AccountStore::open(path.as_ref()).expect("open store");
+    let initial = snapshot("owner-id", "owner", "C63");
+    store.replace(&initial).expect("initial accounts");
+    let directory = AccountDirectory::with_store(initial, store).expect("account directory");
+
+    let mut user = snapshot("temporary-id", "temporary", "TMP1")
+        .users()
+        .next()
+        .expect("temporary user")
+        .clone();
+    user.mod_revision = 0;
+    assert_eq!(
+        directory
+            .upsert_user(user.clone(), None)
+            .await
+            .expect("create user"),
+        1
+    );
+
+    let mut mountpoint = snapshot("temporary-id", "temporary", "TMP1")
+        .mountpoint("TMP1")
+        .expect("temporary mountpoint")
+        .clone();
+    mountpoint.mod_revision = 0;
+    assert_eq!(
+        directory
+            .upsert_mountpoint(mountpoint.clone(), None)
+            .await
+            .expect("create mountpoint"),
+        1
+    );
+    mountpoint.enabled = false;
+    assert_eq!(
+        directory
+            .upsert_mountpoint(mountpoint, Some(1))
+            .await
+            .expect("update mountpoint"),
+        2
+    );
+
+    user.enabled = false;
+    assert_eq!(
+        directory
+            .upsert_user(user, Some(1))
+            .await
+            .expect("disable user"),
+        2
+    );
+    directory
+        .delete_mountpoint("TMP1", 2)
+        .await
+        .expect("delete mountpoint");
+    directory
+        .delete_user("temporary-id", 2)
+        .await
+        .expect("delete user");
+    drop(directory);
+
+    let snapshot = AccountStore::open(path.as_ref())
+        .expect("reopen store")
+        .load()
+        .expect("reload accounts");
+    assert!(snapshot.user_by_id("temporary-id").is_none());
+    assert!(snapshot.mountpoint("TMP1").is_none());
+    assert!(snapshot.user_by_id("owner-id").is_some());
+    assert!(snapshot.mountpoint("C63").is_some());
+}
+
 fn snapshot(user_id: &str, username: &str, mountpoint: &str) -> AccountSnapshot {
     AccountSnapshot::new(
         [User {

@@ -616,6 +616,9 @@ impl AccountDirectory {
         user: User,
         expected_revision: Option<u64>,
     ) -> Result<u64, AccountDirectoryError> {
+        if let Some(store) = &self.store {
+            return self.upsert_user_local(store, user, expected_revision).await;
+        }
         AccountSnapshot::new([user.clone()], [])?;
         let (client, cluster_id) = self.writable()?;
         let current = self.snapshot().user_by_id(&user.user_id).cloned();
@@ -662,6 +665,11 @@ impl AccountDirectory {
         user_id: &str,
         expected_revision: u64,
     ) -> Result<(), AccountDirectoryError> {
+        if let Some(store) = &self.store {
+            return self
+                .delete_user_local(store, user_id, expected_revision)
+                .await;
+        }
         let snapshot = self.snapshot();
         let user = snapshot
             .user_by_id(user_id)
@@ -697,6 +705,11 @@ impl AccountDirectory {
         mountpoint: Mountpoint,
         expected_revision: Option<u64>,
     ) -> Result<u64, AccountDirectoryError> {
+        if let Some(store) = &self.store {
+            return self
+                .upsert_mountpoint_local(store, mountpoint, expected_revision)
+                .await;
+        }
         let snapshot = self.snapshot();
         let owner = snapshot
             .user_by_id(&mountpoint.owner_user_id)
@@ -735,6 +748,11 @@ impl AccountDirectory {
         mountpoint: &str,
         expected_revision: u64,
     ) -> Result<(), AccountDirectoryError> {
+        if let Some(store) = &self.store {
+            return self
+                .delete_mountpoint_local(store, mountpoint, expected_revision)
+                .await;
+        }
         let (client, cluster_id) = self.writable()?;
         let key = mountpoint_key(cluster_id, mountpoint)?;
         let compare =
@@ -760,6 +778,141 @@ impl AccountDirectory {
             .as_ref()
             .zip(self.cluster_id.as_deref())
             .ok_or(AccountDirectoryError::InvalidCluster)
+    }
+
+    async fn upsert_user_local(
+        &self,
+        store: &Arc<Mutex<AccountStore>>,
+        mut user: User,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, AccountDirectoryError> {
+        let current_snapshot = self.snapshot();
+        let current = current_snapshot.user_by_id(&user.user_id).cloned();
+        match (expected_revision, current.as_ref()) {
+            (Some(expected), Some(current)) if current.mod_revision == expected => {}
+            (Some(_), Some(_)) => return Err(AccountDirectoryError::Conflict),
+            (Some(_), None) => return Err(AccountDirectoryError::NotFound),
+            (None, Some(_)) => return Err(AccountDirectoryError::Conflict),
+            (None, None) => {}
+        }
+        if current
+            .as_ref()
+            .is_some_and(|current| current.username != user.username)
+        {
+            return Err(AccountDirectoryError::InvalidRecord);
+        }
+        user.mod_revision = current
+            .as_ref()
+            .map(|current| current.mod_revision.saturating_add(1))
+            .unwrap_or(1);
+        let mut users = current_snapshot
+            .users()
+            .filter(|existing| existing.user_id != user.user_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        users.push(user.clone());
+        let snapshot = AccountSnapshot::new(users, current_snapshot.mountpoints().cloned())?;
+        store.lock().await.replace(&snapshot)?;
+        self.replace_snapshot(snapshot);
+        Ok(user.mod_revision)
+    }
+
+    async fn delete_user_local(
+        &self,
+        store: &Arc<Mutex<AccountStore>>,
+        user_id: &str,
+        expected_revision: u64,
+    ) -> Result<(), AccountDirectoryError> {
+        let current = self.snapshot();
+        let user = current
+            .user_by_id(user_id)
+            .ok_or(AccountDirectoryError::NotFound)?;
+        if user.mod_revision != expected_revision {
+            return Err(AccountDirectoryError::Conflict);
+        }
+        if current
+            .mountpoints()
+            .any(|mountpoint| mountpoint.owner_user_id == user_id)
+        {
+            return Err(AccountDirectoryError::InUse);
+        }
+        let snapshot = AccountSnapshot::new(
+            current
+                .users()
+                .filter(|user| user.user_id != user_id)
+                .cloned(),
+            current.mountpoints().cloned(),
+        )?;
+        store.lock().await.replace(&snapshot)?;
+        self.replace_snapshot(snapshot);
+        Ok(())
+    }
+
+    async fn upsert_mountpoint_local(
+        &self,
+        store: &Arc<Mutex<AccountStore>>,
+        mut mountpoint: Mountpoint,
+        expected_revision: Option<u64>,
+    ) -> Result<u64, AccountDirectoryError> {
+        let current = self.snapshot();
+        let existing = current.mountpoint(&mountpoint.mountpoint).cloned();
+        match (expected_revision, existing.as_ref()) {
+            (Some(expected), Some(existing)) if existing.mod_revision == expected => {}
+            (Some(_), Some(_)) => return Err(AccountDirectoryError::Conflict),
+            (Some(_), None) => return Err(AccountDirectoryError::NotFound),
+            (None, Some(_)) => return Err(AccountDirectoryError::Conflict),
+            (None, None) => {}
+        }
+        current
+            .user_by_id(&mountpoint.owner_user_id)
+            .filter(|owner| owner.enabled)
+            .ok_or(AccountDirectoryError::InvalidRecord)?;
+        mountpoint.mod_revision = existing
+            .as_ref()
+            .map(|existing| existing.mod_revision.saturating_add(1))
+            .unwrap_or(1);
+        let mut mountpoints = current
+            .mountpoints()
+            .filter(|existing| existing.mountpoint != mountpoint.mountpoint)
+            .cloned()
+            .collect::<Vec<_>>();
+        mountpoints.push(mountpoint.clone());
+        let snapshot = AccountSnapshot::new(current.users().cloned(), mountpoints)?;
+        store.lock().await.replace(&snapshot)?;
+        self.replace_snapshot(snapshot);
+        Ok(mountpoint.mod_revision)
+    }
+
+    async fn delete_mountpoint_local(
+        &self,
+        store: &Arc<Mutex<AccountStore>>,
+        mountpoint: &str,
+        expected_revision: u64,
+    ) -> Result<(), AccountDirectoryError> {
+        let current = self.snapshot();
+        let existing = current
+            .mountpoint(mountpoint)
+            .ok_or(AccountDirectoryError::NotFound)?;
+        if existing.mod_revision != expected_revision {
+            return Err(AccountDirectoryError::Conflict);
+        }
+        let snapshot = AccountSnapshot::new(
+            current.users().cloned(),
+            current
+                .mountpoints()
+                .filter(|existing| existing.mountpoint != mountpoint)
+                .cloned(),
+        )?;
+        store.lock().await.replace(&snapshot)?;
+        self.replace_snapshot(snapshot);
+        Ok(())
+    }
+
+    fn replace_snapshot(&self, snapshot: AccountSnapshot) {
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot;
     }
 }
 
