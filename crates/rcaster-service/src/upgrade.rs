@@ -286,6 +286,7 @@ struct UpgradeInner {
     policy: UpgradePolicy,
     require_approval: bool,
     lock: Option<HeldLock>,
+    cleaned_terminal_operations: std::collections::BTreeSet<String>,
 }
 
 struct HeldLock {
@@ -371,6 +372,7 @@ impl UpgradeManager {
             policy,
             require_approval,
             lock: None,
+            cleaned_terminal_operations: std::collections::BTreeSet::new(),
         }));
         let weak = Arc::downgrade(&inner);
         tokio::spawn(run_advance_loop(weak));
@@ -1015,11 +1017,20 @@ impl UpgradeInner {
             };
             if matches!(
                 operation.status,
-                OperationStatus::PendingApproval
-                    | OperationStatus::Succeeded
-                    | OperationStatus::Failed
-                    | OperationStatus::Canceled
+                OperationStatus::Succeeded | OperationStatus::Failed | OperationStatus::Canceled
             ) {
+                if !self
+                    .cleaned_terminal_operations
+                    .contains(&operation.operation_id)
+                {
+                    self.delete_commands(&operation.operation_id).await?;
+                    self.clear_lock_key(&operation.operation_id).await?;
+                    self.cleaned_terminal_operations
+                        .insert(operation.operation_id);
+                }
+                continue;
+            }
+            if operation.status == OperationStatus::PendingApproval {
                 continue;
             }
             let lease_id = self.client.lease_grant(LOCK_TTL_S, None).await?.id();

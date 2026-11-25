@@ -149,6 +149,36 @@ async fn signed_rollout_is_previewed_locked_and_advanced() {
         .await
         .expect("commands");
     assert!(commands.kvs().is_empty());
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-commands/{operation_id}/leftover"),
+        br#"{"operation_id":"leftover"}"#.to_vec(),
+        None,
+    )
+    .await
+    .expect("leftover command");
+    let recovery_policy = UpgradePolicy::new(
+        &[hex(signing_key.verifying_key().as_bytes())],
+        &["updates.example.test".to_owned()],
+    )
+    .expect("recovery policy");
+    let _recovery_manager = UpgradeManager::new(connect().await, cluster.clone(), recovery_policy);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let commands = etcd
+                .get(
+                    format!("/rcaster/{cluster}/runtime/upgrade-commands/{operation_id}/"),
+                    Some(GetOptions::new().with_prefix()),
+                )
+                .await
+                .expect("recovered commands");
+            if commands.kvs().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("terminal command recovery timeout");
     let lock = etcd
         .get(format!("/rcaster/{cluster}/locks/upgrade/global"), None)
         .await
