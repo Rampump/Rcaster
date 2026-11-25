@@ -62,12 +62,12 @@ After Connect, its log reported `NTRIP Client is Connected, Waiting for Data`
 and then `NTRIP Client is receiving data`. The received-byte display grew
 from 341 to 1,200 and then 6,360 bytes.
 
-## Not Verified
+## Outside Acceptance Scope
 
-| Client or source | Status | Reason |
+| Client or source | Status | Note |
 |---|---|---|
-| Additional receiver models | NOT VERIFIED | Only the local CH340-connected RTK base module was available |
+| Additional receiver models and other commercial clients | OUT OF SCOPE | Removed from the agreed acceptance scope on 2026-11-26 |
 
-Commercial or unavailable clients must remain marked unverified. Do not claim
-support based only on the shared NTRIP2/TLS paths exercised by RCaster, RTKLIB,
-and the local module.
+Broader hardware and client coverage is not an acceptance blocker. It remains a
+factual compatibility boundary: do not claim that an unexercised product was
+tested merely because it shares the validated NTRIP2/TLS path.

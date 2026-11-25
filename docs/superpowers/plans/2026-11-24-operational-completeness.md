@@ -141,8 +141,12 @@ the user's instruction not to touch the soak servers.
 - [ ] Complete the 72-hour soak without touching the current frozen run.
 - [ ] Execute a signed rolling upgrade and rollback across four real nodes.
 - [ ] Obtain a traceable real CMR/CMR+ capture.
-- [ ] Validate additional receiver and commercial-client models.
 - [ ] Validate production DNS/GeoDNS/LB and OCSP behavior.
 
 These items must remain marked pending or partial until their real environment
 evidence exists.
+
+Additional receiver models and other commercial clients were explicitly removed
+from the acceptance scope by the user on 2026-11-26. The completed RTKLIB,
+`strsvr`, BKG BNC, Lefebure, u-center and real CH340 evidence remains part of
+the compatibility record.

@@ -232,3 +232,8 @@ readiness 置为 false 并停止健康采样，再开始关闭 listener。
 
 本报告中的本地结果只证明对应代码路径在当前 Windows 环境可运行。生产结论
 必须补充目标 Linux 节点、真实网络、真实设备和长稳态证据。
+
+> 2026-11-26 scope update: additional receiver models and other commercial
+> clients were removed from the agreed acceptance scope. The historical
+> observations above remain accurate for the hardware and clients actually
+> exercised; broader product coverage is no longer an acceptance blocker.
