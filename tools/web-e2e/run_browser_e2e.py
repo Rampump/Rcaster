@@ -225,6 +225,27 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
         or checks["admin_hci"]["mountResetMode"] != "New mountpoint"
     ):
         raise RuntimeError(f"admin HCI contract failed: {checks['admin_hci']}")
+    checks["admin_operation_json_hci"] = measure_admin_operation_and_json_hci(page)
+    required_actions = {
+        "users.disable",
+        "users.delete",
+        "mountpoints.disable",
+        "mountpoints.change_owner",
+        "sessions.drop",
+    }
+    if (
+        not required_actions.issubset(
+            set(checks["admin_operation_json_hci"]["actions"])
+        )
+        or not checks["admin_operation_json_hci"]["hasCancel"]
+        or not checks["admin_operation_json_hci"]["hasRetry"]
+        or checks["admin_operation_json_hci"]["jsonInvalid"] != "true"
+        or "JSON" not in checks["admin_operation_json_hci"]["status"]
+    ):
+        raise RuntimeError(
+            f"admin operation/JSON HCI failed: "
+            f"{checks['admin_operation_json_hci']}"
+        )
     page.evaluate("loadSources()")
     page.wait_for("document.getElementById('sources').textContent.includes('C63')")
     checks["admin_source_filter"] = page.evaluate(
@@ -1221,6 +1242,24 @@ def measure_admin_hci(page: Cdp) -> dict:
         "statusLive:status.getAttribute('aria-live')||'',"
         "focusPreserved,statusPreserved,editMode,resetMode,"
         "mountEditMode,mountResetMode};})()"
+    )
+
+
+def measure_admin_operation_and_json_hci(page: Cdp) -> dict:
+    return page.evaluate(
+        "(async()=>{"
+        "const actions=[...document.querySelectorAll('#batch-action option')]"
+        ".map(option=>option.value);"
+        "document.getElementById('mount-name').value='JSONTEST';"
+        "document.getElementById('mount-owner').value='owner-id';"
+        "document.getElementById('mount-source-expectation').value='{bad';"
+        "await saveMount();"
+        "const jsonValid=document.getElementById('mount-source-expectation')"
+        ".getAttribute('aria-invalid');"
+        "resetMount();"
+        "return {actions,hasCancel:Boolean(document.getElementById('operation-cancel')),"
+        "hasRetry:Boolean(document.getElementById('operation-retry')),"
+        "jsonInvalid:jsonValid,status:document.getElementById('status').textContent};})()"
     )
 
 
