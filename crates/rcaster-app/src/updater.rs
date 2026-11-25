@@ -63,9 +63,10 @@ pub async fn run_supervisor(config_path: PathBuf) -> UpdaterResult<()> {
     };
     updater.start().await?;
     let mut seen = BTreeSet::new();
+    let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown => {
                 updater.stop().await;
                 return Ok(());
             }
@@ -75,6 +76,22 @@ pub async fn run_supervisor(config_path: PathBuf) -> UpdaterResult<()> {
             eprintln!("rcaster-updater: command poll failed: {error}");
         }
     }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 struct Updater {
@@ -469,6 +486,7 @@ fn inactive_slot(current: Slot) -> Slot {
 
 fn download_artifact(url: &str, path: &Path, expected_size: u64) -> UpdaterResult<()> {
     let agent = ureq::AgentBuilder::new()
+        .redirects(0)
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(60))
         .build();
@@ -595,6 +613,31 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("artifact"), b"test");
         let _ = std::fs::remove_file(path);
         server.join().expect("artifact server");
+    }
+
+    #[test]
+    fn rejects_artifact_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+        let address = listener.local_addr().expect("redirect address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("redirect request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://evil.example/rcaster\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("redirect response");
+        });
+        let path = std::env::temp_dir().join(format!(
+            "rcaster-updater-redirect-{}.bin",
+            std::process::id()
+        ));
+        let result = download_artifact(&format!("http://{address}/artifact"), &path, 4);
+        assert!(result.is_err(), "artifact redirects must not be followed");
+        assert!(!path.exists());
+        let _ = std::fs::remove_file(path);
+        server.join().expect("redirect server");
     }
 
     #[tokio::test]
