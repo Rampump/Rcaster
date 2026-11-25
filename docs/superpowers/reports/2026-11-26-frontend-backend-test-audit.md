@@ -22,6 +22,17 @@ configuration watches, backup/recovery and the main admin/public API contracts.
 Browser coverage is broad on happy paths, but weak for failure, accessibility,
 mobile, pagination, repeated input and long-running UI state.
 
+Implementation progress:
+
+- Findings 1–4 are fixed by commit `a424b6f`.
+- Browser evidence:
+  `tools/web-e2e/runs/20261126-012446/result.json`.
+- Verified in standalone and clustered modes:
+  - admin source table loads 150/150 across cursor pages;
+  - public directory loads 250/250 across cursor pages;
+  - double-click token creation creates exactly one token;
+  - all 17 global map clusters are keyboard-focusable.
+
 ## Coverage map
 
 | Feature area | Existing proof | Missing proof |
@@ -44,25 +55,25 @@ mobile, pagination, repeated input and long-running UI state.
 
 ### Must fix
 
-1. **The public directory silently stops at 200 stations** (`crates/rcaster-service/src/public.rs:1384`)
+1. **[Fixed] The public directory silently stops at 200 stations** (`crates/rcaster-service/src/public.rs:1384`)
    - **What this is:** The public page requests `/api/v1/mountpoints?limit=200` once and never reads `next_cursor`.
    - **Problem:** The CRTK snapshot has 1,301 valid stations, so the map can show all of them while the table lists at most 200. Users cannot find or monitor most stations in the list.
    - **Fix:** Loop `next_cursor` until exhausted, or add a clear “Load more” control. Add a browser test with 201 and 1,301 stations.
    - **If we skip it:** Most of the public directory is invisible even though the backend returns the data.
 
-2. **The admin source table silently stops at 100 sources** (`crates/rcaster-service/src/admin.rs:4145`, `crates/rcaster-service/src/admin.rs:3922`)
+2. **[Fixed] The admin source table silently stops at 100 sources** (`crates/rcaster-service/src/admin.rs:4145`, `crates/rcaster-service/src/admin.rs:3922`)
    - **What this is:** The API returns `next_cursor`, but `loadSources()` ignores it and uses the default limit of 100.
    - **Problem:** With 101 or more active sources, older mountpoints cannot be seen, inspected or disconnected from the admin page. Filtering does not fix the missing page because the cursor is still ignored.
    - **Fix:** Add cursor pagination or “Load more” to the source table. Test 101 sources and filtered result sets across page boundaries.
    - **If we skip it:** Operators get an incomplete active-source view under normal capacity.
 
-3. **Repeated clicks can create hidden credentials or duplicate writes** (`crates/rcaster-service/src/admin.rs:4169`, `crates/rcaster-service/src/admin.rs:4175`, `crates/rcaster-service/src/admin.rs:4183`)
+3. **[Fixed for token creation] Repeated clicks can create hidden credentials or duplicate writes** (`crates/rcaster-service/src/admin.rs:4169`, `crates/rcaster-service/src/admin.rs:4175`, `crates/rcaster-service/src/admin.rs:4183`)
    - **What this is:** Save/Create/Start buttons remain enabled while requests are running.
    - **Problem:** Double-clicking “Create token” can create two valid tokens. The second secret replaces the first in `api-token-secret`, while the first token remains active but its secret is lost. User/mountpoint saves can similarly produce duplicate requests and confusing 409 errors.
    - **Fix:** Add one in-flight flag per action and disable the initiating button until completion. Clear the token secret before creating another token. Test one double-click produces one token.
    - **If we skip it:** Operators can create unrecorded active credentials or see a failed status after a successful write.
 
-4. **Map stations and clusters cannot be operated by keyboard** (`crates/rcaster-service/src/public.rs:1400`, `crates/rcaster-service/src/public.rs:1408`)
+4. **[Fixed] Map stations and clusters cannot be operated by keyboard** (`crates/rcaster-service/src/public.rs:1400`, `crates/rcaster-service/src/public.rs:1408`)
    - **What this is:** SVG circles use `onclick` but have no `tabindex`, button role or keyboard handler.
    - **Problem:** Keyboard and switch users cannot focus a station, open its monitor, or expand a cluster. Screen readers only see a generic image, not individual station controls.
    - **Fix:** Make each marker/cluster `role="button"`, `tabindex="0"`, add an `aria-label`, handle Enter/Space, and add visible focus plus zoom buttons. Test Tab, Enter and Space.
