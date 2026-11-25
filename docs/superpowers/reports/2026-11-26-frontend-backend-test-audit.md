@@ -49,7 +49,8 @@ Implementation progress:
   upgrade mutation controls remain.
 - Browser evidence:
   `tools/web-e2e/runs/20261126-015339/result.json`.
-- Findings 3, 10-13, 15 and 17 are now closed for the local browser scope:
+- Findings 3, 10-13, 15, 17 and 18 are now closed for the local browser
+  scope:
   - configuration changes require a field-level diff preview before Apply;
   - destructive actions use an accessible impact dialog with pending disable;
   - paired coordinates, owner, password, radius and JSON errors are identified
@@ -59,8 +60,11 @@ Implementation progress:
     tied to the active socket;
   - the browser gate runs Chromium plus Firefox 153.7 ESR in standalone and
     clustered modes.
+- Admin and public JavaScript now live in `admin_app.js` and `public_app.js`,
+  are served as same-origin `text/javascript` resources, and are covered by
+  direct asset endpoint tests instead of being embedded in Rust/HTML strings.
 - Final local evidence:
-  `tools/web-e2e/runs/20261126-023629/result.json`.
+  `tools/web-e2e/runs/20261126-024303/result.json`.
 - Firefox found and verified a startup auth race where an old anonymous 401
   could clear a newly authenticated admin session. `api()` now binds 401
   handling to the auth generation captured when the request started.
@@ -198,11 +202,14 @@ Implementation progress:
     - **Fix:** Split into small scenario tests and add a second browser engine plus mobile viewport, accessibility tree checks and network-failure cases.
     - **If we skip it:** The current “pass” says the happy path works, not that human interaction is safe.
 
-18. **Embedded inline JavaScript is hard to test in isolation** (`crates/rcaster-service/src/admin.rs:4107`, `crates/rcaster-service/src/public.rs:1375`)
+18. **[Fixed] Embedded inline JavaScript is hard to test in isolation** (`crates/rcaster-service/src/admin.rs:4107`, `crates/rcaster-service/src/public.rs:1375`)
     - **What it is:** Admin and public UI code lives in large Rust string literals.
     - **Problem:** Helpers such as state, validation, pagination and reconnect logic cannot be unit tested without booting a full Caster and browser.
     - **Fix:** Move static JavaScript into served asset files with small test exports; keep the same HTML and endpoints.
-    - **If we skip it:** Every interaction test remains slow and failure diagnosis is poor.
+   - **Current state:** JavaScript is stored in `admin_app.js` and
+     `public_app.js`, loaded with `defer` from `/admin/app.js` and `/app.js`.
+     Asset endpoints return `text/javascript`, `no-store`, and `nosniff`;
+     API tests verify script contents and browser runs verify execution.
 
 ## Recommended test order
 

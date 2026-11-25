@@ -93,55 +93,67 @@ async fn admin_routes_require_mtls_and_service_token() {
     assert!(page.contains("Content-Security-Policy"));
     assert!(page.contains("<h3>Users</h3>"));
     assert!(page.contains("<h3>Sessions</h3>"));
-    assert!(page.contains("addBlacklist()"));
-    assert!(page.contains("deleteBlacklist"));
-    assert!(page.contains("If-Match"));
-    assert!(page.contains("showSourceHealth"));
-    assert!(page.contains("saveUser"));
     assert!(page.contains("id=\"user-ntrip-enabled\""));
     assert!(page.contains("id=\"user-web-enabled\""));
-    assert!(page.contains("saveMount"));
     assert!(page.contains("id=\"mount-latitude\""));
     assert!(page.contains("id=\"mount-source-expectation\""));
-    assert!(page.contains("createApiToken"));
     assert!(page.contains("id=\"api-tokens-section\""));
-    assert!(page.contains("session.kind==='service'"));
-    assert!(page.contains("serviceReadOnly"));
     assert!(page.contains("class=\"write-control\""));
     assert!(page.contains("Read-only service session"));
-    assert!(page.contains("disconnectSource"));
-    assert!(page.contains("disconnectSession"));
-    assert!(page.contains("monitorSource"));
-    assert!(page.contains("clearCooldown"));
     assert!(page.contains("Source cooldowns"));
     assert!(page.contains("Source events"));
-    assert!(page.contains("loadSources"));
-    assert!(page.contains("showSourceHistory"));
-    assert!(page.contains("drawHistory"));
-    assert!(page.contains("saveConfig"));
     assert!(page.contains("id=\"config-json\""));
-    assert!(page.contains("loadOperationalViews"));
     assert!(page.contains("NEAR clients"));
-    assert!(page.contains("Config history unavailable"));
-    assert!(page.contains("loadOperation"));
-    assert!(page.contains("previewBatchDisable"));
-    assert!(page.contains("startBatchDisable"));
-    assert!(page.contains("AbortController"));
-    assert!(page.contains("loggingOut"));
-    assert!(page.contains("Data stale."));
     assert!(page.contains("data-freshness"));
     assert!(page.contains("confirm-dialog"));
-    assert!(page.contains("validateUserForm"));
-    assert!(page.contains("validateMountForm"));
-    assert!(page.contains("previewConfig"));
     assert!(page.contains("config-diff"));
-    assert!(page.contains("previewUpgrade"));
     assert!(page.contains("upgrade-rollback"));
     assert!(page.contains("class=\"write-control\""));
-    assert!(page.contains("loadUpgrade"));
     assert!(page.contains("Audit"));
-    assert!(page.contains("admin/v1/auth/login"));
-    assert!(page.contains("setInterval"));
+    assert!(page.contains("<script src=\"/admin/app.js\" defer>"));
+    assert!(!page.contains("<script>"));
+
+    let script = request_raw(address, &pki, "GET", "/admin/app.js", "", "", "").await;
+    assert!(script.starts_with("HTTP/1.1 200 OK"));
+    assert!(script.contains("Content-Type: text/javascript; charset=utf-8"));
+    assert!(script.contains("Cache-Control: no-store"));
+    assert!(script.contains("X-Content-Type-Options: nosniff"));
+    for expected in [
+        "addBlacklist()",
+        "deleteBlacklist",
+        "If-Match",
+        "showSourceHealth",
+        "saveUser",
+        "saveMount",
+        "createApiToken",
+        "session.kind==='service'",
+        "serviceReadOnly",
+        "disconnectSource",
+        "disconnectSession",
+        "monitorSource",
+        "clearCooldown",
+        "loadSources",
+        "showSourceHistory",
+        "drawHistory",
+        "saveConfig",
+        "loadOperationalViews",
+        "Config history unavailable",
+        "loadOperation",
+        "previewBatchDisable",
+        "startBatchDisable",
+        "AbortController",
+        "loggingOut",
+        "Data stale.",
+        "validateUserForm",
+        "validateMountForm",
+        "previewConfig",
+        "previewUpgrade",
+        "loadUpgrade",
+        "admin/v1/auth/login",
+        "setInterval",
+    ] {
+        assert!(script.contains(expected), "admin script missing {expected}");
+    }
 
     let unauthorized = request(address, &pki, "/admin/v1/cluster/status", "Bearer wrong").await;
     assert!(unauthorized.starts_with("HTTP/1.1 401"));

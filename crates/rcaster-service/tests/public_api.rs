@@ -161,36 +161,51 @@ async fn public_directory_exposes_only_advertised_anonymous_fields() {
 
     let page = request(address, "/").await;
     assert!(page.contains("RCaster public stations"));
-    assert!(page.contains("/api/v1/public/str"));
     assert!(page.contains("Content-Security-Policy"));
     assert!(page.contains("<svg id=\"map\""));
-    assert!(page.contains("function renderMap"));
-    assert!(page.contains("function drawChart"));
-    assert!(page.contains("function renderSatellites"));
-    assert!(page.contains("satellite_ids"));
     assert!(page.contains("<svg id=\"skyplot\""));
-    assert!(page.contains("elevation_deg"));
-    assert!(page.contains("satellite_cn0_db_hz"));
-    assert!(page.contains("initializeMapControls"));
-    assert!(page.contains("function drawMap"));
-    assert!(page.contains("function mapBbox"));
-    assert!(page.contains("function wgs84ToGcj02"));
-    assert!(page.contains("coordinate_system"));
-    assert!(page.contains("dataset.mountpoint"));
-    assert!(page.contains("dataset.displayLongitude"));
-    assert!(page.contains("async function refreshMap"));
-    assert!(page.contains("/api/v1/public/map/stations?bbox="));
-    assert!(page.contains("/api/v1/mountpoints?"));
-    assert!(page.contains("next_cursor"));
-    assert!(page.contains("function drawMapClusters"));
     assert!(page.contains("tile-layer"));
-    assert!(page.contains("https://tiles.example.test"));
-    assert!(page.contains("/api/v1/public/map/stations"));
     assert!(page.contains("data-freshness"));
-    assert!(page.contains("Data stale."));
-    assert!(page.contains("refreshPublicSession"));
-    assert!(page.contains("if(socket!==next)return"));
-    assert!(page.contains("status.textContent='Live: '+mountpoint"));
+    assert!(page.contains("https://tiles.example.test"));
+    assert!(page.contains("<script src=\"/app.js\" defer>"));
+    assert!(!page.contains("<script>"));
+
+    let script = request(address, "/app.js").await;
+    assert!(script.starts_with("HTTP/1.1 200 OK"));
+    assert!(script.contains("Content-Type: text/javascript; charset=utf-8"));
+    assert!(script.contains("Cache-Control: no-store"));
+    assert!(script.contains("X-Content-Type-Options: nosniff"));
+    for expected in [
+        "/api/v1/public/str",
+        "function renderMap",
+        "function drawChart",
+        "function renderSatellites",
+        "satellite_ids",
+        "elevation_deg",
+        "satellite_cn0_db_hz",
+        "initializeMapControls",
+        "function drawMap",
+        "function mapBbox",
+        "function wgs84ToGcj02",
+        "coordinate_system",
+        "dataset.mountpoint",
+        "dataset.displayLongitude",
+        "async function refreshMap",
+        "/api/v1/public/map/stations?bbox=",
+        "/api/v1/mountpoints?",
+        "next_cursor",
+        "function drawMapClusters",
+        "/api/v1/public/map/stations",
+        "Data stale.",
+        "refreshPublicSession",
+        "if(socket!==next)return",
+        "status.textContent='Live: '+mountpoint",
+    ] {
+        assert!(
+            script.contains(expected),
+            "public script missing {expected}"
+        );
+    }
 
     let str = request(address, "/api/v1/public/str").await;
     assert!(str.contains("\"mountpoint\":\"C63\""));
