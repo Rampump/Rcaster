@@ -437,6 +437,49 @@ def exercise_admin_mutations(
     )
     checks["user_delete"] = True
 
+    page.evaluate(
+        "(() => {"
+        "blacklistRevision=null;"
+        "document.getElementById('bl-id').value='e2e-rule';"
+        "document.getElementById('bl-cidr').value='198.51.100.0/24';"
+        "document.getElementById('bl-quota').value='0';"
+        "document.getElementById('bl-description').value='browser e2e';"
+        "return addBlacklist();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('blacklist').textContent.includes('e2e-rule')"
+    )
+    checks["blacklist_create"] = True
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#blacklist tr')]"
+        ".find(row=>row.textContent.includes('e2e-rule'));"
+        "row.querySelectorAll('button')[0].click();"
+        "document.getElementById('bl-quota').value='1';"
+        "return addBlacklist();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('blacklist').textContent"
+        ".includes('e2e-rule198.51.100.0/241true')"
+    )
+    checks["blacklist_update"] = True
+
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#blacklist tr')]"
+        ".find(row=>row.textContent.includes('e2e-rule'));"
+        "row.querySelectorAll('button')[1].click();"
+        "return true;"
+        "})()"
+    )
+    page.wait_for(
+        "!document.getElementById('blacklist').textContent.includes('e2e-rule')"
+    )
+    checks["blacklist_delete"] = True
+
     owner_client = connect_local_client(clear_port, "owner", "secret")
     clients.append(owner_client)
     page.evaluate("load()")
