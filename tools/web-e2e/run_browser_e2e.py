@@ -321,6 +321,7 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
     checks["maintenance_disable"] = page.evaluate(
         "document.getElementById('maintenance').textContent"
     )
+    checks["admin_mobile_layout"] = measure_mobile_layout(page, "admin")
     return checks
 
 
@@ -1104,6 +1105,33 @@ def capture_amap_china_view(page: Cdp) -> dict:
     )
 
 
+def measure_mobile_layout(page: Cdp, label: str) -> dict:
+    page.send(
+        "Emulation.setDeviceMetricsOverride",
+        {
+            "width": 390,
+            "height": 844,
+            "deviceScaleFactor": 1,
+            "mobile": False,
+        },
+    )
+    time.sleep(0.2)
+    result = page.evaluate(
+        "({innerWidth:window.innerWidth,"
+        "scrollWidth:document.documentElement.scrollWidth,"
+        "bodyWidth:document.body.scrollWidth,"
+        "mapWidth:document.getElementById('map-shell')?.clientWidth||0})"
+    )
+    screenshot = page.send("Page.captureScreenshot", {"format": "png"})
+    path = OUTPUT / f"mobile-{label}.png"
+    path.write_bytes(base64.b64decode(screenshot["data"]))
+    page.send("Emulation.clearDeviceMetricsOverride")
+    if result["scrollWidth"] > result["innerWidth"] + 1:
+        raise RuntimeError(f"mobile horizontal overflow in {label}: {result}")
+    result["screenshot"] = str(path.relative_to(ROOT))
+    return result
+
+
 def measure_public_directory_pagination(page: Cdp) -> dict:
     return page.evaluate(
         "(async()=>{"
@@ -1844,6 +1872,9 @@ def run_test(temp: Path, clustered: bool) -> dict:
             result["checks"]["public_map_amap_china"] = capture_amap_china_view(
                 public
             )
+        result["checks"]["public_mobile_layout"] = measure_mobile_layout(
+            public, "public"
+        )
         result["checks"]["public_directory_pagination"] = (
             measure_public_directory_pagination(public)
         )

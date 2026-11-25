@@ -4125,6 +4125,7 @@ const ADMIN_HTML: &str = r#"<!doctype html>
 <section><h3>Upgrade lookup</h3><p><input id="upgrade-id" aria-label="Upgrade ID" placeholder="upgrade id"><button onclick="loadUpgrade()">Load upgrade</button></p><pre id="upgrade">-</pre></section>
 <section><h3>Audit</h3><table><thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Target</th><th>Result</th></tr></thead><tbody id="audit"></tbody></table></section>
 </main><script>
+document.head.append(Object.assign(document.createElement('style'),{textContent:'@media(max-width:700px){main{margin:12px auto;padding:0 10px}section{overflow-x:auto;padding:12px}input,select,textarea{width:100%;max-width:100%;box-sizing:border-box}button{margin:6px 6px 6px 0}table{min-width:720px}}'}));
 const status=document.getElementById('status');
 let blacklistRevision=null;
 let userRevision=null,mountRevision=null;
