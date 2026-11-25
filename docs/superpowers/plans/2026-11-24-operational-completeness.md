@@ -108,6 +108,8 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
   disconnect against real NTRIP sockets.
 - [x] Apply a clustered configuration change through the browser and verify
   automatic generation advancement.
+- [x] Toggle maintenance mode through the browser in standalone and clustered
+  deployments.
 - [x] Exercise public directory, map, login, ticket and monitor WebSocket.
 - [x] Capture console errors and failed network requests.
 - [x] Keep the test independent of the soak deployment.
@@ -115,7 +117,7 @@ wsl.exe --cd /mnt/e/GitHub/Rcaster -d Debian --user rtk -- bash -lc "cargo test 
 Evidence:
 
 - `tools/web-e2e/run_browser_e2e.py`
-- `tools/web-e2e/runs/20261125-230653/result.json`
+- `tools/web-e2e/runs/20261125-231725/result.json`
 - Standalone: real admin login/source/health/history/config and public
   login/ticket/WebSocket flows pass with no unexpected browser or network
   errors.
