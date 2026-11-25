@@ -346,9 +346,235 @@ async fn standalone_admin_login_lists_local_sources() {
     .await;
     assert!(sources.starts_with("HTTP/1.1 200 OK"), "{sources}");
     assert!(sources.contains("\"mountpoint\":\"C63\""), "{sources}");
+    let csrf = response_body(&login)["csrf_token"]
+        .as_str()
+        .expect("CSRF token")
+        .to_owned();
+    assert!(
+        request_raw(
+            address,
+            &pki,
+            "POST",
+            "/admin/v1/auth/logout",
+            "",
+            &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+            "",
+        )
+        .await
+        .starts_with("HTTP/1.1 204 No Content")
+    );
+    assert!(
+        request_raw(
+            address,
+            &pki,
+            "GET",
+            "/admin/v1/auth/session",
+            "",
+            &format!("Cookie: {cookie}\r\n"),
+            "",
+        )
+        .await
+        .starts_with("HTTP/1.1 401 Unauthorized")
+    );
 
     shutdown_tx.send(()).expect("shutdown");
     server.await.expect("admin task").expect("admin server");
+}
+
+#[tokio::test]
+async fn standalone_admin_api_token_authenticates_lists_and_revokes() {
+    let pki = TestPki::generate();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("admin listener");
+    let address = listener.local_addr().expect("admin address");
+    let hub = Arc::new(MountpointHub::new(8).expect("hub"));
+    let source = hub.claim_source("C63").expect("source");
+    source
+        .set_str_record(StrRecord::from_profile("C63", &DataProfile::default()))
+        .expect("activate source");
+    let user = User {
+        schema_version: 1,
+        mod_revision: 1,
+        user_id: "standalone-token-admin".to_owned(),
+        username: "standalone-token-admin".to_owned(),
+        password_hash: rcaster_service::account_auth::hash_password("standalone-secret")
+            .expect("password hash"),
+        auth_version: 1,
+        enabled: true,
+        ntrip_enabled: false,
+        web_enabled: true,
+        role: UserRole::Admin,
+        created_at: "2026-11-25T00:00:00Z".to_owned(),
+        updated_at: "2026-11-25T00:00:00Z".to_owned(),
+    };
+    let snapshot = AccountSnapshot::new([user], std::iter::empty::<Mountpoint>())
+        .expect("standalone account snapshot");
+    let account_path = std::env::temp_dir().join(format!("{}.redb", unique("admin-api-token")));
+    let store = rcaster_service::account_store::AccountStore::open(&account_path)
+        .expect("open account store");
+    store.replace(&snapshot).expect("seed account store");
+    let accounts =
+        rcaster_service::account_directory::AccountDirectory::with_store(snapshot, store)
+            .expect("standalone account directory");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_admin_mtls(
+        listener,
+        pki.server_tls(),
+        AdminState {
+            cluster_id: "standalone".to_owned(),
+            caster_id: "standalone".to_owned(),
+            token: "service-secret".to_owned(),
+            ready: Arc::new(HealthState::default()),
+            hub,
+            runtime: None,
+            relays: None,
+            near_mountpoint: None,
+            accounts,
+            relay_tls: None,
+            upgrades: None,
+            proxy_protocol: None,
+            maintenance_state: None,
+            listener_tls: None,
+            config_revision_retention: 200,
+            login_limiter: Default::default(),
+            audit: Default::default(),
+            websockets: Default::default(),
+            connections: Arc::new(ConnectionController::default()),
+            auth_limiter: Default::default(),
+        },
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let login = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/auth/login",
+        "",
+        "",
+        r#"{"username":"standalone-token-admin","password":"standalone-secret"}"#,
+    )
+    .await;
+    assert!(login.starts_with("HTTP/1.1 200 OK"), "{login}");
+    let cookie = response_header(&login, "set-cookie")
+        .and_then(|value| value.split(';').next())
+        .expect("admin cookie")
+        .to_owned();
+    let csrf = response_body(&login)["csrf_token"]
+        .as_str()
+        .expect("CSRF token")
+        .to_owned();
+    let created = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/api-tokens",
+        "",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+        r#"{"name":"standalone-automation","scopes":["admin:read"],"expires_in_s":60}"#,
+    )
+    .await;
+    assert!(created.starts_with("HTTP/1.1 201 Created"), "{created}");
+    let created = response_body(&created);
+    let token = created["token"].as_str().expect("API token").to_owned();
+    let token_id = created["token_id"]
+        .as_str()
+        .expect("API token ID")
+        .to_owned();
+
+    let listed = request_raw(
+        address,
+        &pki,
+        "GET",
+        "/admin/v1/api-tokens",
+        "",
+        &format!("Cookie: {cookie}\r\n"),
+        "",
+    )
+    .await;
+    assert!(listed.starts_with("HTTP/1.1 200 OK"), "{listed}");
+    assert!(listed.contains(&token_id), "{listed}");
+    assert!(listed.contains("standalone-automation"), "{listed}");
+    let authenticated = request(
+        address,
+        &pki,
+        "/admin/v1/sources",
+        &format!("Bearer {token}"),
+    )
+    .await;
+    assert!(
+        authenticated.starts_with("HTTP/1.1 200 OK"),
+        "{authenticated}"
+    );
+    assert!(authenticated.contains("\"mountpoint\":\"C63\""));
+
+    let revoked = request_raw(
+        address,
+        &pki,
+        "DELETE",
+        &format!("/admin/v1/api-tokens/{token_id}"),
+        "",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+        "",
+    )
+    .await;
+    assert!(revoked.starts_with("HTTP/1.1 204 No Content"), "{revoked}");
+    assert!(
+        request(
+            address,
+            &pki,
+            "/admin/v1/sources",
+            &format!("Bearer {token}")
+        )
+        .await
+        .starts_with("HTTP/1.1 401 Unauthorized")
+    );
+    let versioned = request_raw(
+        address,
+        &pki,
+        "POST",
+        "/admin/v1/api-tokens",
+        "",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\n"),
+        r#"{"name":"versioned","scopes":["admin:read"]}"#,
+    )
+    .await;
+    assert!(versioned.starts_with("HTTP/1.1 201 Created"), "{versioned}");
+    let versioned_token = response_body(&versioned)["token"]
+        .as_str()
+        .expect("versioned API token")
+        .to_owned();
+    let password_changed = request_raw(
+        address,
+        &pki,
+        "PATCH",
+        "/admin/v1/users/standalone-token-admin",
+        "",
+        &format!("Cookie: {cookie}\r\nX-CSRF-Token: {csrf}\r\nIf-Match: \"1\"\r\n"),
+        r#"{"password":"replacement-secret"}"#,
+    )
+    .await;
+    assert!(
+        password_changed.starts_with("HTTP/1.1 200 OK"),
+        "{password_changed}"
+    );
+    assert!(
+        request(
+            address,
+            &pki,
+            "/admin/v1/sources",
+            &format!("Bearer {versioned_token}")
+        )
+        .await
+        .starts_with("HTTP/1.1 401 Unauthorized")
+    );
+
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("admin task").expect("admin server");
+    let _ = fs::remove_file(account_path);
 }
 
 async fn request(

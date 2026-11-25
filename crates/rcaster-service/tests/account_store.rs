@@ -8,6 +8,7 @@ use rcaster_core::account::{AccountSnapshot, Mountpoint, User, UserRole};
 use rcaster_service::{
     account_directory::AccountDirectory,
     account_store::AccountStore,
+    admin_auth::ApiToken,
     blacklist::{BlacklistError, BlacklistRule},
 };
 
@@ -114,6 +115,54 @@ fn standalone_blacklist_round_trips_across_reopen() {
         .delete_blacklist_rule("blocked", 1)
         .expect("delete blacklist rule");
     assert!(store.blacklist_rules().expect("reload rules").is_empty());
+}
+
+#[test]
+fn standalone_api_tokens_round_trip_across_reopen() {
+    let path = TempDatabase::new();
+    let token = ApiToken {
+        schema_version: 1,
+        token_id: "a".repeat(64),
+        name: "automation".to_owned(),
+        token_hash: "sha256:hash".to_owned(),
+        user_id: "owner-id".to_owned(),
+        username: "owner".to_owned(),
+        auth_version: 1,
+        scopes: vec!["admin:read".to_owned()],
+        created_at: 1_800_000_000,
+        expires_at: Some(1_800_000_060),
+    };
+    {
+        let store = AccountStore::open(path.as_ref()).expect("open store");
+        store.put_api_token(&token).expect("persist API token");
+        store
+            .put_api_token_last_used(&token.token_id, 1_800_000_001)
+            .expect("persist last-used timestamp");
+    }
+
+    let store = AccountStore::open(path.as_ref()).expect("reopen store");
+    let tokens = store.api_tokens().expect("load API tokens");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].token_id, token.token_id);
+    assert_eq!(
+        store
+            .api_token_last_used(&token.token_id)
+            .expect("load last-used timestamp"),
+        Some(1_800_000_001)
+    );
+
+    assert!(
+        store
+            .delete_api_token(&token.token_id)
+            .expect("delete API token")
+    );
+    assert!(store.api_tokens().expect("reload API tokens").is_empty());
+    assert_eq!(
+        store
+            .api_token_last_used(&token.token_id)
+            .expect("reload last-used timestamp"),
+        None
+    );
 }
 
 #[tokio::test]

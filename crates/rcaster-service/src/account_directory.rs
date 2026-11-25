@@ -17,6 +17,7 @@ use tokio::{
 use crate::{
     ETCD_WATCH_IDLE_TIMEOUT,
     account_store::{AccountStore, StoreError},
+    admin_auth::ApiToken,
     blacklist::{BlacklistError, BlacklistRule},
     etcd_watch_metrics::{EtcdWatchMetrics, WatchLane},
 };
@@ -323,6 +324,79 @@ impl AccountDirectory {
         let store = store.lock().await;
         store.delete_blacklist_rule(id, expected_revision)?;
         replace_blacklist(&self.blacklist, store.blacklist_rules()?);
+        Ok(())
+    }
+
+    pub(crate) async fn local_api_tokens(
+        &self,
+    ) -> Result<Vec<(ApiToken, Option<u64>)>, AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Ok(Vec::new());
+        };
+        let store = store.lock().await;
+        store
+            .api_tokens()?
+            .into_iter()
+            .map(|token| {
+                let last_used = store.api_token_last_used(&token.token_id)?;
+                Ok((token, last_used))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn local_api_token(
+        &self,
+        token_id: &str,
+    ) -> Result<Option<ApiToken>, AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        Ok(store.lock().await.api_token(token_id)?)
+    }
+
+    pub(crate) async fn local_api_token_put(
+        &self,
+        token: &ApiToken,
+    ) -> Result<(), AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Err(AccountDirectoryError::InvalidCluster);
+        };
+        store.lock().await.put_api_token(token)?;
+        Ok(())
+    }
+
+    pub(crate) async fn local_api_token_delete(
+        &self,
+        token_id: &str,
+    ) -> Result<bool, AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Ok(false);
+        };
+        Ok(store.lock().await.delete_api_token(token_id)?)
+    }
+
+    pub(crate) async fn local_api_token_last_used(
+        &self,
+        token_id: &str,
+    ) -> Result<Option<u64>, AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        Ok(store.lock().await.api_token_last_used(token_id)?)
+    }
+
+    pub(crate) async fn local_api_token_last_used_put(
+        &self,
+        token_id: &str,
+        timestamp: u64,
+    ) -> Result<(), AccountDirectoryError> {
+        let Some(store) = &self.store else {
+            return Err(AccountDirectoryError::InvalidCluster);
+        };
+        store
+            .lock()
+            .await
+            .put_api_token_last_used(token_id, timestamp)?;
         Ok(())
     }
 

@@ -364,17 +364,21 @@ pub async fn create_api_token(
         created_at: unix_time(),
         expires_at,
     };
-    let lease_id = match expires_in_s {
-        Some(seconds) => Some(directory.etcd_lease(seconds as i64).await?),
-        None => None,
-    };
-    directory
-        .etcd_put(
-            &api_token_key(directory, &token_id)?,
-            serde_json::to_vec(&token).map_err(|_| AdminAuthError::Unavailable)?,
-            lease_id,
-        )
-        .await?;
+    if directory.is_clustered() {
+        let lease_id = match expires_in_s {
+            Some(seconds) => Some(directory.etcd_lease(seconds as i64).await?),
+            None => None,
+        };
+        directory
+            .etcd_put(
+                &api_token_key(directory, &token_id)?,
+                serde_json::to_vec(&token).map_err(|_| AdminAuthError::Unavailable)?,
+                lease_id,
+            )
+            .await?;
+    } else {
+        directory.local_api_token_put(&token).await?;
+    }
     Ok((
         format!("{TOKEN_PREFIX}{token_id}.{secret}"),
         ApiTokenView {
@@ -394,7 +398,28 @@ pub async fn list_api_tokens(
     directory: &AccountDirectory,
 ) -> Result<Vec<ApiTokenView>, AdminAuthError> {
     if !directory.is_clustered() {
-        return Ok(Vec::new());
+        let mut tokens = directory
+            .local_api_tokens()
+            .await?
+            .into_iter()
+            .filter(|(token, _)| {
+                token
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > unix_time())
+            })
+            .map(|(token, last_used_at)| ApiTokenView {
+                token_id: token.token_id,
+                name: token.name,
+                user_id: token.user_id,
+                username: token.username,
+                scopes: token.scopes,
+                created_at: token.created_at,
+                expires_at: token.expires_at,
+                last_used_at,
+            })
+            .collect::<Vec<_>>();
+        tokens.sort_by(|left, right| left.token_id.cmp(&right.token_id));
+        return Ok(tokens);
     }
     let prefix = api_token_prefix(directory)?;
     let last_used_prefix = api_token_last_used_prefix(directory)?;
@@ -434,6 +459,13 @@ pub async fn delete_api_token(
 ) -> Result<(), AdminAuthError> {
     if token_id.is_empty() || !valid_hex_id(token_id) {
         return Err(AdminAuthError::NotFound);
+    }
+    if !directory.is_clustered() {
+        return if directory.local_api_token_delete(token_id).await? {
+            Ok(())
+        } else {
+            Err(AdminAuthError::NotFound)
+        };
     }
     let key = api_token_key(directory, token_id)?;
     if directory.etcd_get(&key).await?.is_none() {
@@ -518,12 +550,19 @@ async fn authenticate_api_token(
     token: &str,
 ) -> Result<AdminIdentity, AdminAuthError> {
     let (token_id, secret) = split_token(token).ok_or(AdminAuthError::Invalid)?;
-    let stored = directory
-        .etcd_get(&api_token_key(directory, token_id)?)
-        .await?
-        .ok_or(AdminAuthError::Invalid)?
-        .0;
-    let token: ApiToken = serde_json::from_slice(&stored).map_err(|_| AdminAuthError::Invalid)?;
+    let token = if directory.is_clustered() {
+        let stored = directory
+            .etcd_get(&api_token_key(directory, token_id)?)
+            .await?
+            .ok_or(AdminAuthError::Invalid)?
+            .0;
+        serde_json::from_slice(&stored).map_err(|_| AdminAuthError::Invalid)?
+    } else {
+        directory
+            .local_api_token(token_id)
+            .await?
+            .ok_or(AdminAuthError::Invalid)?
+    };
     if token
         .expires_at
         .is_some_and(|expires_at| expires_at <= unix_time())
@@ -601,8 +640,21 @@ async fn touch_api_token_last_used(
     directory: &AccountDirectory,
     token_id: &str,
 ) -> Result<(), AdminAuthError> {
-    let key = api_token_last_used_key(directory, token_id)?;
     let now = unix_time();
+    if !directory.is_clustered() {
+        if directory
+            .local_api_token_last_used(token_id)
+            .await?
+            .is_some_and(|last_used| now.saturating_sub(last_used) < TOKEN_LAST_USED_UPDATE_S)
+        {
+            return Ok(());
+        }
+        directory
+            .local_api_token_last_used_put(token_id, now)
+            .await?;
+        return Ok(());
+    }
+    let key = api_token_last_used_key(directory, token_id)?;
     if let Some((value, _)) = directory.etcd_get(&key).await?
         && std::str::from_utf8(&value)
             .ok()

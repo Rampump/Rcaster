@@ -480,6 +480,40 @@ def exercise_admin_mutations(
     )
     checks["blacklist_delete"] = True
 
+    page.evaluate(
+        "(() => {"
+        "document.getElementById('api-token-name').value='browser-token';"
+        "document.getElementById('api-token-scope').value='read';"
+        "document.getElementById('api-token-expiry').value='60';"
+        "return createApiToken();"
+        "})()"
+    )
+    page.wait_for(
+        "document.getElementById('api-token-secret')"
+        ".textContent.startsWith('rcaster_')"
+    )
+    page.wait_for(
+        "document.getElementById('api-tokens').textContent.includes('browser-token')"
+    )
+    checks["api_token_create"] = page.evaluate(
+        "({secret_prefix:document.getElementById('api-token-secret')"
+        ".textContent.slice(0,8),"
+        "listed:document.getElementById('api-tokens')"
+        ".textContent.includes('browser-token')})"
+    )
+    page.evaluate(
+        "(() => {"
+        "const row=[...document.querySelectorAll('#api-tokens tr')]"
+        ".find(row=>row.textContent.includes('browser-token'));"
+        "row.querySelector('button').click();"
+        "return true;"
+        "})()"
+    )
+    page.wait_for(
+        "!document.getElementById('api-tokens').textContent.includes('browser-token')"
+    )
+    checks["api_token_revoke"] = True
+
     if clustered:
         page.evaluate(
             "(() => {"
@@ -583,6 +617,14 @@ def exercise_admin_mutations(
             "!document.getElementById('sources').textContent.includes('C63')"
         )
         checks["source_disconnect_kicks_source"] = True
+    page.evaluate("logout()")
+    page.wait_for(
+        "!document.getElementById('login').hidden"
+        " && document.getElementById('account').hidden"
+    )
+    checks["admin_logout"] = page.evaluate(
+        "document.getElementById('status').textContent"
+    )
     return checks
 
 

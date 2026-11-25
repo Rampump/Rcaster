@@ -649,12 +649,6 @@ async fn handle(
         ));
     }
     if method != "GET" {
-        let Some(runtime) = &state.runtime else {
-            return Ok(response(
-                503,
-                json!({"code":"UNAVAILABLE","message":"cluster runtime unavailable"}),
-            ));
-        };
         if path == "/admin/v1/auth/logout" {
             if let Access::Admin(identity) = &access {
                 let _ = admin_auth::logout(&state.accounts, identity).await;
@@ -789,6 +783,12 @@ async fn handle(
                 );
             }
         }
+        let Some(runtime) = &state.runtime else {
+            return Ok(response(
+                503,
+                json!({"code":"UNAVAILABLE","message":"cluster runtime unavailable"}),
+            ));
+        };
         if method == "POST" && path == "/admin/v1/config/reload" {
             return Ok(match runtime.reload_config().await {
                 Ok(snapshot) => {

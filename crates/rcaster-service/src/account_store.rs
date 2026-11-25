@@ -8,6 +8,7 @@ use rcaster_core::account::{AccountError, AccountSnapshot};
 use redb::{Database, ReadableTable, TableDefinition};
 
 use crate::{
+    admin_auth::ApiToken,
     blacklist::{BlacklistError, BlacklistRule, validate_rule},
     session_limit::IpNetwork,
 };
@@ -15,6 +16,9 @@ use crate::{
 const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
 const MOUNTPOINTS: TableDefinition<&str, &[u8]> = TableDefinition::new("mountpoints");
 const BLACKLIST: TableDefinition<&str, &[u8]> = TableDefinition::new("blacklist");
+const API_TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("api_tokens");
+const API_TOKEN_LAST_USED: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("api_token_last_used");
 
 pub struct AccountStore {
     database: Database,
@@ -145,6 +149,127 @@ impl AccountStore {
         Ok(rules)
     }
 
+    pub fn api_tokens(&self) -> Result<Vec<ApiToken>, StoreError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        let table = transaction
+            .open_table(API_TOKENS)
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        table
+            .iter()
+            .map_err(|error| StoreError::Database(error.to_string()))?
+            .map(|entry| {
+                let (_, value) = entry.map_err(|error| StoreError::Database(error.to_string()))?;
+                serde_json::from_slice(value.value()).map_err(StoreError::Json)
+            })
+            .collect()
+    }
+
+    pub fn api_token(&self, token_id: &str) -> Result<Option<ApiToken>, StoreError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        let table = transaction
+            .open_table(API_TOKENS)
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        table
+            .get(token_id)
+            .map_err(|error| StoreError::Database(error.to_string()))?
+            .map(|value| serde_json::from_slice(value.value()).map_err(StoreError::Json))
+            .transpose()
+    }
+
+    pub fn put_api_token(&self, token: &ApiToken) -> Result<(), StoreError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        {
+            let mut table = transaction
+                .open_table(API_TOKENS)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let value = serde_json::to_vec(token)?;
+            table
+                .insert(token.token_id.as_str(), value.as_slice())
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    pub fn delete_api_token(&self, token_id: &str) -> Result<bool, StoreError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        let removed = {
+            let mut tokens = transaction
+                .open_table(API_TOKENS)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            let removed = tokens
+                .remove(token_id)
+                .map_err(|error| StoreError::Database(error.to_string()))?
+                .is_some();
+            let mut last_used = transaction
+                .open_table(API_TOKEN_LAST_USED)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            last_used
+                .remove(token_id)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            removed
+        };
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        Ok(removed)
+    }
+
+    pub fn api_token_last_used(&self, token_id: &str) -> Result<Option<u64>, StoreError> {
+        let transaction = self
+            .database
+            .begin_read()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        let table = transaction
+            .open_table(API_TOKEN_LAST_USED)
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        table
+            .get(token_id)
+            .map_err(|error| StoreError::Database(error.to_string()))?
+            .map(|value| {
+                std::str::from_utf8(value.value())
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(|| StoreError::Database("invalid API token timestamp".to_owned()))
+            })
+            .transpose()
+    }
+
+    pub fn put_api_token_last_used(
+        &self,
+        token_id: &str,
+        timestamp: u64,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .database
+            .begin_write()
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        {
+            let mut table = transaction
+                .open_table(API_TOKEN_LAST_USED)
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+            table
+                .insert(token_id, timestamp.to_string().as_bytes())
+                .map_err(|error| StoreError::Database(error.to_string()))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
     pub fn put_blacklist_rule(
         &self,
         rule: &BlacklistRule,
@@ -236,6 +361,12 @@ fn ensure_tables(database: &Database) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Database(error.to_string()))?;
         transaction
             .open_table(BLACKLIST)
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        transaction
+            .open_table(API_TOKENS)
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        transaction
+            .open_table(API_TOKEN_LAST_USED)
             .map_err(|error| StoreError::Database(error.to_string()))?;
     }
     transaction
