@@ -1438,7 +1438,17 @@ async fn handle_local_command(
         "error": null,
     });
     if let Ok(value) = serde_json::to_vec(&state) {
-        let _ = client.put(state_key, value, None).await;
+        let _ = client
+            .txn(
+                Txn::new()
+                    .when([Compare::create_revision(
+                        state_key.clone(),
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then([TxnOp::put(state_key, value, None)]),
+            )
+            .await;
     }
     let _ = context.shutdown.send(true);
     true

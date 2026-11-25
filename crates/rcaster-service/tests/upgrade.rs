@@ -4,6 +4,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use etcd_client::{Client, ConnectOptions, GetOptions};
 use rcaster_service::{
     config::{CasterConfig, publish_config},
+    connections::ConnectionController,
     health::HealthState,
     upgrade::{
         SignedUpgradeManifest, UpgradeCommandWatcher, UpgradeManager, UpgradeManifest,
@@ -342,6 +343,79 @@ async fn stale_or_already_handled_local_commands_do_not_trigger_shutdown() {
     tokio::time::sleep(Duration::from_millis(1400)).await;
     assert!(!*shutdown_rx.borrow());
     assert!(health.is_ready());
+    watcher.shutdown().await;
+}
+
+#[tokio::test]
+async fn draining_state_does_not_overwrite_terminal_state() {
+    let cluster = unique("upgrade-local-race");
+    let mut etcd = connect().await;
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrades/op-4"),
+        serde_json::to_vec(&json!({
+            "status": "RUNNING",
+            "current_node": 0,
+            "nodes": [{"caster_id": "edge-1", "status": "COMMANDED"}]
+        }))
+        .expect("operation JSON"),
+        None,
+    )
+    .await
+    .expect("operation");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-commands/op-4/edge-1"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "operation_id": "op-4",
+            "caster_id": "edge-1",
+            "action": "apply",
+            "target_version": "0.2.0"
+        }))
+        .expect("command JSON"),
+        None,
+    )
+    .await
+    .expect("command");
+    let health = Arc::new(HealthState::default());
+    health.set_ready(true);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let watcher = UpgradeCommandWatcher::start(
+        connect().await,
+        cluster.clone(),
+        "edge-1".to_owned(),
+        Arc::clone(&health),
+        Some(Arc::new(ConnectionController::default())),
+        shutdown_tx,
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while health.is_ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("drain start timeout");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-states/op-4/edge-1"),
+        br#"{"status":"APPLIED"}"#.to_vec(),
+        None,
+    )
+    .await
+    .expect("terminal state");
+    tokio::time::timeout(Duration::from_secs(3), shutdown_rx.changed())
+        .await
+        .expect("drain timeout")
+        .expect("drain signal");
+    let state = etcd
+        .get(
+            format!("/rcaster/{cluster}/runtime/upgrade-states/op-4/edge-1"),
+            None,
+        )
+        .await
+        .expect("state");
+    assert!(
+        String::from_utf8_lossy(state.kvs()[0].value()).contains("\"status\":\"APPLIED\""),
+        "DRAINING must not overwrite a concurrent terminal state"
+    );
     watcher.shutdown().await;
 }
 
