@@ -923,6 +923,7 @@ impl UpgradeInner {
                                 .await?;
                         }
                         if operation.status == OperationStatus::Succeeded {
+                            self.delete_commands(&operation_id).await?;
                             self.release_lock(&operation_id).await;
                         }
                         return Ok(());
@@ -947,6 +948,7 @@ impl UpgradeInner {
                             .await?;
                     }
                     if operation.status == OperationStatus::Failed {
+                        self.delete_commands(&operation_id).await?;
                         self.release_lock(&operation_id).await;
                     }
                     return Ok(());
@@ -959,6 +961,7 @@ impl UpgradeInner {
                     operation.updated_at = now;
                     operation.command_at = None;
                     self.put_operation(&operation).await?;
+                    self.delete_commands(&operation_id).await?;
                     self.release_lock(&operation_id).await;
                     return Ok(());
                 }
@@ -994,6 +997,7 @@ impl UpgradeInner {
             operation.updated_at = now;
             operation.command_at = None;
             self.put_operation(&operation).await?;
+            self.delete_commands(&operation_id).await?;
             self.release_lock(&operation_id).await;
         }
         Ok(())

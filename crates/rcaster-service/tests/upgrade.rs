@@ -120,8 +120,35 @@ async fn signed_rollout_is_previewed_locked_and_advanced() {
     .await
     .expect("next-node command recovery timeout");
 
-    let canceled = manager.cancel(&operation_id).await.expect("cancel");
-    assert_eq!(canceled["status"], "CANCELED");
+    etcd.put(
+        format!("/rcaster/{cluster}/runtime/upgrade-states/{operation_id}/core-1"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "caster_id": "core-1",
+            "status": "APPLIED",
+            "updated_at": 1,
+            "error": null
+        }))
+        .expect("state JSON"),
+        None,
+    )
+    .await
+    .expect("core state");
+    put_version(&mut etcd, &cluster, "core-1", "0.2.0", true).await;
+    let succeeded = wait_for_operation(&manager, &operation_id, |operation| {
+        operation["status"] == "SUCCEEDED"
+    })
+    .await;
+    assert_eq!(succeeded["nodes"][1]["status"], "SUCCEEDED");
+    let commands = etcd
+        .get(
+            format!("/rcaster/{cluster}/runtime/upgrade-commands/{operation_id}/"),
+            Some(GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("commands");
+    assert!(commands.kvs().is_empty());
     let lock = etcd
         .get(format!("/rcaster/{cluster}/locks/upgrade/global"), None)
         .await
@@ -522,6 +549,14 @@ async fn failed_node_requests_rollback_and_does_not_advance() {
     .await;
     assert_eq!(failed["nodes"][0]["status"], "ROLLED_BACK");
     assert_eq!(failed["nodes"][1]["status"], "PENDING");
+    let commands = etcd
+        .get(
+            format!("/rcaster/{cluster}/runtime/upgrade-commands/{operation_id}/"),
+            Some(GetOptions::new().with_prefix()),
+        )
+        .await
+        .expect("commands");
+    assert!(commands.kvs().is_empty());
     let lock = etcd
         .get(format!("/rcaster/{cluster}/locks/upgrade/global"), None)
         .await
