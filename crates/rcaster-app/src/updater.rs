@@ -602,7 +602,7 @@ async fn probe_health(url: &str) -> bool {
     let Ok(Ok(read)) = timeout(Duration::from_secs(2), stream.read(&mut response)).await else {
         return false;
     };
-    response[..read].starts_with(b"HTTP/1.1 200")
+    response[..read].starts_with(b"HTTP/1.1 200") || response[..read].starts_with(b"HTTP/1.0 200")
 }
 
 async fn connect_etcd(config: &UpdaterConfig) -> UpdaterResult<ReloadableEtcdClient> {
@@ -636,9 +636,11 @@ mod tests {
     };
 
     use super::{
-        Slot, download_artifact, ensure_staging_space, inactive_slot, probe_health,
-        request_graceful_stop, terminal_upgrade_state,
+        Slot, Updater, connect_etcd, download_artifact, ensure_staging_space, inactive_slot,
+        probe_health, request_graceful_stop, terminal_upgrade_state,
     };
+    use crate::config::UpdaterConfig;
+    use rcaster_service::upgrade::UpgradePolicy;
 
     #[test]
     fn alternates_between_two_slots() {
@@ -672,6 +674,78 @@ mod tests {
         ensure_staging_space(&path, 0).expect("zero-byte staging");
         assert!(ensure_staging_space(&path, u64::MAX).is_err());
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_restarts_an_exited_service() {
+        use std::{fs, net::TcpListener, os::unix::fs::PermissionsExt};
+        use tokio::process::Child;
+
+        let root =
+            std::env::temp_dir().join(format!("rcaster-updater-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("health")).expect("health dir");
+        fs::write(root.join("health/ready"), b"ready\n").expect("health response");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("health port");
+        let port = listener.local_addr().expect("health address").port();
+        drop(listener);
+        let service = root.join("service.sh");
+        fs::write(
+            &service,
+            format!(
+                "#!/bin/sh\nexec python3 -m http.server {port} --bind 127.0.0.1 --directory '{}' >/dev/null 2>&1\n",
+                root.display()
+            ),
+        )
+        .expect("service script");
+        fs::set_permissions(&service, fs::Permissions::from_mode(0o755)).expect("service mode");
+        let config = UpdaterConfig {
+            etcd_endpoints: vec!["http://127.0.0.1:2379".to_owned()],
+            etcd_tls: None,
+            cluster_id: format!("updater-restart-{}", std::process::id()),
+            caster_id: "edge-1".to_owned(),
+            work_dir: root.clone(),
+            service_program: service,
+            service_args: Vec::new(),
+            health_url: format!("http://127.0.0.1:{port}/health/ready"),
+            trusted_public_keys: vec![
+                "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a".to_owned(),
+            ],
+            artifact_hosts: vec!["updates.example.test".to_owned()],
+            health_timeout_s: 5,
+            drain_timeout_s: 2,
+        };
+        let etcd = connect_etcd(&config).await.expect("etcd");
+        let client = etcd.client();
+        let policy = UpgradePolicy::new(&config.trusted_public_keys, &config.artifact_hosts)
+            .expect("policy");
+        let mut updater = Updater {
+            config,
+            client,
+            _etcd: etcd,
+            policy,
+            child: None,
+        };
+        updater.start().await.expect("initial service");
+        let first_pid = updater
+            .child
+            .as_ref()
+            .and_then(Child::id)
+            .expect("first pid");
+        let child = updater.child.as_mut().expect("child");
+        child.start_kill().expect("kill child");
+        let _ = child.wait().await.expect("wait child");
+        updater.ensure_service().await.expect("restart service");
+        let second_pid = updater
+            .child
+            .as_ref()
+            .and_then(Child::id)
+            .expect("second pid");
+        assert_ne!(second_pid, first_pid);
+        assert!(probe_health(&updater.config.health_url).await);
+        updater.stop().await;
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -754,6 +828,24 @@ mod tests {
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nready\n",
+                )
+                .expect("health response");
+        });
+        assert!(probe_health(&format!("http://{address}/health/ready")).await);
+        server.join().expect("health server");
+    }
+
+    #[tokio::test]
+    async fn health_probe_accepts_http10_ready_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("health listener");
+        let address = listener.local_addr().expect("health address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nready\n",
                 )
                 .expect("health response");
         });
