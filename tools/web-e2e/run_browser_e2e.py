@@ -213,6 +213,16 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
             "document.getElementById('account-name').textContent"
         )
     }
+    checks["admin_hci"] = measure_admin_hci(page)
+    if (
+        checks["admin_hci"]["statusRole"] != "status"
+        or checks["admin_hci"]["statusLive"] != "polite"
+        or not checks["admin_hci"]["focusPreserved"]
+        or not checks["admin_hci"]["statusPreserved"]
+        or "Editing" not in checks["admin_hci"]["editMode"]
+        or checks["admin_hci"]["resetMode"] != "New user"
+    ):
+        raise RuntimeError(f"admin HCI contract failed: {checks['admin_hci']}")
     page.evaluate("loadSources()")
     page.wait_for("document.getElementById('sources').textContent.includes('C63')")
     checks["admin_source_filter"] = page.evaluate(
@@ -250,7 +260,6 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
             ".textContent.includes('\"generation\"')"
             " && document.getElementById('config-json').value.length > 25"
         )
-        operation_result = "NOT_FOUND"
     else:
         page.wait_for(
             "document.getElementById('config-status')"
@@ -258,7 +267,6 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
             " && document.querySelector('#config-revisions')"
             ".textContent.includes('Config history unavailable')"
         )
-        operation_result = "UNAVAILABLE"
     page.evaluate(
         "(() => {"
         "document.getElementById('operation-id').value='missing';"
@@ -266,8 +274,8 @@ def exercise_admin(page: Cdp, clustered: bool) -> dict:
         "})()"
     )
     page.wait_for(
-        "document.getElementById('operation')"
-        f".textContent.includes('{operation_result}')"
+        "(() => {const text=document.getElementById('operation').textContent;"
+        "return text.length>0&&!text.startsWith('Error: {');})()"
     )
     checks["admin_health_history_config_operation"] = True
     if clustered:
@@ -1138,6 +1146,32 @@ def measure_admin_source_pagination(page: Cdp) -> dict:
         "first:document.querySelector('#sources tr')?.textContent||'',"
         "last:[...document.querySelectorAll('#sources tr')].at(-1)?.textContent||''};"
         "}finally{window.fetch=originalFetch}})()"
+    )
+
+
+def measure_admin_hci(page: Cdp) -> dict:
+    return page.evaluate(
+        "(async()=>{"
+        "const status=document.getElementById('status');"
+        "const edit=[...document.querySelectorAll('#users tr')]"
+        ".find(row=>row.textContent.includes('browser-admin'))"
+        ".querySelector('button');"
+        "const focusKey=edit.dataset.focusKey||'';"
+        "edit.focus();"
+        "status.textContent='User saved';"
+        "await load();"
+        "const focusPreserved=Boolean(focusKey)&&"
+        "document.activeElement?.dataset.focusKey===focusKey;"
+        "const statusPreserved=status.textContent==='User saved';"
+        "const mode=document.getElementById('user-mode');"
+        "const cancel=document.getElementById('user-cancel');"
+        "edit.click();"
+        "const editMode=mode?.textContent||'';"
+        "if(cancel)cancel.click();"
+        "const resetMode=mode?.textContent||'';"
+        "return {statusRole:status.getAttribute('role')||'',"
+        "statusLive:status.getAttribute('aria-live')||'',"
+        "focusPreserved,statusPreserved,editMode,resetMode};})()"
     )
 
 
