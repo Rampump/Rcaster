@@ -207,6 +207,12 @@ impl Updater {
                 .previous
                 .ok_or("no previous upgrade slot is available")?
         };
+        if !self
+            .command_is_active(operation_id, action, &caster_id)
+            .await
+        {
+            return Ok(());
+        }
 
         self.stop_child().await;
         state.current = replacement;
