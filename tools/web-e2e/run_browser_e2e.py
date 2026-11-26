@@ -98,7 +98,12 @@ def wait_http(url: str, timeout: float = 20.0) -> None:
 
 class Cdp:
     def __init__(self, websocket_url: str):
-        self.websocket = connect(websocket_url, max_size=None)
+        self.websocket = connect(
+            websocket_url,
+            max_size=None,
+            ping_interval=None,
+            close_timeout=1,
+        )
         self.next_id = 1
         self.events: list[dict] = []
         self.send("Page.enable")
@@ -1380,6 +1385,174 @@ def measure_mobile_layout(page: Cdp, label: str) -> dict:
     return result
 
 
+def measure_public_touch_map(page: Cdp) -> dict:
+    page.send(
+        "Emulation.setDeviceMetricsOverride",
+        {
+            "width": 800,
+            "height": 700,
+            "deviceScaleFactor": 1,
+            "mobile": True,
+        },
+    )
+    page.send(
+        "Emulation.setTouchEmulationEnabled",
+        {"enabled": True, "maxTouchPoints": 2},
+    )
+    try:
+        page.evaluate(
+            "(() => {"
+            "mapData={type:'FeatureCollection',features:[]};"
+            "mapCamera.centerX=.5;mapCamera.centerY=.5;"
+            "mapCamera.zoom=6;mapCamera.initialized=true;drawMap();"
+            "document.getElementById('map-shell')"
+            ".scrollIntoView({block:'center'});return true;})()"
+        )
+        time.sleep(0.2)
+        start = page.evaluate("mapCamera.zoom")
+        rect = page.evaluate(
+            "(() => {const rect=document.getElementById('map')"
+            ".getBoundingClientRect();"
+            "return {left:rect.left,top:rect.top,"
+            "width:rect.width,height:rect.height};})()"
+        )
+        center_x = rect["left"] + rect["width"] / 2
+        center_y = rect["top"] + rect["height"] / 2
+        page.send(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mouseWheel",
+                "x": center_x,
+                "y": center_y,
+                "deltaX": 0,
+                "deltaY": -1,
+            },
+        )
+        time.sleep(0.1)
+        wheeled = page.evaluate(
+            "({zoom:mapCamera.zoom,centerX:mapCamera.centerX,"
+            "centerY:mapCamera.centerY})"
+        )
+        page.evaluate(
+            "mapCamera.centerX=.5;mapCamera.centerY=.5;"
+            "mapCamera.zoom=6;drawMap();true"
+        )
+
+        def touch_points(offset: int) -> list[dict]:
+            return [
+                {
+                    "x": center_x - offset,
+                    "y": center_y,
+                    "id": 11,
+                    "radiusX": 2,
+                    "radiusY": 2,
+                    "force": 1,
+                },
+                {
+                    "x": center_x + offset,
+                    "y": center_y,
+                    "id": 12,
+                    "radiusX": 2,
+                    "radiusY": 2,
+                    "force": 1,
+                },
+            ]
+
+        page.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchStart", "touchPoints": touch_points(35)},
+        )
+        page.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchMove", "touchPoints": touch_points(80)},
+        )
+        page.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchEnd", "touchPoints": []},
+        )
+        time.sleep(0.1)
+        pinched = page.evaluate(
+            "({zoom:mapCamera.zoom,centerX:mapCamera.centerX,"
+            "centerY:mapCamera.centerY})"
+        )
+
+        page.send(
+            "Input.dispatchTouchEvent",
+            {
+                "type": "touchStart",
+                "touchPoints": [
+                    {
+                        "x": center_x,
+                        "y": center_y,
+                        "id": 13,
+                        "radiusX": 2,
+                        "radiusY": 2,
+                        "force": 1,
+                    }
+                ],
+            },
+        )
+        page.send(
+            "Input.dispatchTouchEvent",
+            {
+                "type": "touchMove",
+                "touchPoints": [
+                    {
+                        "x": center_x + 70,
+                        "y": center_y + 20,
+                        "id": 13,
+                        "radiusX": 2,
+                        "radiusY": 2,
+                        "force": 1,
+                    }
+                ],
+            },
+        )
+        page.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchEnd", "touchPoints": []},
+        )
+        time.sleep(0.1)
+        panned = page.evaluate(
+            "({zoom:mapCamera.zoom,centerX:mapCamera.centerX,"
+            "centerY:mapCamera.centerY})"
+        )
+    finally:
+        page.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
+        page.send("Emulation.clearDeviceMetricsOverride")
+
+    if pinched["zoom"] < start + 1:
+        raise RuntimeError(
+            f"public map pinch zoom failed: start={start}, result={pinched}"
+        )
+    if (
+        wheeled["zoom"] < start + 1
+        or abs(wheeled["centerX"] - 0.5) > 0.001
+        or abs(wheeled["centerY"] - 0.5) > 0.001
+    ):
+        raise RuntimeError(f"public map wheel zoom failed: {wheeled}")
+    if (
+        abs(pinched["centerX"] - 0.5) > 0.001
+        or abs(pinched["centerY"] - 0.5) > 0.001
+    ):
+        raise RuntimeError(
+            f"public map pinch center drifted: {pinched}"
+        )
+    if (
+        abs(panned["centerX"] - pinched["centerX"]) < 0.00001
+        or abs(panned["centerY"] - 0.5) < 0.00001
+    ):
+        raise RuntimeError(
+            f"public map touch pan failed: pinch={pinched}, pan={panned}"
+        )
+    return {
+        "start_zoom": start,
+        "wheeled": wheeled,
+        "pinched": pinched,
+        "panned": panned,
+    }
+
+
 def measure_public_directory_pagination(page: Cdp) -> dict:
     return page.evaluate(
         "(async()=>{"
@@ -2404,6 +2577,7 @@ def run_test(temp: Path, clustered: bool) -> dict:
         result["checks"]["public_mobile_layout"] = measure_mobile_layout(
             public, "public"
         )
+        result["checks"]["public_touch_map"] = measure_public_touch_map(public)
         result["checks"]["public_directory_pagination"] = (
             measure_public_directory_pagination(public)
         )

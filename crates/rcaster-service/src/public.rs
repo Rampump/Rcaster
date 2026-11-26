@@ -1386,7 +1386,7 @@ const PUBLIC_HTML: &str = r#"<!doctype html>
 <section><input id="username" placeholder="username" autocomplete="username"><input id="password" type="password" placeholder="password" autocomplete="current-password"><button onclick="login()">Sign in</button><button onclick="logout()">Sign out</button><p id="session-status" role="status" aria-live="polite">Anonymous directory is read-only.</p><p id="data-freshness" role="status" aria-live="polite"></p><p id="status" role="status" aria-live="polite"></p></section>
 <section><h2>Mountpoints</h2><table><thead><tr><th>Mountpoint</th><th>Format</th><th>Region</th><th>Action</th></tr></thead><tbody id="mounts"></tbody></table></section>
 <section><h2>Live monitor</h2><button id="monitor-retry" hidden onclick="retryMonitor()">Retry monitor</button><div id="satellites">No active source.</div><svg id="skyplot" viewBox="0 0 300 300" role="img" aria-label="Satellite skyplot"></svg><pre id="monitor">Sign in and select Monitor.</pre><canvas id="chart" width="1000" height="220"></canvas></section>
-<section><h2>Station map</h2><div id="map-shell"><div id="tile-layer" aria-hidden="true"></div><svg id="map" viewBox="0 0 1000 360" role="img" aria-label="Station map"></svg><div id="map-attribution"></div></div></section>
+<section><h2>Station map</h2><div id="map-shell"><div id="tile-layer" aria-hidden="true"></div><svg id="map" viewBox="0 0 1000 360" role="img" aria-label="Station map. Drag to pan; pinch or use the mouse wheel to zoom."></svg><div id="map-attribution"></div></div></section>
 </main><script src="/app.js" defer></script></body></html>"#;
 
 const PUBLIC_JS: &str = include_str!("public_app.js");
