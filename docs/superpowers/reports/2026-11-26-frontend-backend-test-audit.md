@@ -64,10 +64,13 @@ Implementation progress:
   are served as same-origin `text/javascript` resources, and are covered by
   direct asset endpoint tests instead of being embedded in Rust/HTML strings.
 - Final local evidence:
-  `tools/web-e2e/runs/20261126-025403/result.json`.
+  `tools/web-e2e/runs/20261126-191527/result.json`.
 - Firefox found and verified a startup auth race where an old anonymous 401
   could clear a newly authenticated admin session. `api()` now binds 401
   handling to the auth generation captured when the request started.
+- The final Chromium gate also sends real CDP touch events: mouse-wheel and
+  two-finger zoom both move from level 6 to 7 without drifting from the
+  viewport center, and one-finger pan changes the camera at level 7.
 
 ## Coverage map
 
@@ -81,11 +84,11 @@ Implementation progress:
 | Admin auth, CSRF and API tokens | API tests for scopes, expiry, revoke and auth-version invalidation | Login failure UX, lockout countdown, token copy/one-time warning UX |
 | User/mountpoint/blacklist CRUD | API and browser happy-path CRUD | Concurrent edits, stale ETag UX, duplicate submit, field-level validation |
 | Source/session kick | Real socket disconnect tests in standalone and clustered modes | Double-click, disconnect failure and pending-timeout UX |
-| Public directory and map | Browser tests, real OSM/AMap tiles, 1,301 CRTK stations, 0 px marker error | More than 200-row directory navigation, keyboard/touch map operation |
+| Public directory and map | Browser tests, real OSM/AMap tiles, 1,301 CRTK stations, 0 px marker error, keyboard clusters, anchored wheel/pinch zoom and touch pan | Physical-device touch and production-scale visual performance |
 | Public monitor | Ticket and WebSocket happy path; generation-change closure | Reconnect, network loss, session expiry and close-reason UX |
 | Batch operations | API tests for all actions, retry, cancel and recovery | Browser controls for delete/disable/change-owner/cancel/retry |
 | Upgrade workflow | API tests for preview/approve/cancel/rollback | Browser workflow and real multi-node rollout |
-| Mobile/accessibility | None beyond viewport metadata and a few ARIA labels | Keyboard, screen reader, focus order, responsive tables, touch targets |
+| Mobile/accessibility | 390×844 overflow checks, keyboard-focusable map controls, live status regions, focus retention, touch pan/zoom and Chromium/Firefox smoke | Screen-reader software, 768×1024 tablet layout and physical-device gesture coverage |
 
 ## Findings
 
@@ -176,6 +179,10 @@ Implementation progress:
     - **Problem:** On a 390 px phone, wide tables and 360 px inputs grow the page wider than the viewport. Map touch zoom is not explicitly tested, and buttons have small spacing.
     - **Fix:** Add a table scroll container, stack form fields under a mobile breakpoint, and test 390×844 plus 768×1024 with touch.
     - **If we skip it:** Public station lookup and admin actions are hard to use on phones and tablets.
+    - **Current state:** The 390×844 overflow gate passes. The public map now
+      handles two-pointer pinch with an anchored center and one-finger pan;
+      Chromium validates both through CDP touch events. A physical-device and
+      768×1024 tablet run remains external HCI evidence.
 
 15. **[Fixed for browser data refresh] Offline and slow-network behavior is untested and has no stale-data state** (`crates/rcaster-service/src/admin.rs:4144`, `crates/rcaster-service/src/public.rs:1384`)
     - **What this is:** Both pages refresh on timers and replace data when requests succeed.

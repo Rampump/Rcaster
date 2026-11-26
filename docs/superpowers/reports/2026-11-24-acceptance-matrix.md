@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-26 06:18 CST
+Status date: 2026-11-26 19:17 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -9,14 +9,16 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`6b84d34` (committed locally, not pushed or deployed)
+`599d76e` (committed locally, not pushed or deployed)
 
 Current local release artifacts:
 
 - `target/release/rcaster`:
-  `260DA502195C96307134B3480DE216508B4C7E792530BAFE7069876E01D00C5F`
+  `696EE575AC69E56005F4CC5A978CC8DE56017A2E05647C683B9C67EFF58BA029`
 - `target/release/rcaster-updater`:
   `BB8598766BEE99E34277C227734D67BDD793632FD275FF29831BC44E0D9741EF`
+- `target/release/rcaster-upgrade-signer`:
+  `199E3CE6FF4AD1970DCBBE53489BFE25493FA0B7ADF695D88F3FCA927A00B52D`
 
 ## Status
 
@@ -48,7 +50,7 @@ not be described as final production acceptance.
 | 18.10 Ownership and reconnect | Verified | Automated tests cover owner-only writes, runtime epoch changes, source generation fencing, lease expiry, stale cache replacement and old-connection rejection. | Repeat a post-window orphan-key and source/session count audit. |
 | 18.11 Automatic upgrade and rollback | Partial | Signed manifest verification, untrusted-host/size/hash rejection, two-person approval, rollout locking, failure stopping and rollback state tests pass. Updater tests cover exact-size artifact download, redirect-category rejection, command/manifest version consistency, local staging free-space rejection, operation-ID path traversal rejection, corrupt-slot-state rejection, HTTP/1.0 and HTTP/1.1 readiness probes, durable cross-restart command deduplication, slot switching, missing-current-slot fallback state repair, and SIGTERM-before-drain with KILL fallback; a real child-process test kills the supervised service and verifies restart with a new PID and healthy readiness. Artifact download/verification is separate from slot installation: cancellation or timeout during download removes only `.part` staging and does not overwrite the inactive slot; active fencing is repeated immediately before service stop and again before slot installation. Caster command watchers independently enforce command/manifest version consistency before draining. The systemd updater stop timeout covers the maximum supported 300-second drain plus shutdown grace. `DRAINING` remains non-terminal so an updater restart still applies the pending upgrade; only `APPLIED/FAILED/ROLLED_BACK` suppress command replay. Caster command watchers reject stale commands from inactive operations and commands for nodes that already wrote upgrade state. DRAINING is written with an etcd create-only transaction so a concurrent `APPLIED` terminal state cannot be overwritten. The coordinator recreates a missing current-node command after a crash and removes command keys once an operation reaches a terminal state; a restarted manager also performs the same terminal cleanup idempotently. The clustered browser gate exercises a signed upgrade through preview, cancel, rollback, second-admin approval and the expected test-node shutdown. | No real four-node signed rolling upgrade and rollback has been performed under production traffic. |
 | 18.12 External DNS/LB | Partial | Real HAProxy PROXY Protocol v2 preserved the source IP; trusted proxy configuration is regression-tested; health and readiness endpoints are available. | Real GeoDNS/region VIP, draining/removal behavior, all public hostnames and production TLS certificate coverage. |
-| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` uses top-level server TLS, and standalone public sessions/tickets now use bounded in-process state instead of requiring etcd. Standalone API tokens persist in redb, support create/list/revoke/Bearer authentication, prune expired records, and are invalidated by user auth-version changes; standalone logout no longer requires cluster runtime. Standalone and clustered management now support NTRIP/Web user flags, full mountpoint coordinates/coverage/STR/source expectations, local session listing and single-session drop, live source disconnect and source cancellation when a mountpoint is disabled. The map supports WGS-84 XYZ/OSM and GCJ-02 AMap tiles with WGS-84 STR-to-tile conversion and WGS-84 bbox round-tripping. A 1,301-station CRTK.NET snapshot produced identical low-zoom cluster totals and 15/15 individually measured dense-region markers with 0.0 px maximum error in both projections. The HCI gate now covers paired coordinate and required-password validation, JSON field invalidation, configuration diff before Apply, accessible destructive-action impact dialogs, bounded stale-data retry, idle session expiry, active-socket monitor reconnect state and progressive single-flight controls. Admin and public JavaScript is served as same-origin `text/javascript` assets with direct endpoint tests. Chromium and Firefox 153.7 ESR both run standalone and clustered smoke flows, and Chromium covers admin login/logout, user and mountpoint CRUD, blacklist CRUD, API token create/list/revoke, maintenance toggle, clustered config apply, batch user-disable, health/history/operation UI, source filtering, public map/login/ticket/WebSocket, user-disable disconnect, session drop, source disconnect and mountpoint-disable source cancellation. The clustered browser gate also drives a signed upgrade through Preview, Start, Cancel, Rollback, Rollback Cancel and second-administrator Approve to `RUNNING` against a disposable Caster that shuts down as the final test step. The browser runs had no unexpected console or network errors. | Public web is not exposed on the protected test deployment (`public_bind=null`); external DNS/LB, production tile service, large-map behavior, production monitor load and a real multi-node upgrade under traffic remain unverified. |
+| 18.13 Public Web/STR/map/monitor | Partial | Public directory, ticket, authentication, monitor, tile-host validation and source privacy tests pass. Standalone `admin_bind` uses top-level server TLS, and standalone public sessions/tickets now use bounded in-process state instead of requiring etcd. Standalone API tokens persist in redb, support create/list/revoke/Bearer authentication, prune expired records, and are invalidated by user auth-version changes; standalone logout no longer requires cluster runtime. Standalone and clustered management now support NTRIP/Web user flags, full mountpoint coordinates/coverage/STR/source expectations, local session listing and single-session drop, live source disconnect and source cancellation when a mountpoint is disabled. The map supports WGS-84 XYZ/OSM and GCJ-02 AMap tiles with WGS-84 STR-to-tile conversion and WGS-84 bbox round-tripping. A 1,301-station CRTK.NET snapshot produced identical low-zoom cluster totals and 15/15 individually measured dense-region markers with 0.0 px maximum error in both projections. The Chromium touch gate verifies anchored mouse-wheel zoom, two-pointer pinch zoom and single-finger pan; symmetric wheel/pinch zoom from 6 to 7 keeps the viewport center at 0.5/0.5 instead of drifting. The HCI gate now covers paired coordinate and required-password validation, JSON field invalidation, configuration diff before Apply, accessible destructive-action impact dialogs, bounded stale-data retry, idle session expiry, active-socket monitor reconnect state and progressive single-flight controls. Admin and public JavaScript is served as same-origin `text/javascript` assets with direct endpoint tests. Chromium and Firefox 153.7 ESR both run standalone and clustered smoke flows, and Chromium covers admin login/logout, user and mountpoint CRUD, blacklist CRUD, API token create/list/revoke, maintenance toggle, clustered config apply, batch user-disable, health/history/operation UI, source filtering, public map/login/ticket/WebSocket, user-disable disconnect, session drop, source disconnect and mountpoint-disable source cancellation. The clustered browser gate also drives a signed upgrade through Preview, Start, Cancel, Rollback, Rollback Cancel and second-administrator Approve to `RUNNING` against a disposable Caster that shuts down as the final test step. The browser runs had no unexpected console or network errors. | Public web is not exposed on the protected test deployment (`public_bind=null`); external DNS/LB, production tile service, large-map behavior, production monitor load, physical-device touch and a real multi-node upgrade under traffic remain unverified. |
 
 ## Operational Completeness Follow-up
 
@@ -84,10 +86,13 @@ Final current-tree verification on 2026-11-26:
 - All-feature release binaries: pass.
   - `rcaster` 23,624,440 bytes,
     SHA-256
-    `260DA502195C96307134B3480DE216508B4C7E792530BAFE7069876E01D00C5F`;
+    `696EE575AC69E56005F4CC5A978CC8DE56017A2E05647C683B9C67EFF58BA029`;
   - `rcaster-updater` 7,663,280 bytes,
     SHA-256
-    `BB8598766BEE99E34277C227734D67BDD793632FD275FF29831BC44E0D9741EF`.
+    `BB8598766BEE99E34277C227734D67BDD793632FD275FF29831BC44E0D9741EF`;
+  - `rcaster-upgrade-signer` 1,515,040 bytes,
+    SHA-256
+    `199E3CE6FF4AD1970DCBBE53489BFE25493FA0B7ADF695D88F3FCA927A00B52D`.
 - Upgrade integration suite: 8 tests pass, including stale/terminal command
   fencing, DRAINING create-only state, slot action sequencing and terminal
   cleanup after manager restart.
@@ -95,9 +100,9 @@ Final current-tree verification on 2026-11-26:
   rejection, disk-space preflight, slot-state recovery and deferred slot
   installation after operation cancellation.
 - Last full Chromium + Firefox browser gate:
-  `tools/web-e2e/runs/20261126-025403/result.json`, standalone and clustered
-  pass with zero unexpected browser/network errors. Frontend files are
-  unchanged after this evidence.
+  `tools/web-e2e/runs/20261126-191527/result.json`, standalone and clustered
+  pass with zero unexpected browser/network errors. The anchored wheel/pinch
+  and single-finger pan checks pass in both map projection modes.
 
 Historical current-tree verification on 2026-11-25:
 

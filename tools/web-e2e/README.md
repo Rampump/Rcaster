@@ -39,8 +39,11 @@ The HCI gate also verifies paired coordinate errors, required user passwords,
 JSON field invalidation, configuration diff before Apply, the accessible
 destructive-action impact dialog, bounded refresh retry with `Data stale`,
 idle public-session expiry, reconnect status from the active socket, and
-single-flight mutation controls. Batch preview/start and operation Cancel/Retry
-are exercised when the local etcd-backed mode is available.
+single-flight mutation controls. The public map is exercised with CDP mouse
+wheel and two-pointer pinch zoom, asserting that zoom changes while the
+viewport center stays anchored, followed by one-finger pan. Batch
+preview/start and operation Cancel/Retry are exercised when the local
+etcd-backed mode is available.
 
 The clustered run also configures a trusted Ed25519 upgrade key and drives the
 browser upgrade UI through signed Preview, Start, pending approval, Cancel,
