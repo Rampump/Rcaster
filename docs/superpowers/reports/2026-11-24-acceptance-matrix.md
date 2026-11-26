@@ -1,6 +1,6 @@
 # RCaster Acceptance Matrix
 
-Status date: 2026-11-26 01:55 CST
+Status date: 2026-11-26 06:18 CST
 
 Deployed soak release:
 `76f542d70efce5cbc9b3a29213654ea62bb3d555dfb98336fd7570f59498ae2c`
@@ -9,7 +9,14 @@ Deployed soak source code commit:
 `9bdc2f8`
 
 Local remediation code commit:
-`ce9e785` (committed locally, not pushed or deployed)
+`6b84d34` (committed locally, not pushed or deployed)
+
+Current local release artifacts:
+
+- `target/release/rcaster`:
+  `260DA502195C96307134B3480DE216508B4C7E792530BAFE7069876E01D00C5F`
+- `target/release/rcaster-updater`:
+  `BB8598766BEE99E34277C227734D67BDD793632FD275FF29831BC44E0D9741EF`
 
 ## Status
 
@@ -66,7 +73,31 @@ metrics are implemented locally. The operational completeness plan is complete
 for code and local acceptance; only protected external-environment checks
 remain.
 
-Final current-tree verification on 2026-11-25:
+Final current-tree verification on 2026-11-26:
+
+- `cargo fmt --all -- --check`: pass.
+- `cargo test --workspace --all-features --locked`: pass.
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D
+  warnings`: pass.
+- All-feature release binaries: pass.
+  - `rcaster` 23,624,440 bytes,
+    SHA-256
+    `260DA502195C96307134B3480DE216508B4C7E792530BAFE7069876E01D00C5F`;
+  - `rcaster-updater` 7,663,280 bytes,
+    SHA-256
+    `BB8598766BEE99E34277C227734D67BDD793632FD275FF29831BC44E0D9741EF`.
+- Upgrade integration suite: 8 tests pass, including stale/terminal command
+  fencing, DRAINING create-only state, slot action sequencing and terminal
+  cleanup after manager restart.
+- Updater unit suite: 15 tests pass, including real child restart, redirect
+  rejection, disk-space preflight, slot-state recovery and deferred slot
+  installation after operation cancellation.
+- Last full Chromium + Firefox browser gate:
+  `tools/web-e2e/runs/20261126-025403/result.json`, standalone and clustered
+  pass with zero unexpected browser/network errors. Frontend files are
+  unchanged after this evidence.
+
+Historical current-tree verification on 2026-11-25:
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo test --workspace --all-features --locked`: pass.
