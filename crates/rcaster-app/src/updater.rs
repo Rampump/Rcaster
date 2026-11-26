@@ -198,23 +198,43 @@ impl Updater {
         }
         let mut state = self.read_state()?;
         let old = state.current;
-        let replacement = if action == "apply" {
+        let staged_artifact = if action == "apply" {
             let slot = inactive_slot(old);
-            self.stage_artifact(operation_id, slot, &manifest).await?;
-            slot
+            Some((slot, self.prepare_artifact(operation_id, &manifest).await?))
         } else {
-            state
+            None
+        };
+        let replacement = match &staged_artifact {
+            Some((slot, _)) => *slot,
+            None => state
                 .previous
-                .ok_or("no previous upgrade slot is available")?
+                .ok_or("no previous upgrade slot is available")?,
         };
         if !self
             .command_is_active(operation_id, action, &caster_id)
             .await
         {
+            if let Some((_, staging)) = staged_artifact {
+                let _ = fs::remove_file(staging);
+            }
             return Ok(());
         }
 
         self.stop_child().await;
+        if !self
+            .command_is_active(operation_id, action, &caster_id)
+            .await
+        {
+            if let Some((_, staging)) = staged_artifact {
+                let _ = fs::remove_file(staging);
+            }
+            self.start_child().await?;
+            self.wait_healthy().await?;
+            return Ok(());
+        }
+        if let Some((slot, staging)) = staged_artifact {
+            install_staged_artifact(&staging, &self.slot_program(slot))?;
+        }
         state.current = replacement;
         state.previous = Some(old);
         self.write_slot_state(&state)?;
@@ -279,15 +299,11 @@ impl Updater {
             .is_some_and(|state| terminal_upgrade_state(&state)))
     }
 
-    async fn stage_artifact(
+    async fn prepare_artifact(
         &self,
         operation_id: &str,
-        slot: Slot,
         manifest: &rcaster_service::upgrade::UpgradeManifest,
-    ) -> UpdaterResult<()> {
-        if matches!(slot, Slot::Initial) {
-            return Err("invalid staging slot".into());
-        }
+    ) -> UpdaterResult<PathBuf> {
         ensure_staging_space(&self.config.work_dir, manifest.artifact_size)?;
         let staging = self
             .config
@@ -299,23 +315,18 @@ impl Updater {
         let url = manifest.artifact_url.clone();
         let expected_size = manifest.artifact_size;
         let path = staging.clone();
-        tokio::task::spawn_blocking(move || download_artifact(&url, &path, expected_size))
-            .await??;
-        verify_artifact(&staging, manifest)?;
-        let target = self.slot_program(slot);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+        let result =
+            tokio::task::spawn_blocking(move || download_artifact(&url, &path, expected_size))
+                .await?;
+        if let Err(error) = result {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
         }
-        if target.exists() {
-            fs::remove_file(&target)?;
+        if let Err(error) = verify_artifact(&staging, manifest) {
+            let _ = fs::remove_file(&staging);
+            return Err(error.into());
         }
-        fs::rename(&staging, &target)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
-        }
-        Ok(())
+        Ok(staging)
     }
 
     async fn command_is_active(
@@ -508,6 +519,22 @@ impl Updater {
     }
 }
 
+fn install_staged_artifact(staging: &Path, target: &Path) -> UpdaterResult<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        fs::remove_file(target)?;
+    }
+    fs::rename(staging, target)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(target, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
 fn request_graceful_stop(child: &mut Child) {
     #[cfg(unix)]
     if let Some(process_id) = child.id() {
@@ -686,8 +713,9 @@ mod tests {
 
     use super::{
         Slot, SlotState, Updater, command_target_matches, connect_etcd, download_artifact,
-        ensure_staging_space, inactive_slot, probe_health, read_slot_state, repaired_slot_state,
-        request_graceful_stop, terminal_upgrade_state, valid_identifier,
+        ensure_staging_space, inactive_slot, install_staged_artifact, probe_health,
+        read_slot_state, repaired_slot_state, request_graceful_stop, terminal_upgrade_state,
+        valid_identifier,
     };
     use crate::config::UpdaterConfig;
     use rcaster_service::upgrade::UpgradePolicy;
@@ -742,6 +770,22 @@ mod tests {
             "0.2.0"
         ));
         assert!(!command_target_matches(&serde_json::json!({}), "0.2.0"));
+    }
+
+    #[test]
+    fn replaces_target_only_when_installing_a_staged_artifact() {
+        let root =
+            std::env::temp_dir().join(format!("rcaster-updater-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("slot")).expect("slot dir");
+        let staging = root.join("artifact.part");
+        let target = root.join("slot/rcaster");
+        std::fs::write(&staging, b"new").expect("staging");
+        std::fs::write(&target, b"old").expect("target");
+        install_staged_artifact(&staging, &target).expect("install");
+        assert_eq!(std::fs::read(&target).expect("target"), b"new");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
