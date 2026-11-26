@@ -295,6 +295,38 @@ async fn standalone_account_directory_crud_persists_users_and_mountpoints() {
     assert!(snapshot.mountpoint("C63").is_some());
 }
 
+#[tokio::test]
+async fn concurrent_standalone_user_writes_do_not_overwrite_each_other() {
+    let path = TempDatabase::new();
+    let store = AccountStore::open(path.as_ref()).expect("open store");
+    let initial = snapshot("owner-id", "owner", "C63");
+    store.replace(&initial).expect("initial accounts");
+    let directory = AccountDirectory::with_store(initial, store).expect("account directory");
+    let first = directory.clone();
+    let second = directory.clone();
+
+    let (left, right) = tokio::join!(
+        first.upsert_user(local_user("left-id", "left"), None),
+        second.upsert_user(local_user("right-id", "right"), None),
+    );
+    left.expect("left write");
+    right.expect("right write");
+
+    let persisted = directory.snapshot();
+    assert!(persisted.user_by_id("left-id").is_some());
+    assert!(persisted.user_by_id("right-id").is_some());
+}
+
+fn local_user(user_id: &str, username: &str) -> User {
+    let mut user = snapshot(user_id, username, "UNUSED")
+        .users()
+        .next()
+        .expect("user")
+        .clone();
+    user.mod_revision = 0;
+    user
+}
+
 fn snapshot(user_id: &str, username: &str, mountpoint: &str) -> AccountSnapshot {
     AccountSnapshot::new(
         [User {

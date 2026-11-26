@@ -19,6 +19,78 @@ use rcaster_service::{
 use tokio::{net::TcpListener, sync::oneshot};
 
 #[tokio::test]
+async fn concurrent_shared_admissions_share_the_coordinator_batch() {
+    let cluster = unique("runtime-batch");
+    let mut admin = connect().await;
+    publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(
+            connect().await,
+            &cluster,
+            CoordinatorOptions {
+                batch_window: std::time::Duration::from_millis(100),
+                ..CoordinatorOptions::default()
+            },
+        )
+        .await
+        .expect("start coordinator"),
+    );
+    let shared = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        options(&cluster, "caster-batch", "10.0.0.11:12102"),
+    )
+    .await
+    .expect("shared runtime");
+    let before = admin
+        .get("/__rcaster_revision_probe", None)
+        .await
+        .expect("revision read")
+        .header()
+        .expect("revision header")
+        .revision();
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for index in 0..8 {
+        let shared = shared.clone();
+        tasks.spawn(async move {
+            shared
+                .admit_client(
+                    &format!("batch-user-{index}"),
+                    "C63",
+                    &format!("203.0.113.{}", index + 10),
+                    1,
+                    None,
+                )
+                .await
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("admission task").expect("admission");
+    }
+    let after = admin
+        .get("/__rcaster_revision_probe", None)
+        .await
+        .expect("revision read")
+        .header()
+        .expect("revision header")
+        .revision();
+    assert!(
+        after.saturating_sub(before) <= 2,
+        "eight concurrent admissions should share one etcd batch, revisions advanced by {}",
+        after.saturating_sub(before)
+    );
+
+    shared.shutdown().await.expect("runtime shutdown");
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
+}
+
+#[tokio::test]
 async fn source_claim_is_exclusive_and_releasable_across_casters() {
     let cluster = unique("runtime-source");
     let mut admin = connect().await;

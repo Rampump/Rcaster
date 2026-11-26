@@ -2,10 +2,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::{
-    account_auth::{hash_password, rehash_password_if_needed, verify_password},
+    account_auth::{rehash_password_if_needed, verify_password},
     account_directory::{AccountDirectory, AccountDirectoryError},
+    admin_auth::valid_login_username,
     auth::AuthConcurrencyLimiter,
 };
 
@@ -80,6 +83,9 @@ pub async fn login(
     username: &str,
     password: &str,
 ) -> Result<IssuedPublicSession, PublicAuthError> {
+    if !valid_login_username(username) {
+        return Err(PublicAuthError::Invalid);
+    }
     let user = directory
         .linear_user_by_username(username)
         .await?
@@ -102,7 +108,7 @@ pub async fn login(
     let session_id = random_hex();
     let secret = random_hex();
     let csrf_token = random_hex();
-    let token_hash = hash_secret(secret.clone()).await?;
+    let token_hash = hash_secret(&secret);
     let now = unix_time();
     let expires_at = now.saturating_add(PUBLIC_SESSION_TTL_S as u64);
     let session = PublicSession {
@@ -197,7 +203,7 @@ pub async fn issue_ticket(
 ) -> Result<String, PublicAuthError> {
     let ticket_id = random_hex();
     let secret = random_hex();
-    let token_hash = hash_secret(secret.clone()).await?;
+    let token_hash = hash_secret(&secret);
     let now = unix_time();
     let ticket = MonitorTicket {
         schema_version: 1,
@@ -294,6 +300,16 @@ async fn current_user(
 }
 
 async fn verify_secret(hash: String, secret: String) -> Result<(), PublicAuthError> {
+    if let Some(expected) = hash.strip_prefix("sha256:") {
+        let actual = format!("{:x}", Sha256::digest(secret.as_bytes()));
+        return if expected.len() == actual.len()
+            && bool::from(expected.as_bytes().ct_eq(actual.as_bytes()))
+        {
+            Ok(())
+        } else {
+            Err(PublicAuthError::Invalid)
+        };
+    }
     if tokio::task::spawn_blocking(move || verify_password(&hash, &secret))
         .await
         .map_err(|_| PublicAuthError::Unavailable)?
@@ -304,11 +320,8 @@ async fn verify_secret(hash: String, secret: String) -> Result<(), PublicAuthErr
     }
 }
 
-async fn hash_secret(secret: String) -> Result<String, PublicAuthError> {
-    tokio::task::spawn_blocking(move || hash_password(&secret))
-        .await
-        .map_err(|_| PublicAuthError::Unavailable)?
-        .map_err(|_| PublicAuthError::Unavailable)
+fn hash_secret(secret: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(secret.as_bytes()))
 }
 
 pub fn session_key(
@@ -354,4 +367,21 @@ fn unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hash_secret, verify_secret};
+
+    #[tokio::test]
+    async fn random_secret_hashes_are_sha256_and_constant_time_verifiable() {
+        let hash = hash_secret("secret");
+        assert!(hash.starts_with("sha256:"));
+        assert!(
+            verify_secret(hash.clone(), "secret".to_owned())
+                .await
+                .is_ok()
+        );
+        assert!(verify_secret(hash, "wrong".to_owned()).await.is_err());
+    }
 }

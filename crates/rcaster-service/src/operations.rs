@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     account_directory::{AccountDirectory, AccountDirectoryError},
     cluster_runtime::SharedClusterRuntime,
+    connections::ConnectionController,
     health::HealthState,
 };
 
@@ -82,6 +83,8 @@ struct BatchOperation {
     results: Vec<TargetResult>,
     created_at: u64,
     updated_at: u64,
+    #[serde(skip, default)]
+    revision: u64,
 }
 
 #[derive(Serialize)]
@@ -100,6 +103,7 @@ pub struct OperationManager {
     cluster_id: String,
     caster_id: String,
     health: Option<Arc<HealthState>>,
+    connections: Option<Arc<ConnectionController>>,
 }
 
 impl OperationManager {
@@ -116,7 +120,13 @@ impl OperationManager {
             cluster_id,
             caster_id,
             health,
+            connections: None,
         }
+    }
+
+    pub fn with_connections(mut self, connections: Arc<ConnectionController>) -> Self {
+        self.connections = Some(connections);
+        self
     }
 
     pub async fn preview(&self, body: &Value) -> Result<Value, (u16, String)> {
@@ -177,6 +187,9 @@ impl OperationManager {
         ) {
             return Err((400, "unsupported batch operation".to_owned()));
         }
+        if action == "sessions.drop" && !self.connection_watch_healthy() {
+            return Err((503, "connection command watch is unavailable".to_owned()));
+        }
         let expected_digest = body
             .get("preview_digest")
             .and_then(Value::as_str)
@@ -198,7 +211,7 @@ impl OperationManager {
 
         let now = unix_time();
         let operation_id = format!("op_{}", random_hex());
-        let operation = BatchOperation {
+        let mut operation = BatchOperation {
             schema_version: 1,
             operation_id: operation_id.clone(),
             action: action.to_owned(),
@@ -215,9 +228,10 @@ impl OperationManager {
             results: Vec::new(),
             created_at: now,
             updated_at: now,
+            revision: 0,
         };
         let lease_id = self.acquire_operation_lease(&operation).await?;
-        self.put(&operation).await?;
+        self.put(&mut operation).await?;
         self.put_lease_key(&operation.operation_id, &self.caster_id, lease_id)
             .await?;
         self.spawn_run(operation.clone(), lease_id);
@@ -226,6 +240,9 @@ impl OperationManager {
 
     pub async fn retry(&self, operation_id: &str) -> Result<Value, (u16, String)> {
         let mut operation = self.load(operation_id).await?;
+        if !operation.affected_sessions.is_empty() && !self.connection_watch_healthy() {
+            return Err((503, "connection command watch is unavailable".to_owned()));
+        }
         if !matches!(operation.status.as_str(), "PARTIAL" | "FAILED") {
             return Err((
                 409,
@@ -237,7 +254,7 @@ impl OperationManager {
         operation.results.clear();
         operation.updated_at = unix_time();
         let lease_id = self.acquire_operation_lease(&operation).await?;
-        self.put(&operation).await?;
+        self.put(&mut operation).await?;
         self.put_lease_key(&operation.operation_id, &self.caster_id, lease_id)
             .await?;
         self.spawn_run(operation.clone(), lease_id);
@@ -274,17 +291,18 @@ impl OperationManager {
             operation.updated_at = now;
             let replaced = self
                 .accounts
-                .etcd_put_if_revision(
+                .etcd_put_if_revision_checked(
                     &self.operation_key(&operation.operation_id),
                     serde_json::to_vec(&operation).map_err(|error| (500, error.to_string()))?,
                     revision,
                 )
                 .await
                 .map_err(|error| (503, error.to_string()))?;
-            if !replaced {
+            let Some(new_revision) = replaced else {
                 let _ = self.accounts.etcd_revoke_lease(lease_id).await;
                 continue;
-            }
+            };
+            operation.revision = new_revision;
             if let Err(error) = self
                 .put_lease_key(&operation.operation_id, &self.caster_id, lease_id)
                 .await
@@ -560,7 +578,7 @@ impl OperationManager {
         operation = current;
         operation.status = "RUNNING".to_owned();
         operation.updated_at = unix_time();
-        if self.put(&operation).await.is_err() {
+        if self.put(&mut operation).await.is_err() {
             return;
         }
         match operation.action.as_str() {
@@ -577,6 +595,7 @@ impl OperationManager {
                         Err(_) => return,
                     };
                     operation.status = current.status;
+                    operation.revision = current.revision;
                     let result = if operation.action == "users.delete" {
                         self.delete_user(&target).await
                     } else {
@@ -584,7 +603,7 @@ impl OperationManager {
                     };
                     operation.results.push(result);
                     operation.updated_at = unix_time();
-                    if self.put(&operation).await.is_err() {
+                    if self.put(&mut operation).await.is_err() {
                         return;
                     }
                 }
@@ -602,10 +621,11 @@ impl OperationManager {
                         Err(_) => return,
                     };
                     operation.status = current.status;
+                    operation.revision = current.revision;
                     let result = self.disable_mountpoint(&target).await;
                     operation.results.push(result);
                     operation.updated_at = unix_time();
-                    if self.put(&operation).await.is_err() {
+                    if self.put(&mut operation).await.is_err() {
                         return;
                     }
                 }
@@ -623,10 +643,11 @@ impl OperationManager {
                         Err(_) => return,
                     };
                     operation.status = current.status;
+                    operation.revision = current.revision;
                     let result = self.change_mountpoint_owner(&target).await;
                     operation.results.push(result);
                     operation.updated_at = unix_time();
-                    if self.put(&operation).await.is_err() {
+                    if self.put(&mut operation).await.is_err() {
                         return;
                     }
                 }
@@ -644,10 +665,11 @@ impl OperationManager {
                         Err(_) => return,
                     };
                     operation.status = current.status;
+                    operation.revision = current.revision;
                     let result = self.drop_session(&target).await;
                     operation.results.push(result);
                     operation.updated_at = unix_time();
-                    if self.put(&operation).await.is_err() {
+                    if self.put(&mut operation).await.is_err() {
                         return;
                     }
                 }
@@ -661,6 +683,7 @@ impl OperationManager {
         if current.status == "CANCELED" {
             return;
         }
+        operation.revision = current.revision;
         let succeeded = operation
             .results
             .iter()
@@ -676,7 +699,7 @@ impl OperationManager {
         }
         .to_owned();
         operation.updated_at = unix_time();
-        let _ = self.put(&operation).await;
+        let _ = self.put(&mut operation).await;
     }
 
     fn spawn_run(&self, operation: BatchOperation, lease_id: i64) {
@@ -686,6 +709,7 @@ impl OperationManager {
             cluster_id: self.cluster_id.clone(),
             caster_id: self.caster_id.clone(),
             health: self.health.clone(),
+            connections: self.connections.clone(),
         };
         let keepalive_manager = Self {
             runtime: self.runtime.clone(),
@@ -693,6 +717,7 @@ impl OperationManager {
             cluster_id: self.cluster_id.clone(),
             caster_id: self.caster_id.clone(),
             health: self.health.clone(),
+            connections: self.connections.clone(),
         };
         let operation_id = operation.operation_id.clone();
         tokio::spawn(async move {
@@ -918,6 +943,9 @@ impl OperationManager {
     }
 
     async fn drop_session(&self, target: &SessionRevision) -> TargetResult {
+        if !self.connection_watch_healthy() {
+            return failed_session(target, "COMMAND_WATCH_UNAVAILABLE");
+        }
         let sessions = match self.runtime.sessions().await {
             Ok(sessions) => sessions,
             Err(error) => return failed_session(target, &error.to_string()),
@@ -945,6 +973,12 @@ impl OperationManager {
             },
             Err(error) => failed_session(target, &error.to_string()),
         }
+    }
+
+    fn connection_watch_healthy(&self) -> bool {
+        self.connections
+            .as_ref()
+            .is_none_or(|connections| connections.is_watch_healthy())
     }
 
     fn operation_key(&self, operation_id: &str) -> String {
@@ -994,26 +1028,37 @@ impl OperationManager {
             .map_err(|error| (503, error.to_string()))
     }
 
-    async fn put(&self, operation: &BatchOperation) -> Result<(), (u16, String)> {
-        self.accounts
-            .etcd_put(
-                &self.operation_key(&operation.operation_id),
-                serde_json::to_vec(operation).map_err(|error| (500, error.to_string()))?,
-                None,
+    async fn put(&self, operation: &mut BatchOperation) -> Result<(), (u16, String)> {
+        let key = self.operation_key(&operation.operation_id);
+        let value = serde_json::to_vec(operation).map_err(|error| (500, error.to_string()))?;
+        let revision = if operation.revision == 0 {
+            Some(
+                self.accounts
+                    .etcd_put(&key, value, None)
+                    .await
+                    .map_err(|error| (503, error.to_string()))?,
             )
-            .await
-            .map(|_| ())
-            .map_err(|error| (503, error.to_string()))
+        } else {
+            self.accounts
+                .etcd_put_if_revision_checked(&key, value, operation.revision as i64)
+                .await
+                .map_err(|error| (503, error.to_string()))?
+        };
+        operation.revision = revision.ok_or((409, "operation changed concurrently".to_owned()))?;
+        Ok(())
     }
 
     async fn load(&self, operation_id: &str) -> Result<BatchOperation, (u16, String)> {
-        let (value, _) = self
+        let (value, revision) = self
             .accounts
             .etcd_get(&self.operation_key(operation_id))
             .await
             .map_err(|error| (503, error.to_string()))?
             .ok_or_else(|| (404, "operation not found".to_owned()))?;
-        serde_json::from_slice(&value).map_err(|error| (503, error.to_string()))
+        let mut operation: BatchOperation =
+            serde_json::from_slice(&value).map_err(|error| (503, error.to_string()))?;
+        operation.revision = revision as u64;
+        Ok(operation)
     }
 }
 

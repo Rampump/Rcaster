@@ -89,6 +89,9 @@ pub struct HealthState {
     process_rss_bytes: AtomicU64,
     process_open_fds: AtomicU64,
     process_usage_available: AtomicBool,
+    clock_offset_nanos: AtomicI64,
+    clock_synchronized: AtomicBool,
+    clock_available: AtomicBool,
     subscribers: AtomicUsize,
     active_connections: AtomicUsize,
     tls_certificate_expiry: AtomicI64,
@@ -417,6 +420,21 @@ impl HealthState {
             .store(available, Ordering::Release);
     }
 
+    pub fn set_clock_health(&self, clock: Option<ClockHealth>) {
+        self.clock_available
+            .store(clock.is_some(), Ordering::Release);
+        self.clock_offset_nanos.store(
+            clock
+                .map(|clock| (clock.offset_seconds * 1_000_000_000.0) as i64)
+                .unwrap_or_default(),
+            Ordering::Release,
+        );
+        self.clock_synchronized.store(
+            clock.is_some_and(|clock| clock.synchronized),
+            Ordering::Release,
+        );
+    }
+
     fn metrics(&self) -> String {
         let ready = usize::from(self.is_ready());
         let expiry = self.tls_certificate_expiry.load(Ordering::Acquire);
@@ -555,15 +573,18 @@ impl HealthState {
                 "NaN".to_owned()
             }
         ));
-        let (clock_offset, clock_synchronized) = clock_health().map_or_else(
-            || ("NaN".to_owned(), "NaN".to_owned()),
-            |clock| {
-                (
-                    format!("{:.9}", clock.offset_seconds),
-                    usize::from(clock.synchronized).to_string(),
-                )
-            },
-        );
+        let clock_available = self.clock_available.load(Ordering::Acquire);
+        let (clock_offset, clock_synchronized) = if clock_available {
+            (
+                format!(
+                    "{:.9}",
+                    self.clock_offset_nanos.load(Ordering::Acquire) as f64 / 1_000_000_000.0
+                ),
+                usize::from(self.clock_synchronized.load(Ordering::Acquire)).to_string(),
+            )
+        } else {
+            ("NaN".to_owned(), "NaN".to_owned())
+        };
         metrics.push_str(&format!(
             "# HELP rcaster_node_clock_offset_seconds Node clock offset from chrony or the kernel discipline.\n# TYPE rcaster_node_clock_offset_seconds gauge\nrcaster_node_clock_offset_seconds {clock_offset}\n# HELP rcaster_node_clock_synchronized Node clock discipline is synchronized.\n# TYPE rcaster_node_clock_synchronized gauge\nrcaster_node_clock_synchronized {clock_synchronized}\n"
         ));
@@ -627,6 +648,7 @@ fn chronyc_clock_health() -> Option<ClockHealth> {
     parse_chronyc_tracking(&String::from_utf8_lossy(&output))
 }
 
+#[cfg(target_os = "linux")]
 fn parse_chronyc_tracking(output: &str) -> Option<ClockHealth> {
     let fields = output.trim().split(',').collect::<Vec<_>>();
     if fields.len() < 14 {
@@ -693,15 +715,24 @@ pub async fn serve_health_with_token<F>(
 where
     F: Future<Output = ()>,
 {
+    let connection_limiter = crate::session_limit::ConnectionLimiter::with_accept_rate(64, 64)
+        .expect("valid health listener budget");
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => {
+                if !connection_limiter.try_accept() {
+                    continue;
+                }
+                let Some(connection_slot) = connection_limiter.acquire() else {
+                    continue;
+                };
                 let (mut stream, _) = accepted?;
                 let state = Arc::clone(&state);
                 let metrics_token = metrics_token.clone();
                 tokio::spawn(async move {
+                    let _connection_slot = connection_slot;
                     let mut request = vec![0_u8; 8192];
                     let read = timeout(Duration::from_secs(5), stream.read(&mut request)).await;
                     let Ok(Ok(read)) = read else {

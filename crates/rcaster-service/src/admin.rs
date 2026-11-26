@@ -218,15 +218,24 @@ pub async fn serve_admin_mtls_reloadable<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let connection_limiter = crate::session_limit::ConnectionLimiter::with_accept_rate(64, 64)
+        .expect("valid admin listener budget");
     let mut shutdown = Box::pin(shutdown);
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => accepted?,
         };
+        if !connection_limiter.try_accept() {
+            continue;
+        }
+        let Some(connection_slot) = connection_limiter.acquire() else {
+            continue;
+        };
         let acceptor = tls.current();
         let state = state.clone();
         tokio::spawn(async move {
+            let _connection_slot = connection_slot;
             let (mut stream, peer) = accepted;
             let Ok(source_ip) =
                 resolve_client_ip(&mut stream, peer.ip(), state.proxy_protocol.as_ref()).await
@@ -304,6 +313,12 @@ async fn handle(
                 json!({"code":"BAD_REQUEST","message":"username and password are required"}),
             ));
         };
+        if !admin_auth::valid_login_username(username) {
+            return Ok(response(
+                400,
+                json!({"code":"BAD_REQUEST","message":"username is invalid"}),
+            ));
+        }
         let ip_key = format!(
             "ip:{}",
             source_ip.map(|ip| ip.to_string()).unwrap_or_default()
@@ -1020,7 +1035,8 @@ async fn handle(
                     state.cluster_id.clone(),
                     state.caster_id.clone(),
                     Some(Arc::clone(&state.ready)),
-                );
+                )
+                .with_connections(Arc::clone(&state.connections));
                 return Ok(
                     match manager
                         .start(
@@ -1179,7 +1195,8 @@ async fn handle(
                     state.cluster_id.clone(),
                     state.caster_id.clone(),
                     Some(Arc::clone(&state.ready)),
-                );
+                )
+                .with_connections(Arc::clone(&state.connections));
                 let result = manager.retry(operation_id).await;
                 audit(
                     state,
@@ -1402,6 +1419,12 @@ async fn handle(
             ));
         }
         if method == "DELETE" && path.starts_with("/admin/v1/sessions/") {
+            if !state.connections.is_watch_healthy() {
+                return Ok(response(
+                    503,
+                    json!({"code":"UNAVAILABLE","message":"connection command watch is unavailable"}),
+                ));
+            }
             let session_id = &path["/admin/v1/sessions/".len()..];
             let sessions = runtime.sessions().await.map_err(|_| ());
             let Ok(sessions) = sessions else {
@@ -4004,7 +4027,8 @@ async fn operation_preview(
             state.cluster_id.clone(),
             state.caster_id.clone(),
             Some(Arc::clone(&state.ready)),
-        );
+        )
+        .with_connections(Arc::clone(&state.connections));
         return manager.preview(body).await;
     }
     let Some(target_generation) = body.get("generation").and_then(Value::as_u64) else {

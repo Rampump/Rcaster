@@ -373,7 +373,7 @@ async fn near_selects_source_from_gga_header_and_forwards_rtcm3() {
     assert!(table.contains("STR;AUTO_NEAR;NEAR;RTCM 3;"));
     assert!(table.contains(";1;0;RCaster;none;N;N;0;virtual=near"));
 
-    let gga = nmea_gga(0.0, 0.0);
+    let gga = nmea_gga(30.0, 0.0);
     let mut client = TcpStream::connect(address).await.expect("near connect");
     client
         .write_all(
@@ -402,8 +402,8 @@ async fn near_selects_source_from_gga_header_and_forwards_rtcm3() {
 #[tokio::test]
 async fn near_switch_sends_cached_station_position_from_new_source() {
     let hub = Arc::new(MountpointHub::new(64).expect("hub"));
-    let source_a = activate_at(&hub, "A", 0.002);
-    let source_b = activate_at(&hub, "B", 0.0);
+    let source_a = activate_at(&hub, "A", 30.002);
+    let source_b = activate_at(&hub, "B", 30.0);
     let header = synthetic_rtcm3(1006);
     let mut demux = ProtocolDemux::new();
     source_b
@@ -428,7 +428,7 @@ async fn near_switch_sends_cached_station_position_from_new_source() {
         start_test_server_for_existing_hub(Arc::clone(&hub), Some(near)).await;
 
     let mut client = TcpStream::connect(address).await.expect("near connect");
-    let initial_gga = nmea_gga(0.002, 0.0);
+    let initial_gga = nmea_gga(30.002, 0.0);
     client
         .write_all(
             format!(
@@ -445,7 +445,7 @@ async fn near_switch_sends_cached_station_position_from_new_source() {
     );
 
     client
-        .write_all(format!("{}\r\n{}\r\n", nmea_gga(0.0, 0.0), nmea_gga(0.0, 0.0)).as_bytes())
+        .write_all(format!("{}\r\n{}\r\n", nmea_gga(30.0, 0.0), nmea_gga(30.0, 0.0)).as_bytes())
         .await
         .expect("near switch GGA");
     let mut received = vec![0_u8; header.len()];
@@ -463,8 +463,8 @@ async fn near_switch_sends_cached_station_position_from_new_source() {
 #[tokio::test]
 async fn near_fails_over_when_active_source_disconnects() {
     let hub = Arc::new(MountpointHub::new(64).expect("hub"));
-    let source_a = activate_at(&hub, "A", 0.002);
-    let source_b = activate_at(&hub, "B", 0.0);
+    let source_a = activate_at(&hub, "A", 30.002);
+    let source_b = activate_at(&hub, "B", 30.0);
     let near = rcaster_service::ntrip_server::NearServerConfig {
         mountpoint: "AUTO_NEAR".to_owned(),
         selector: rcaster_service::near::NearConfig {
@@ -488,7 +488,7 @@ async fn near_fails_over_when_active_source_disconnects() {
         .write_all(
             format!(
                 "GET /AUTO_NEAR HTTP/1.1\r\nNtrip-Version: Ntrip/2.0\r\nNtrip-GGA: {}\r\n\r\n",
-                nmea_gga(0.002, 0.0)
+                nmea_gga(30.002, 0.0)
             )
             .as_bytes(),
         )
@@ -539,7 +539,7 @@ async fn near_fails_over_when_active_source_disconnects() {
 #[tokio::test]
 async fn near_without_alternative_closes_at_no_source_deadline_while_receiving_gga() {
     let hub = Arc::new(MountpointHub::new(64).expect("hub"));
-    let source = activate_at(&hub, "A", 0.0);
+    let source = activate_at(&hub, "A", 30.0);
     let near = rcaster_service::ntrip_server::NearServerConfig {
         mountpoint: "AUTO_NEAR".to_owned(),
         selector: rcaster_service::near::NearConfig {
@@ -562,7 +562,7 @@ async fn near_without_alternative_closes_at_no_source_deadline_while_receiving_g
         .write_all(
             format!(
                 "GET /AUTO_NEAR HTTP/1.1\r\nNtrip-Version: Ntrip/2.0\r\nNtrip-GGA: {}\r\n\r\n",
-                nmea_gga(0.0, 0.0)
+                nmea_gga(30.0, 0.0)
             )
             .as_bytes(),
         )
@@ -578,7 +578,7 @@ async fn near_without_alternative_closes_at_no_source_deadline_while_receiving_g
     let writer_task = tokio::spawn(async move {
         for _ in 0..20 {
             if writer
-                .write_all(format!("{}\r\n", nmea_gga(0.0, 0.0)).as_bytes())
+                .write_all(format!("{}\r\n", nmea_gga(30.0, 0.0)).as_bytes())
                 .await
                 .is_err()
             {
@@ -1225,6 +1225,7 @@ async fn start_test_server_with_hub() -> (
         SessionLimitConfig::default(),
         None,
         None,
+        None,
     )
     .await
 }
@@ -1284,6 +1285,7 @@ async fn start_test_server_with_limits(
         session_limits,
         None,
         None,
+        None,
     )
     .await;
     (address, shutdown_tx, server)
@@ -1309,6 +1311,7 @@ async fn start_test_server_with_admission(
             read_timeout: Duration::from_secs(1),
             str_refresh: true,
         }),
+        None,
         None,
     )
     .await
@@ -1350,6 +1353,7 @@ async fn start_test_near_server() -> (
             no_source_timeout: Duration::from_secs(1),
             advertise: true,
         }),
+        Some(near_test_accounts()),
     )
     .await
 }
@@ -1359,6 +1363,7 @@ async fn start_test_server_with_admission_inner(
     session_limits: SessionLimitConfig,
     source_admission: Option<SourceAdmissionConfig>,
     near: Option<rcaster_service::ntrip_server::NearServerConfig>,
+    accounts: Option<AccountDirectory>,
 ) -> (
     SocketAddr,
     oneshot::Sender<()>,
@@ -1369,6 +1374,7 @@ async fn start_test_server_with_admission_inner(
         session_limits,
         source_admission,
         near,
+        accounts,
     )
     .await;
     (address, shutdown_tx, server)
@@ -1379,6 +1385,7 @@ async fn start_test_server_with_admission_inner_with_hub(
     session_limits: SessionLimitConfig,
     source_admission: Option<SourceAdmissionConfig>,
     near: Option<rcaster_service::ntrip_server::NearServerConfig>,
+    accounts: Option<AccountDirectory>,
 ) -> (
     SocketAddr,
     Arc<MountpointHub>,
@@ -1407,7 +1414,7 @@ async fn start_test_server_with_admission_inner_with_hub(
             relay_manager: None,
             source_admission,
             near,
-            accounts: None,
+            accounts,
             metrics: None,
             connections: None,
             proxy_protocol: None,
@@ -1528,6 +1535,45 @@ fn synthetic_rtcm3(message_number: u16) -> Vec<u8> {
     let crc = crc24q(&frame);
     frame.extend_from_slice(&crc.to_be_bytes()[1..]);
     frame
+}
+
+fn near_test_accounts() -> AccountDirectory {
+    AccountDirectory::static_snapshot(
+        AccountSnapshot::new(
+            [User {
+                schema_version: 1,
+                mod_revision: 1,
+                user_id: "owner".to_owned(),
+                username: "owner".to_owned(),
+                password_hash: "hash".to_owned(),
+                auth_version: 1,
+                enabled: true,
+                ntrip_enabled: true,
+                web_enabled: false,
+                role: UserRole::User,
+                created_at: "0".to_owned(),
+                updated_at: "0".to_owned(),
+            }],
+            [Mountpoint {
+                schema_version: 1,
+                mod_revision: 1,
+                mountpoint: "C63".to_owned(),
+                owner_user_id: "owner".to_owned(),
+                enabled: true,
+                ntrip1_upload_password_hash: None,
+                advertise: true,
+                region: None,
+                latitude: Some(30.0),
+                longitude: Some(0.0),
+                coverage_radius_m: None,
+                str_fields: None,
+                source_expectation: None,
+                created_at: "0".to_owned(),
+                updated_at: "0".to_owned(),
+            }],
+        )
+        .expect("NEAR accounts"),
+    )
 }
 
 fn activate_at(

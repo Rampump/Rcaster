@@ -137,12 +137,12 @@ impl Updater {
             if seen.contains(&fingerprint) {
                 continue;
             }
-            seen.insert(fingerprint);
             if let Err(error) = self.apply_command(&command).await {
                 self.write_state(&command, "FAILED", Some(&error.to_string()))
-                    .await;
+                    .await?;
                 eprintln!("rcaster-updater: upgrade command failed: {error}");
             }
+            seen.insert(fingerprint);
         }
         Ok(())
     }
@@ -249,7 +249,7 @@ impl Updater {
                 },
                 None,
             )
-            .await;
+            .await?;
             return Ok(());
         }
 
@@ -264,17 +264,18 @@ impl Updater {
             self.write_slot_state(&state)?;
             self.start_child().await?;
             if self.wait_healthy().await.is_ok() {
-                self.write_state(command, "ROLLED_BACK", Some(&error)).await;
+                self.write_state(command, "ROLLED_BACK", Some(&error))
+                    .await?;
             } else {
                 self.write_state(
                     command,
                     "FAILED",
                     Some("both the new binary and the previous slot are unhealthy"),
                 )
-                .await;
+                .await?;
             }
         } else {
-            self.write_state(command, "FAILED", Some(&error)).await;
+            self.write_state(command, "FAILED", Some(&error)).await?;
         }
         eprintln!("rcaster-updater: {error}");
         Ok(())
@@ -434,9 +435,14 @@ impl Updater {
         self.stop_child().await;
     }
 
-    async fn write_state(&mut self, command: &Value, status: &str, error: Option<&str>) {
+    async fn write_state(
+        &mut self,
+        command: &Value,
+        status: &str,
+        error: Option<&str>,
+    ) -> UpdaterResult<()> {
         let Some(operation_id) = command["operation_id"].as_str() else {
-            return;
+            return Ok(());
         };
         let key = format!(
             "/rcaster/{}/runtime/upgrade-states/{operation_id}/{}",
@@ -451,8 +457,17 @@ impl Updater {
             "updated_at": now_timestamp(),
             "error": error,
         });
-        if let Ok(value) = serde_json::to_vec(&value) {
-            let _ = self.client.put(key, value, None).await;
+        let value = serde_json::to_vec(&value)?;
+        loop {
+            if self
+                .client
+                .put(key.clone(), value.clone(), None)
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -704,20 +719,24 @@ fn now_timestamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::time::Duration;
     use std::{
         io::{Read, Write},
         net::TcpListener,
         thread,
-        time::Duration,
     };
 
     use super::{
-        Slot, SlotState, Updater, command_target_matches, connect_etcd, download_artifact,
-        ensure_staging_space, inactive_slot, install_staged_artifact, probe_health,
-        read_slot_state, repaired_slot_state, request_graceful_stop, terminal_upgrade_state,
-        valid_identifier,
+        Slot, SlotState, command_target_matches, download_artifact, inactive_slot,
+        install_staged_artifact, probe_health, read_slot_state, repaired_slot_state,
+        terminal_upgrade_state, valid_identifier,
     };
+    #[cfg(unix)]
+    use super::{Updater, connect_etcd, ensure_staging_space, request_graceful_stop};
+    #[cfg(unix)]
     use crate::config::UpdaterConfig;
+    #[cfg(unix)]
     use rcaster_service::upgrade::UpgradePolicy;
 
     #[test]
@@ -898,6 +917,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn graceful_stop_sends_sigterm_before_kill() {
         let mut child = tokio::process::Command::new("sh")

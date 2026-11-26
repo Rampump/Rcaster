@@ -88,6 +88,21 @@ async fn source_disconnect_closes_subscriber_channels() {
 }
 
 #[tokio::test]
+async fn local_source_replacement_changes_the_generation() {
+    let hub = MountpointHub::new(16).expect("hub");
+    let first = hub.claim_source("C63").expect("first source");
+    activate(&first);
+    let first_generation = hub.source_generation("C63").expect("first generation");
+    assert_eq!(first.generation(), first_generation);
+    drop(first);
+
+    let second = hub.claim_source("C63").expect("second source");
+    activate(&second);
+    let second_generation = hub.source_generation("C63").expect("second generation");
+    assert_ne!(first_generation, second_generation);
+}
+
+#[tokio::test]
 async fn slow_subscriber_observes_bounded_lag() {
     let hub = MountpointHub::new(2).expect("hub");
     let source = hub.claim_source("C63").expect("source");

@@ -252,14 +252,23 @@ pub async fn serve_public<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let connection_limiter = crate::session_limit::ConnectionLimiter::with_accept_rate(512, 256)
+        .expect("valid public listener budget");
     let mut shutdown = Box::pin(shutdown);
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => accepted?,
         };
+        if !connection_limiter.try_accept() {
+            continue;
+        }
+        let Some(connection_slot) = connection_limiter.acquire() else {
+            continue;
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _connection_slot = connection_slot;
             let peer_ip = accepted.1.ip().to_string();
             let mut stream = accepted.0;
             let _ = timeout(
@@ -294,15 +303,24 @@ pub async fn serve_public_tls_reloadable<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let connection_limiter = crate::session_limit::ConnectionLimiter::with_accept_rate(512, 256)
+        .expect("valid public listener budget");
     let mut shutdown = Box::pin(shutdown);
     loop {
         let accepted = tokio::select! {
             _ = &mut shutdown => return Ok(()),
             accepted = listener.accept() => accepted?,
         };
+        if !connection_limiter.try_accept() {
+            continue;
+        }
+        let Some(connection_slot) = connection_limiter.acquire() else {
+            continue;
+        };
         let acceptor = tls.current();
         let state = state.clone();
         tokio::spawn(async move {
+            let _connection_slot = connection_slot;
             let (mut stream, peer) = accepted;
             let Ok(peer_ip) =
                 resolve_client_ip(&mut stream, peer.ip(), state.proxy_protocol.as_ref()).await
@@ -376,6 +394,14 @@ where
                 .write_all(&response(400, json!({"code":"BAD_REQUEST"})))
                 .await;
         };
+        if !crate::admin_auth::valid_login_username(username) {
+            return stream
+                .write_all(&response(
+                    400,
+                    json!({"code":"BAD_REQUEST","message":"username is invalid"}),
+                ))
+                .await;
+        }
         let ip_key = format!("ip:{peer_ip}");
         let user_key = format!("user:{username}");
         let mut retry_after = state
@@ -937,8 +963,7 @@ where
 }
 
 async fn monitor_snapshot(state: &PublicState, mountpoint: &str) -> Option<(Option<u64>, Value)> {
-    let mut records = public_records(state).await;
-    let entry = records.remove(mountpoint)?;
+    let entry = public_record(state, mountpoint).await?;
     let source_generation = entry.source_generation;
     let health = state.hub.source_health(mountpoint);
     let profile = state.hub.source_profile(mountpoint);
@@ -975,6 +1000,35 @@ async fn monitor_snapshot(state: &PublicState, mountpoint: &str) -> Option<(Opti
     ))
 }
 
+async fn public_record(state: &PublicState, mountpoint: &str) -> Option<PublicRecord> {
+    let accounts = state.accounts.snapshot();
+    let configured = accounts
+        .mountpoint(mountpoint)
+        .filter(|mountpoint| mountpoint.enabled && mountpoint.advertise)?;
+    let (mut record, source_generation) = if let Some(runtime) = &state.runtime {
+        if let Some(route) = runtime.source_route(mountpoint).await {
+            (route.str_record, Some(route.source_generation))
+        } else {
+            (
+                state.hub.source_record(mountpoint)?,
+                state.hub.source_generation(mountpoint),
+            )
+        }
+    } else {
+        (
+            state.hub.source_record(mountpoint)?,
+            state.hub.source_generation(mountpoint),
+        )
+    };
+    apply_configured_position(&mut record, Some(configured));
+    Some(PublicRecord {
+        record,
+        region: configured.region.clone(),
+        coverage_radius_m: configured.coverage_radius_m,
+        source_generation,
+    })
+}
+
 fn observation_view(observation: &rcaster_core::protocol::GnssObservation) -> Value {
     json!({
         "system": observation.system.as_str(),
@@ -1004,6 +1058,7 @@ async fn public_records(state: &PublicState) -> BTreeMap<String, PublicRecord> {
             let configured = accounts.mountpoint(&record.mountpoint);
             let region = configured.and_then(|mountpoint| mountpoint.region.clone());
             let coverage_radius_m = configured.and_then(|mountpoint| mountpoint.coverage_radius_m);
+            let source_generation = state.hub.source_generation(&record.mountpoint);
             apply_configured_position(&mut record, configured);
             (
                 record.mountpoint.clone(),
@@ -1011,7 +1066,7 @@ async fn public_records(state: &PublicState) -> BTreeMap<String, PublicRecord> {
                     record,
                     region,
                     coverage_radius_m,
-                    source_generation: None,
+                    source_generation,
                 },
             )
         })

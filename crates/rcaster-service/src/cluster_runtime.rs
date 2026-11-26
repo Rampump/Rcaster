@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -27,7 +27,7 @@ use crate::{
         SourceAdmissionRequest, SourcePermit, release_session,
     },
     blacklist::{BlacklistRule, BlacklistWatcher, delete_blacklist_rule, upsert_blacklist_rule},
-    config::ConfigWatcher,
+    config::{ConfigState, ConfigWatcher},
     coordinator_admission::AdmissionCoordinator,
     coordinator_grpc::GrpcAdmissionClient,
     etcd_watch_metrics::EtcdWatchMetrics,
@@ -83,9 +83,149 @@ pub struct ClusterRuntime {
     keepalive_task: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
 enum AdmissionBackend {
     Local(Arc<AdmissionCoordinator>),
     Grpc(GrpcAdmissionClient),
+}
+
+#[derive(Clone)]
+struct AdmissionContext {
+    backend: AdmissionBackend,
+    options: ClusterRuntimeOptions,
+    lease_id: Arc<AtomicI64>,
+    config: ConfigState,
+    healthy: Arc<AtomicBool>,
+    blacklist_healthy: Arc<AtomicBool>,
+    sources_healthy: Arc<AtomicBool>,
+    accounts_healthy: Arc<AtomicBool>,
+}
+
+impl AdmissionContext {
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+            && self.config.is_healthy()
+            && self.blacklist_healthy.load(Ordering::Acquire)
+            && self.sources_healthy.load(Ordering::Acquire)
+            && self.accounts_healthy.load(Ordering::Acquire)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_client_with_metadata(
+        &self,
+        user_id: &str,
+        mountpoint: &str,
+        client_ip: &str,
+        max_sessions: usize,
+        ip_max_sessions: Option<usize>,
+        ntrip_version: Option<String>,
+        software: Option<String>,
+        auth_version: u64,
+        user_mod_revision: u64,
+        mountpoint_mod_revision: u64,
+    ) -> Result<ClientPermit, AdmissionError> {
+        if !self.is_healthy() {
+            return Err(AdmissionError::CoordinatorUnavailable);
+        }
+        let mut session = SessionRecord::client(
+            unique_id("s"),
+            user_id,
+            mountpoint,
+            &self.options.caster_id,
+            &self.options.runtime_epoch,
+            client_ip,
+            now_timestamp(),
+        );
+        session.ntrip_version = ntrip_version;
+        session.software = software;
+        session = session.with_account_revisions(
+            auth_version,
+            user_mod_revision,
+            mountpoint_mod_revision,
+        );
+        let request = ClientAdmissionRequest::new(
+            session,
+            max_sessions,
+            ip_max_sessions,
+            self.config.snapshot(),
+        );
+        let mut backend = self.backend.clone();
+        match &mut backend {
+            AdmissionBackend::Local(coordinator) => {
+                coordinator
+                    .admit_client(self.lease_id.load(Ordering::Acquire), request)
+                    .await
+            }
+            AdmissionBackend::Grpc(client) => {
+                client
+                    .admit_client(self.lease_id.load(Ordering::Acquire), request)
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_source_with_metadata(
+        &self,
+        user_id: &str,
+        mountpoint: &str,
+        connection_id: &str,
+        max_sessions: usize,
+        ntrip_version: Option<String>,
+        software: Option<String>,
+        auth_version: u64,
+        user_mod_revision: u64,
+        mountpoint_mod_revision: u64,
+    ) -> Result<ClusterSourcePermit, AdmissionError> {
+        if !self.is_healthy() {
+            return Err(AdmissionError::CoordinatorUnavailable);
+        }
+        let timestamp = now_timestamp();
+        let mut session = SessionRecord::source(
+            unique_id("s"),
+            user_id,
+            mountpoint,
+            &self.options.caster_id,
+            &self.options.runtime_epoch,
+            timestamp.clone(),
+        );
+        session.ntrip_version = ntrip_version;
+        session.software = software;
+        session = session.with_account_revisions(
+            auth_version,
+            user_mod_revision,
+            mountpoint_mod_revision,
+        );
+        let claim = SourceClaimRequest::new(
+            mountpoint,
+            &self.options.caster_id,
+            connection_id,
+            &self.options.runtime_epoch,
+            &self.options.relay_endpoint,
+            user_id,
+            timestamp,
+        );
+        let request =
+            SourceAdmissionRequest::new(session, max_sessions, claim, self.config.snapshot());
+        let mut backend = self.backend.clone();
+        match &mut backend {
+            AdmissionBackend::Local(coordinator) => coordinator
+                .admit_source(self.lease_id.load(Ordering::Acquire), request)
+                .await
+                .map(|permit| ClusterSourcePermit::Local(Box::new(permit))),
+            AdmissionBackend::Grpc(client) => {
+                let permit = client
+                    .admit_source(self.lease_id.load(Ordering::Acquire), request)
+                    .await?;
+                Ok(ClusterSourcePermit::Grpc {
+                    session: Box::new(permit.session),
+                    mountpoint: mountpoint.to_owned(),
+                    connection_id: connection_id.to_owned(),
+                    source_generation: permit.source_generation,
+                })
+            }
+        }
+    }
 }
 
 pub enum ClusterSourcePermit {
@@ -133,6 +273,7 @@ impl ClusterSourcePermit {
 #[derive(Clone)]
 pub struct SharedClusterRuntime {
     inner: Arc<Mutex<Option<ClusterRuntime>>>,
+    admission: Arc<RwLock<Option<AdmissionContext>>>,
     auth_failure_fallback: Arc<AtomicU64>,
     admission_latency_micros: Arc<AtomicU64>,
 }
@@ -440,43 +581,20 @@ impl ClusterRuntime {
         user_mod_revision: u64,
         mountpoint_mod_revision: u64,
     ) -> Result<ClientPermit, AdmissionError> {
-        if !self.is_healthy() {
-            return Err(AdmissionError::CoordinatorUnavailable);
-        }
-        let mut session = SessionRecord::client(
-            unique_id("s"),
-            user_id,
-            mountpoint,
-            &self.options.caster_id,
-            &self.options.runtime_epoch,
-            client_ip,
-            now_timestamp(),
-        );
-        session.ntrip_version = ntrip_version;
-        session.software = software;
-        session = session.with_account_revisions(
-            auth_version,
-            user_mod_revision,
-            mountpoint_mod_revision,
-        );
-        let request = ClientAdmissionRequest::new(
-            session,
-            max_sessions,
-            ip_max_sessions,
-            self.config.snapshot(),
-        );
-        match &mut self.backend {
-            AdmissionBackend::Local(coordinator) => {
-                coordinator
-                    .admit_client(self.lease_id.load(Ordering::Acquire), request)
-                    .await
-            }
-            AdmissionBackend::Grpc(client) => {
-                client
-                    .admit_client(self.lease_id.load(Ordering::Acquire), request)
-                    .await
-            }
-        }
+        self.admission_context()
+            .admit_client_with_metadata(
+                user_id,
+                mountpoint,
+                client_ip,
+                max_sessions,
+                ip_max_sessions,
+                ntrip_version,
+                software,
+                auth_version,
+                user_mod_revision,
+                mountpoint_mod_revision,
+            )
+            .await
     }
 
     pub async fn admit_source(
@@ -513,52 +631,31 @@ impl ClusterRuntime {
         user_mod_revision: u64,
         mountpoint_mod_revision: u64,
     ) -> Result<ClusterSourcePermit, AdmissionError> {
-        if !self.is_healthy() {
-            return Err(AdmissionError::CoordinatorUnavailable);
-        }
-        let timestamp = now_timestamp();
-        let mut session = SessionRecord::source(
-            unique_id("s"),
-            user_id,
-            mountpoint,
-            &self.options.caster_id,
-            &self.options.runtime_epoch,
-            timestamp.clone(),
-        );
-        session.ntrip_version = ntrip_version;
-        session.software = software;
-        session = session.with_account_revisions(
-            auth_version,
-            user_mod_revision,
-            mountpoint_mod_revision,
-        );
-        let claim = SourceClaimRequest::new(
-            mountpoint,
-            &self.options.caster_id,
-            connection_id,
-            &self.options.runtime_epoch,
-            &self.options.relay_endpoint,
-            user_id,
-            timestamp,
-        );
-        let request =
-            SourceAdmissionRequest::new(session, max_sessions, claim, self.config.snapshot());
-        match &mut self.backend {
-            AdmissionBackend::Local(coordinator) => coordinator
-                .admit_source(self.lease_id.load(Ordering::Acquire), request)
-                .await
-                .map(|permit| ClusterSourcePermit::Local(Box::new(permit))),
-            AdmissionBackend::Grpc(client) => {
-                let permit = client
-                    .admit_source(self.lease_id.load(Ordering::Acquire), request)
-                    .await?;
-                Ok(ClusterSourcePermit::Grpc {
-                    session: Box::new(permit.session),
-                    mountpoint: mountpoint.to_owned(),
-                    connection_id: connection_id.to_owned(),
-                    source_generation: permit.source_generation,
-                })
-            }
+        self.admission_context()
+            .admit_source_with_metadata(
+                user_id,
+                mountpoint,
+                connection_id,
+                max_sessions,
+                ntrip_version,
+                software,
+                auth_version,
+                user_mod_revision,
+                mountpoint_mod_revision,
+            )
+            .await
+    }
+
+    fn admission_context(&self) -> AdmissionContext {
+        AdmissionContext {
+            backend: self.backend.clone(),
+            options: self.options.clone(),
+            lease_id: Arc::clone(&self.lease_id),
+            config: self.config.state(),
+            healthy: Arc::clone(&self.healthy),
+            blacklist_healthy: self.blacklist.health_handle(),
+            sources_healthy: self.sources.health_handle(),
+            accounts_healthy: self.accounts.directory().health_handle(),
         }
     }
 
@@ -1195,14 +1292,9 @@ impl SharedClusterRuntime {
         options: ClusterRuntimeOptions,
         account_seed: AccountSnapshot,
     ) -> Result<Self, ClusterRuntimeError> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Some(
-                ClusterRuntime::start_with_accounts(client, coordinator, options, account_seed)
-                    .await?,
-            ))),
-            auth_failure_fallback: Arc::new(AtomicU64::new(0)),
-            admission_latency_micros: Arc::new(AtomicU64::new(0)),
-        })
+        let runtime =
+            ClusterRuntime::start_with_accounts(client, coordinator, options, account_seed).await?;
+        Ok(Self::from_runtime(runtime))
     }
 
     pub async fn start_grpc(
@@ -1210,13 +1302,8 @@ impl SharedClusterRuntime {
         coordinator_endpoint: &str,
         options: ClusterRuntimeOptions,
     ) -> Result<Self, ClusterRuntimeError> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Some(
-                ClusterRuntime::start_grpc(client, coordinator_endpoint, options).await?,
-            ))),
-            auth_failure_fallback: Arc::new(AtomicU64::new(0)),
-            admission_latency_micros: Arc::new(AtomicU64::new(0)),
-        })
+        let runtime = ClusterRuntime::start_grpc(client, coordinator_endpoint, options).await?;
+        Ok(Self::from_runtime(runtime))
     }
 
     pub async fn start_with_grpc_client(
@@ -1239,19 +1326,23 @@ impl SharedClusterRuntime {
         options: ClusterRuntimeOptions,
         account_seed: AccountSnapshot,
     ) -> Result<Self, ClusterRuntimeError> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Some(
-                ClusterRuntime::start_with_grpc_client_and_accounts(
-                    client,
-                    admission,
-                    options,
-                    account_seed,
-                )
-                .await?,
-            ))),
+        let runtime = ClusterRuntime::start_with_grpc_client_and_accounts(
+            client,
+            admission,
+            options,
+            account_seed,
+        )
+        .await?;
+        Ok(Self::from_runtime(runtime))
+    }
+
+    fn from_runtime(runtime: ClusterRuntime) -> Self {
+        Self {
+            admission: Arc::new(RwLock::new(Some(runtime.admission_context()))),
+            inner: Arc::new(Mutex::new(Some(runtime))),
             auth_failure_fallback: Arc::new(AtomicU64::new(0)),
             admission_latency_micros: Arc::new(AtomicU64::new(0)),
-        })
+        }
     }
 
     pub async fn admit_client(
@@ -1263,18 +1354,19 @@ impl SharedClusterRuntime {
         ip_max_sessions: Option<usize>,
     ) -> Result<ClientPermit, AdmissionError> {
         let started = Instant::now();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .as_mut()
-            .ok_or(AdmissionError::CoordinatorUnavailable)?
-            .admit_client(
+        let admission = self.admission_context()?;
+        let result = admission
+            .admit_client_with_metadata(
                 user_id,
                 mountpoint,
                 client_ip,
                 max_sessions,
                 ip_max_sessions,
+                None,
+                None,
+                0,
+                0,
+                0,
             )
             .await;
         self.record_admission_latency(started);
@@ -1296,12 +1388,8 @@ impl SharedClusterRuntime {
         mountpoint_mod_revision: u64,
     ) -> Result<ClientPermit, AdmissionError> {
         let started = Instant::now();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .as_mut()
-            .ok_or(AdmissionError::CoordinatorUnavailable)?
+        let admission = self.admission_context()?;
+        let result = admission
             .admit_client_with_metadata(
                 user_id,
                 mountpoint,
@@ -1327,13 +1415,19 @@ impl SharedClusterRuntime {
         max_sessions: usize,
     ) -> Result<ClusterSourcePermit, AdmissionError> {
         let started = Instant::now();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .as_mut()
-            .ok_or(AdmissionError::CoordinatorUnavailable)?
-            .admit_source(user_id, mountpoint, connection_id, max_sessions)
+        let admission = self.admission_context()?;
+        let result = admission
+            .admit_source_with_metadata(
+                user_id,
+                mountpoint,
+                connection_id,
+                max_sessions,
+                None,
+                None,
+                0,
+                0,
+                0,
+            )
             .await;
         self.record_admission_latency(started);
         result
@@ -1353,12 +1447,8 @@ impl SharedClusterRuntime {
         mountpoint_mod_revision: u64,
     ) -> Result<ClusterSourcePermit, AdmissionError> {
         let started = Instant::now();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .as_mut()
-            .ok_or(AdmissionError::CoordinatorUnavailable)?
+        let admission = self.admission_context()?;
+        let result = admission
             .admit_source_with_metadata(
                 user_id,
                 mountpoint,
@@ -1864,7 +1954,19 @@ impl SharedClusterRuntime {
             .await
     }
 
+    fn admission_context(&self) -> Result<AdmissionContext, AdmissionError> {
+        self.admission
+            .read()
+            .map_err(|_| AdmissionError::CoordinatorUnavailable)?
+            .clone()
+            .ok_or(AdmissionError::CoordinatorUnavailable)
+    }
+
     pub async fn shutdown(&self) -> Result<(), AdmissionError> {
+        self.admission
+            .write()
+            .map_err(|_| AdmissionError::CoordinatorUnavailable)?
+            .take();
         let runtime = self.inner.lock().await.take();
         match runtime {
             Some(runtime) => runtime.shutdown().await,

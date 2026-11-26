@@ -157,6 +157,10 @@ impl AccountDirectory {
         self.healthy.load(Ordering::Acquire)
     }
 
+    pub(crate) fn health_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.healthy)
+    }
+
     pub fn is_writable(&self) -> bool {
         self.client.is_some() || self.store.is_some()
     }
@@ -275,6 +279,25 @@ impl AccountDirectory {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tickets.retain(|_, ticket| ticket.expires_at > now);
         tickets.remove(ticket_id).map(|ticket| ticket.value)
+    }
+
+    pub fn prune_expired_local_auth(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.local_admin_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, session| session.expires_at > now);
+        self.local_public_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, session| session.expires_at > now);
+        self.local_monitor_tickets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, ticket| ticket.expires_at > now);
     }
 
     pub fn blacklist_rules(&self) -> Vec<BlacklistRule> {
@@ -564,6 +587,32 @@ impl AccountDirectory {
             )
             .await?
             .succeeded())
+    }
+
+    pub(crate) async fn etcd_put_if_revision_checked(
+        &self,
+        key: &str,
+        value: Vec<u8>,
+        revision: i64,
+    ) -> Result<Option<u64>, AccountDirectoryError> {
+        let (client, _) = self.writable()?;
+        let response = client
+            .lock()
+            .await
+            .txn(
+                Txn::new()
+                    .when([Compare::mod_revision(key, CompareOp::Equal, revision)])
+                    .and_then([TxnOp::put(key, value, None)]),
+            )
+            .await?;
+        if !response.succeeded() {
+            return Ok(None);
+        }
+        response
+            .header()
+            .map(|header| header.revision() as u64)
+            .ok_or(AccountDirectoryError::InvalidRecord)
+            .map(Some)
     }
 
     pub async fn update_user_password_hash(
@@ -870,7 +919,8 @@ impl AccountDirectory {
         mut user: User,
         expected_revision: Option<u64>,
     ) -> Result<u64, AccountDirectoryError> {
-        let current_snapshot = self.snapshot();
+        let store = store.lock().await;
+        let current_snapshot = store.load()?;
         let current = current_snapshot.user_by_id(&user.user_id).cloned();
         match (expected_revision, current.as_ref()) {
             (Some(expected), Some(current)) if current.mod_revision == expected => {}
@@ -896,7 +946,8 @@ impl AccountDirectory {
             .collect::<Vec<_>>();
         users.push(user.clone());
         let snapshot = AccountSnapshot::new(users, current_snapshot.mountpoints().cloned())?;
-        store.lock().await.replace(&snapshot)?;
+        store.replace(&snapshot)?;
+        drop(store);
         self.replace_snapshot(snapshot);
         Ok(user.mod_revision)
     }
@@ -907,7 +958,8 @@ impl AccountDirectory {
         user_id: &str,
         expected_revision: u64,
     ) -> Result<(), AccountDirectoryError> {
-        let current = self.snapshot();
+        let store = store.lock().await;
+        let current = store.load()?;
         let user = current
             .user_by_id(user_id)
             .ok_or(AccountDirectoryError::NotFound)?;
@@ -927,7 +979,8 @@ impl AccountDirectory {
                 .cloned(),
             current.mountpoints().cloned(),
         )?;
-        store.lock().await.replace(&snapshot)?;
+        store.replace(&snapshot)?;
+        drop(store);
         self.replace_snapshot(snapshot);
         Ok(())
     }
@@ -938,7 +991,8 @@ impl AccountDirectory {
         mut mountpoint: Mountpoint,
         expected_revision: Option<u64>,
     ) -> Result<u64, AccountDirectoryError> {
-        let current = self.snapshot();
+        let store = store.lock().await;
+        let current = store.load()?;
         let existing = current.mountpoint(&mountpoint.mountpoint).cloned();
         match (expected_revision, existing.as_ref()) {
             (Some(expected), Some(existing)) if existing.mod_revision == expected => {}
@@ -962,7 +1016,8 @@ impl AccountDirectory {
             .collect::<Vec<_>>();
         mountpoints.push(mountpoint.clone());
         let snapshot = AccountSnapshot::new(current.users().cloned(), mountpoints)?;
-        store.lock().await.replace(&snapshot)?;
+        store.replace(&snapshot)?;
+        drop(store);
         self.replace_snapshot(snapshot);
         Ok(mountpoint.mod_revision)
     }
@@ -973,7 +1028,8 @@ impl AccountDirectory {
         mountpoint: &str,
         expected_revision: u64,
     ) -> Result<(), AccountDirectoryError> {
-        let current = self.snapshot();
+        let store = store.lock().await;
+        let current = store.load()?;
         let existing = current
             .mountpoint(mountpoint)
             .ok_or(AccountDirectoryError::NotFound)?;
@@ -987,7 +1043,8 @@ impl AccountDirectory {
                 .filter(|existing| existing.mountpoint != mountpoint)
                 .cloned(),
         )?;
-        store.lock().await.replace(&snapshot)?;
+        store.replace(&snapshot)?;
+        drop(store);
         self.replace_snapshot(snapshot);
         Ok(())
     }
@@ -1382,5 +1439,43 @@ async fn stop_or_sleep(stop: &mut oneshot::Receiver<()>) -> bool {
     tokio::select! {
         _ = &mut *stop => true,
         _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccountDirectory;
+    use rcaster_core::account::AccountSnapshot;
+
+    #[test]
+    fn local_auth_cleanup_removes_all_expired_entries() {
+        let directory = AccountDirectory::static_snapshot(AccountSnapshot::default());
+        directory.local_admin_session_put("admin", Vec::new(), 1);
+        directory.local_public_session_put("public", Vec::new(), 1);
+        directory.local_monitor_ticket_put("ticket", Vec::new(), 1);
+
+        directory.prune_expired_local_auth();
+
+        assert!(
+            directory
+                .local_admin_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert!(
+            directory
+                .local_public_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert!(
+            directory
+                .local_monitor_tickets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 }

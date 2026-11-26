@@ -130,6 +130,28 @@ pub struct ConfigWatcher {
     task: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ConfigState {
+    snapshot: Arc<RwLock<ConfigSnapshot>>,
+    healthy: Arc<AtomicBool>,
+}
+
+impl ConfigState {
+    pub(crate) fn snapshot(&self) -> ConfigSnapshot {
+        self.snapshot
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_else(|_| ConfigSnapshot {
+                config: CasterConfig::new(1),
+                revision: 0,
+            })
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
     InvalidIdentifier(&'static str),
@@ -297,6 +319,13 @@ pub async fn load_config_snapshot(
 }
 
 impl ConfigWatcher {
+    pub(crate) fn state(&self) -> ConfigState {
+        ConfigState {
+            snapshot: Arc::clone(&self.snapshot),
+            healthy: Arc::clone(&self.healthy),
+        }
+    }
+
     pub async fn start(client: Client, cluster_id: &str) -> Result<Self, ConfigError> {
         Self::start_with_metrics(client, cluster_id, Arc::new(EtcdWatchMetrics::default())).await
     }

@@ -82,6 +82,10 @@ impl SourceWatcher {
         self.healthy.load(Ordering::Acquire)
     }
 
+    pub(crate) fn health_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.healthy)
+    }
+
     pub async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());

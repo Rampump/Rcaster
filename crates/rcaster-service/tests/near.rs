@@ -100,6 +100,47 @@ fn spatial_index_matches_full_scan() {
 }
 
 #[test]
+fn spatial_index_wraps_across_the_date_line() {
+    let candidates = vec![source("WEST", 0.0, 179.99), source("EAST", 0.0, -179.99)];
+    let index = NearIndex::new(&candidates);
+
+    assert_eq!(
+        index
+            .nearest(position(0.0, 180.0), 5_000.0)
+            .map(|source| source.mountpoint.as_str()),
+        Some("EAST")
+    );
+}
+
+#[test]
+fn origin_is_not_a_valid_source_position() {
+    let mut record =
+        StrRecord::from_profile("ORIGIN", &rcaster_core::protocol::DataProfile::default());
+    record.latitude = "0.0000000".to_owned();
+    record.longitude = "0.0000000".to_owned();
+
+    assert!(NearSource::from_str_record(&record).is_none());
+}
+
+#[test]
+fn selection_is_not_committed_before_subscription_succeeds() {
+    let mut selector = NearSelector::new(NearConfig::default());
+    let now = Instant::now();
+    let candidates = [source("A", 0.0, 0.001)];
+    let index = NearIndex::new(&candidates);
+
+    assert_eq!(
+        selector
+            .propose_update_indexed(&gga(0.0, 0.0, 0.8), &index, now)
+            .as_deref(),
+        Some("A")
+    );
+    assert_eq!(selector.current(), None);
+    selector.commit("A");
+    assert_eq!(selector.current(), Some("A"));
+}
+
+#[test]
 fn hysteresis_prevents_nearby_source_flapping() {
     let mut selector = NearSelector::new(NearConfig::default());
     let now = Instant::now();

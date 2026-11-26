@@ -87,12 +87,12 @@ impl StrRecord {
         Self {
             mountpoint: clean_field(mountpoint),
             identifier: clean_field(identifier),
-            format: format.to_owned(),
+            format: clean_field(format),
             format_details: clean_field(&details),
             carrier: fields
                 .and_then(|fields| fields.carrier.clone())
                 .unwrap_or_else(|| "2".to_owned()),
-            navigation_system,
+            navigation_system: clean_field(&navigation_system),
             network: fields
                 .and_then(|fields| fields.network.clone())
                 .unwrap_or_else(|| "RCaster".to_owned()),
@@ -121,26 +121,27 @@ impl StrRecord {
     }
 
     pub fn to_line(&self) -> String {
+        let field = |value: &str| clean_field(value);
         format!(
             "STR;{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{};{}\r\n",
-            self.mountpoint,
-            self.identifier,
-            self.format,
-            self.format_details,
-            self.carrier,
-            self.navigation_system,
-            self.network,
-            self.country,
-            self.latitude,
-            self.longitude,
-            self.nmea,
-            self.solution,
-            self.generator,
-            self.compression,
-            self.authentication,
-            self.fee,
-            self.bitrate,
-            self.misc,
+            field(&self.mountpoint),
+            field(&self.identifier),
+            field(&self.format),
+            field(&self.format_details),
+            field(&self.carrier),
+            field(&self.navigation_system),
+            field(&self.network),
+            field(&self.country),
+            field(&self.latitude),
+            field(&self.longitude),
+            field(&self.nmea),
+            field(&self.solution),
+            field(&self.generator),
+            field(&self.compression),
+            field(&self.authentication),
+            field(&self.fee),
+            field(&self.bitrate),
+            field(&self.misc),
         )
     }
 }

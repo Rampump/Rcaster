@@ -113,6 +113,19 @@ fn detected_position_overrides_configured_mountpoint_position() {
     assert_eq!(record.format_details, "1005,1074");
 }
 
+#[test]
+fn str_rendering_neutralizes_field_separators_and_control_characters() {
+    let mut record = StrRecord::from_profile("C63", &DataProfile::default());
+    record.format = "RTCM3;STR;EVIL".to_owned();
+    record.network = "NET\r\nSTR;FAKE".to_owned();
+    record.country = "CH\0N".to_owned();
+
+    let line = record.to_line();
+    assert_eq!(line.split(';').count(), 19);
+    assert!(!line.contains('\0'));
+    assert_eq!(line.matches("\r\n").count(), 1);
+}
+
 fn mountpoint_with_str() -> Mountpoint {
     Mountpoint {
         schema_version: 1,
@@ -139,5 +152,34 @@ fn mountpoint_with_str() -> Mountpoint {
         source_expectation: None,
         created_at: "2026-11-24T00:00:00Z".to_owned(),
         updated_at: "2026-11-24T00:00:00Z".to_owned(),
+    }
+}
+
+#[test]
+fn configured_str_fields_reject_separators_and_controls() {
+    let mut mountpoint = mountpoint_with_str();
+    mountpoint.str_fields.as_mut().expect("STR fields").network =
+        Some("NET\r\nSTR;FAKE".to_owned());
+
+    assert!(
+        rcaster_core::account::AccountSnapshot::new([owner()], [mountpoint]).is_err(),
+        "unsafe STR metadata must be rejected"
+    );
+}
+
+fn owner() -> rcaster_core::account::User {
+    rcaster_core::account::User {
+        schema_version: 1,
+        mod_revision: 0,
+        user_id: "owner-id".to_owned(),
+        username: "owner".to_owned(),
+        password_hash: "hash".to_owned(),
+        auth_version: 1,
+        enabled: true,
+        ntrip_enabled: true,
+        web_enabled: true,
+        role: rcaster_core::account::UserRole::User,
+        created_at: String::new(),
+        updated_at: String::new(),
     }
 }

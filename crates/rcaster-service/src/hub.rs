@@ -77,6 +77,7 @@ struct HubInner {
     limits: RwLock<HubLimits>,
     history_seed: Mutex<HashMap<String, Vec<StreamHistoryPoint>>>,
     source_revision: AtomicUsize,
+    next_source_id: AtomicU64,
     station_id_changes: AtomicU64,
     base_position_jumps: AtomicU64,
     backlog_kicks: AtomicU64,
@@ -148,6 +149,7 @@ impl MountpointHub {
                 limits: RwLock::new(HubLimits::default()),
                 history_seed: Mutex::new(HashMap::new()),
                 source_revision: AtomicUsize::new(0),
+                next_source_id: AtomicU64::new(1),
                 station_id_changes: AtomicU64::new(0),
                 base_position_jumps: AtomicU64::new(0),
                 backlog_kicks: AtomicU64::new(0),
@@ -225,12 +227,13 @@ impl MountpointHub {
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let id = sources
-            .values()
-            .map(|source| source.id)
-            .max()
-            .unwrap_or_default()
-            .saturating_add(1);
+        let id = self
+            .inner
+            .next_source_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+                Some(id.saturating_add(1))
+            })
+            .unwrap_or(u64::MAX);
         sources.insert(
             mountpoint.clone(),
             SourceState {
@@ -310,6 +313,21 @@ impl MountpointHub {
             .collect::<Vec<_>>();
         records.sort_by(|left, right| left.mountpoint.cmp(&right.mountpoint));
         records
+    }
+
+    pub fn source_record(&self, mountpoint: &str) -> Option<StrRecord> {
+        self.inner
+            .sources()
+            .get(mountpoint)
+            .and_then(|source| source.str_record.clone())
+    }
+
+    pub fn source_generation(&self, mountpoint: &str) -> Option<u64> {
+        self.inner
+            .sources()
+            .get(mountpoint)
+            .filter(|source| source.str_record.is_some())
+            .map(|source| source.id)
     }
 
     pub fn subscriber_count(&self, mountpoint: &str) -> Option<usize> {
@@ -676,6 +694,10 @@ impl SourceLease {
             .filter(|source| source.id == self.id)
             .map(|source| source.sender.receiver_count())
             .unwrap_or_default()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.id
     }
 
     pub fn close(&self) {

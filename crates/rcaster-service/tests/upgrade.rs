@@ -215,6 +215,58 @@ async fn preview_digest_changes_with_target_nodes_and_rejects_stale_start() {
 }
 
 #[tokio::test]
+async fn old_manager_cannot_write_after_lock_lease_is_replaced() {
+    let cluster = unique("upgrade-fencing");
+    let mut etcd = connect().await;
+    publish_config(&mut etcd, &cluster, CasterConfig::new(1))
+        .await
+        .expect("config");
+    put_version(&mut etcd, &cluster, "edge-1", "0.1.0", true).await;
+    let signing_key = SigningKey::from_bytes(&[6_u8; 32]);
+    let policy = || {
+        UpgradePolicy::new(
+            &[hex(signing_key.verifying_key().as_bytes())],
+            &["updates.example.test".to_owned()],
+        )
+        .expect("policy")
+    };
+    let old = UpgradeManager::new(connect().await, cluster.clone(), policy());
+    let mut request = rollout_request(signed_manifest(&signing_key, "0.2.0", b"new"), "edge-1");
+    let preview = old.preview(&request).await.expect("preview");
+    request["preview_digest"] = preview["preview_digest"].clone();
+    let operation = old.start(&request).await.expect("start");
+    let operation_id = operation["operation_id"].as_str().expect("operation ID");
+    let lock_key = format!("/rcaster/{cluster}/locks/upgrade/global");
+    let old_lock = etcd.get(lock_key.clone(), None).await.expect("lock").kvs()[0].clone();
+    let old_lease = old_lock.lease();
+    etcd.lease_revoke(old_lease).await.expect("revoke old lock");
+
+    let _recovery = UpgradeManager::new(connect().await, cluster.clone(), policy());
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if let Some(lock) = etcd
+                .get(lock_key.clone(), None)
+                .await
+                .expect("lock")
+                .kvs()
+                .first()
+                && lock.lease() != old_lease
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replacement lock");
+
+    assert!(matches!(
+        old.cancel(operation_id).await,
+        Err(rcaster_service::upgrade::UpgradeError::Conflict)
+    ));
+}
+
+#[tokio::test]
 async fn upgrade_requires_a_different_administrator_to_approve() {
     let cluster = unique("upgrade-approval");
     let mut etcd = connect().await;

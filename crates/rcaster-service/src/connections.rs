@@ -1,6 +1,9 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use etcd_client::{Client, EventType, GetOptions, WatchOptions};
@@ -20,10 +23,11 @@ pub struct LocalSession {
     pub software: Option<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ConnectionController {
     inner: Arc<Mutex<HashMap<String, Vec<watch::Sender<bool>>>>>,
     sessions: Arc<Mutex<HashMap<String, LocalSession>>>,
+    watch_unhealthy: Arc<AtomicUsize>,
 }
 
 pub struct ConnectionCancel {
@@ -36,6 +40,16 @@ pub struct ConnectionCancel {
 
 pub struct CommandWatcher {
     tasks: Vec<JoinHandle<()>>,
+}
+
+impl Default for ConnectionController {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            watch_unhealthy: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl ConnectionController {
@@ -111,6 +125,19 @@ impl ConnectionController {
             for sender in senders {
                 sender.send_replace(true);
             }
+        }
+    }
+
+    pub fn is_watch_healthy(&self) -> bool {
+        self.watch_unhealthy.load(Ordering::Acquire) == 0
+    }
+
+    fn set_watch_lane(&self, lane: usize, healthy: bool) {
+        let bit = 1 << lane;
+        if healthy {
+            self.watch_unhealthy.fetch_and(!bit, Ordering::AcqRel);
+        } else {
+            self.watch_unhealthy.fetch_or(bit, Ordering::AcqRel);
         }
     }
 }
@@ -193,15 +220,22 @@ impl CommandWatcher {
                     client.clone(),
                     session_prefix,
                     "session",
+                    0,
                     Arc::clone(&controller),
                 )),
                 tokio::spawn(watch_commands(
                     client.clone(),
                     source_prefix,
                     "source",
+                    1,
                     Arc::clone(&controller),
                 )),
-                tokio::spawn(watch_user_access(client, user_prefix, controller)),
+                tokio::spawn(watch_user_access(
+                    client,
+                    user_prefix,
+                    2,
+                    Arc::clone(&controller),
+                )),
             ],
         })
     }
@@ -217,6 +251,7 @@ impl CommandWatcher {
 async fn watch_user_access(
     mut client: Client,
     prefix: String,
+    health_lane: usize,
     controller: Arc<ConnectionController>,
 ) {
     loop {
@@ -224,6 +259,7 @@ async fn watch_user_access(
             .get(prefix.clone(), Some(GetOptions::new().with_prefix()))
             .await;
         let Ok(response) = response else {
+            controller.set_watch_lane(health_lane, false);
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             continue;
         };
@@ -246,14 +282,20 @@ async fn watch_user_access(
             )
             .await
         else {
+            controller.set_watch_lane(health_lane, false);
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             continue;
         };
+        controller.set_watch_lane(health_lane, true);
         loop {
-            let Ok(Some(response)) = stream.message().await else {
+            let response =
+                tokio::time::timeout(crate::ETCD_WATCH_IDLE_TIMEOUT, stream.message()).await;
+            let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                controller.set_watch_lane(health_lane, false);
                 break;
             };
             if response.canceled() {
+                controller.set_watch_lane(health_lane, false);
                 break;
             }
             for event in response.events() {
@@ -295,6 +337,7 @@ async fn watch_commands(
     mut client: Client,
     prefix: String,
     kind: &'static str,
+    health_lane: usize,
     controller: Arc<ConnectionController>,
 ) {
     loop {
@@ -302,6 +345,7 @@ async fn watch_commands(
             .get(prefix.clone(), Some(GetOptions::new().with_prefix()))
             .await;
         let Ok(response) = response else {
+            controller.set_watch_lane(health_lane, false);
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             continue;
         };
@@ -324,14 +368,20 @@ async fn watch_commands(
             )
             .await
         else {
+            controller.set_watch_lane(health_lane, false);
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             continue;
         };
+        controller.set_watch_lane(health_lane, true);
         loop {
-            let Ok(Some(response)) = stream.message().await else {
+            let response =
+                tokio::time::timeout(crate::ETCD_WATCH_IDLE_TIMEOUT, stream.message()).await;
+            let Some(Some(response)) = response.ok().and_then(Result::ok) else {
+                controller.set_watch_lane(health_lane, false);
                 break;
             };
             if response.canceled() {
+                controller.set_watch_lane(health_lane, false);
                 break;
             }
             for event in response.events() {
@@ -371,5 +421,20 @@ async fn process_command(
         .is_some_and(|target| controller.cancel(target))
     {
         let _ = client.delete(key.to_vec(), None).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionController;
+
+    #[test]
+    fn command_watch_health_requires_every_watch_lane() {
+        let controller = ConnectionController::default();
+        assert!(controller.is_watch_healthy());
+        controller.set_watch_lane(0, false);
+        assert!(!controller.is_watch_healthy());
+        controller.set_watch_lane(0, true);
+        assert!(controller.is_watch_healthy());
     }
 }

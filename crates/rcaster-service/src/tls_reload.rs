@@ -1227,8 +1227,25 @@ mod tests {
                     }
                     request.extend_from_slice(&chunk[..read]);
                 }
+                let head_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4)
+                    .unwrap_or(request.len());
                 let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
                 assert!(headers.contains("content-type: application/ocsp-request"));
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or_default();
+                while request.len().saturating_sub(head_end) < content_length {
+                    let read = std::io::Read::read(&mut stream, &mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
                 if index == 1 {
                     std::thread::sleep(Duration::from_millis(300));
                     server_heartbeat_during_request

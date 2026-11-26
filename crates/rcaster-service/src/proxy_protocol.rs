@@ -78,6 +78,19 @@ pub async fn resolve_client_ip(
     peer_ip: IpAddr,
     config: Option<&ProxyProtocolConfig>,
 ) -> Result<IpAddr, ProxyProtocolError> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        resolve_client_ip_inner(stream, peer_ip, config),
+    )
+    .await
+    .map_err(|_| ProxyProtocolError::Timeout)?
+}
+
+async fn resolve_client_ip_inner(
+    stream: &mut TcpStream,
+    peer_ip: IpAddr,
+    config: Option<&ProxyProtocolConfig>,
+) -> Result<IpAddr, ProxyProtocolError> {
     let Some(config) = config else {
         return Ok(peer_ip);
     };
@@ -107,7 +120,6 @@ pub async fn resolve_client_ip(
 }
 
 async fn peek_prefix(stream: &TcpStream) -> Result<Option<Vec<u8>>, ProxyProtocolError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut buffer = [0_u8; V2_SIGNATURE.len()];
     loop {
         let read = stream.peek(&mut buffer).await?;
@@ -125,9 +137,6 @@ async fn peek_prefix(stream: &TcpStream) -> Result<Option<Vec<u8>>, ProxyProtoco
         }
         if !v1_possible && !v2_possible {
             return Ok(None);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(ProxyProtocolError::Timeout);
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

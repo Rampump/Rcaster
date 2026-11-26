@@ -605,6 +605,10 @@ where
                     });
                 }
                 send_data_success(&mut stream, request.version).await?;
+                let lease_health = match &config.cluster_runtime {
+                    Some(runtime) => runtime.lease_health().await,
+                    None => None,
+                };
                 let operation = async {
                     if let Some(near) = near {
                         stream_near(stream, hub, config, near, request.headers.get("ntrip-gga"))
@@ -613,13 +617,17 @@ where
                         stream_single_source(stream, receiver.expect("ordinary source"), &hub).await
                     }
                 };
-                return if let Some(cancellation) = &mut cancellation {
-                    tokio::select! {
-                        result = operation => result,
-                        _ = cancellation.cancelled() => Ok(()),
+                let cancellation = async {
+                    if let Some(cancellation) = &mut cancellation {
+                        cancellation.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
                     }
-                } else {
-                    operation.await
+                };
+                return tokio::select! {
+                    result = operation => result,
+                    _ = cancellation => Ok(()),
+                    _ = wait_for_lease_loss(lease_health) => Ok(()),
                 };
             }
             Request::SourceV1(request) => {
@@ -1941,11 +1949,13 @@ async fn switch_near_source_inner(
     _query_permit: crate::near::NearQueryPermit,
 ) {
     let previous = selector.current().map(str::to_owned);
-    let Some(mountpoint) = selector.update_indexed(&gga, candidates, std::time::Instant::now())
+    let Some(mountpoint) =
+        selector.propose_update_indexed(&gga, candidates, std::time::Instant::now())
     else {
         return;
     };
     if let Ok(next) = subscribe_source(hub, config, &mountpoint).await {
+        selector.commit(&mountpoint);
         pending_output.clear();
         pending_output.extend(hub.station_frames(&mountpoint));
         *receiver = Some(next);

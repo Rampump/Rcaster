@@ -21,7 +21,7 @@ pub struct RelayManager {
     hub: Arc<MountpointHub>,
     runtime: SharedClusterRuntime,
     tls: GrpcClientTls,
-    relays: Mutex<HashMap<String, RelaySlot>>,
+    relays: Arc<Mutex<HashMap<String, RelaySlot>>>,
     backoff: Mutex<HashMap<String, (Instant, u32)>>,
     max_relays: usize,
     max_starting: usize,
@@ -65,7 +65,7 @@ impl RelayManager {
             hub,
             runtime,
             tls,
-            relays: Mutex::new(HashMap::new()),
+            relays: Arc::new(Mutex::new(HashMap::new())),
             backoff: Mutex::new(HashMap::new()),
             max_relays,
             max_starting,
@@ -145,7 +145,7 @@ impl RelayManager {
         if self.max_relays == 0 || self.max_starting == 0 || self.idle_timeout.is_zero() {
             return Err("invalid relay limits".to_owned());
         }
-        let start_gate = {
+        let (start_gate, owns_start) = {
             let mut relays = self.relays.lock().await;
             relays.retain(|_, slot| match slot {
                 RelaySlot::Active(source) => source.is_active(),
@@ -153,7 +153,7 @@ impl RelayManager {
             });
             match relays.get(mountpoint) {
                 Some(RelaySlot::Active(_)) => return Ok(()),
-                Some(RelaySlot::Starting(gate)) => Arc::clone(gate),
+                Some(RelaySlot::Starting(gate)) => (Arc::clone(gate), false),
                 None => {
                     if relays.len() >= self.max_relays {
                         return Err("relay limit reached".to_owned());
@@ -171,10 +171,15 @@ impl RelayManager {
                         mountpoint.to_owned(),
                         RelaySlot::Starting(Arc::clone(&gate)),
                     );
-                    gate
+                    (gate, true)
                 }
             }
         };
+        let mut starting_guard = owns_start.then(|| StartingRelayGuard {
+            relays: Arc::clone(&self.relays),
+            mountpoint: mountpoint.to_owned(),
+            gate: Arc::clone(&start_gate),
+        });
         let _start_guard = start_gate.lock().await;
         if self
             .relays
@@ -183,6 +188,9 @@ impl RelayManager {
             .get(mountpoint)
             .is_some_and(|slot| matches!(slot, RelaySlot::Active(source) if source.is_active()))
         {
+            if let Some(guard) = starting_guard.as_mut() {
+                guard.disarm();
+            }
             return Ok(());
         }
         let route = match self.runtime.source_route(mountpoint).await {
@@ -196,15 +204,11 @@ impl RelayManager {
             self.relays.lock().await.remove(mountpoint);
             return Err("source is owned by this caster".to_owned());
         }
-        let source = Arc::new(self.hub.claim_source(mountpoint).map_err(|error| {
-            if let Ok(mut relays) = self.relays.try_lock() {
-                relays.remove(mountpoint);
-            }
-            error.to_string()
-        })?);
-        source
-            .set_str_record(route.str_record.clone())
-            .map_err(|error| error.to_string())?;
+        let source = Arc::new(
+            self.hub
+                .claim_source(mountpoint)
+                .map_err(|error| error.to_string())?,
+        );
         let mut client = RelayGrpcClient::connect_mtls(
             format!("https://{}", route.relay_endpoint),
             self.tls.clone(),
@@ -214,12 +218,15 @@ impl RelayManager {
             source.close();
             error.message().to_owned()
         })?;
+        let cluster_id = match self.runtime.cluster_id().await {
+            Some(cluster_id) => cluster_id,
+            None => {
+                source.close();
+                return Err("relay runtime unavailable".to_owned());
+            }
+        };
         let request = RelayOpenRequest {
-            cluster_id: self
-                .runtime
-                .cluster_id()
-                .await
-                .ok_or_else(|| "relay runtime unavailable".to_owned())?,
+            cluster_id,
             mountpoint: route.mountpoint.clone(),
             source_generation: route.source_generation,
             connection_id: route.connection_id.clone(),
@@ -235,10 +242,17 @@ impl RelayManager {
                 source.close();
                 error.message().to_owned()
             })?;
+        source.set_str_record(route.str_record).map_err(|error| {
+            source.close();
+            error.to_string()
+        })?;
         self.relays.lock().await.insert(
             mountpoint.to_owned(),
             RelaySlot::Active(Arc::clone(&source)),
         );
+        if let Some(guard) = starting_guard.as_mut() {
+            guard.disarm();
+        }
         let idle_source = Arc::clone(&source);
         let idle_timeout = self.idle_timeout;
         let idle_closes = Arc::clone(&self.idle_closes);
@@ -287,5 +301,36 @@ impl RelayManager {
             source.close();
         });
         Ok(())
+    }
+}
+
+struct StartingRelayGuard {
+    relays: Arc<Mutex<HashMap<String, RelaySlot>>>,
+    mountpoint: String,
+    gate: Arc<Mutex<()>>,
+}
+
+impl StartingRelayGuard {
+    fn disarm(&mut self) {
+        self.mountpoint.clear();
+    }
+}
+
+impl Drop for StartingRelayGuard {
+    fn drop(&mut self) {
+        if self.mountpoint.is_empty() {
+            return;
+        }
+        let relays = Arc::clone(&self.relays);
+        let mountpoint = std::mem::take(&mut self.mountpoint);
+        let gate = Arc::clone(&self.gate);
+        tokio::spawn(async move {
+            let mut relays = relays.lock().await;
+            if relays.get(&mountpoint).is_some_and(
+                |slot| matches!(slot, RelaySlot::Starting(existing) if Arc::ptr_eq(existing, &gate)),
+            ) {
+                relays.remove(&mountpoint);
+            }
+        });
     }
 }

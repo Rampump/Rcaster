@@ -160,7 +160,10 @@ impl NearSource {
         }
         let latitude = record.latitude.parse::<f64>().ok()?;
         let longitude = record.longitude.parse::<f64>().ok()?;
-        if !(-90.0..=90.0).contains(&latitude) || !(-180.0..=180.0).contains(&longitude) {
+        if !(-90.0..=90.0).contains(&latitude)
+            || !(-180.0..=180.0).contains(&longitude)
+            || (latitude == 0.0 && longitude == 0.0)
+        {
             return None;
         }
         Some(Self {
@@ -224,7 +227,8 @@ impl NearIndex {
         let (center_lat, center_lon) = Self::cell(position);
         let mut nearest = None::<(&NearSource, f64)>;
         for latitude in (center_lat - latitude_span)..=(center_lat + latitude_span) {
-            for longitude in (center_lon - longitude_span)..=(center_lon + longitude_span) {
+            for offset in -longitude_span..=longitude_span {
+                let longitude = (center_lon + offset).rem_euclid(360);
                 let Some(indices) = self.cells.get(&(latitude, longitude)) else {
                     continue;
                 };
@@ -250,7 +254,8 @@ impl NearIndex {
 
     fn cell(position: GeoPosition) -> (i32, i32) {
         let latitude = (position.latitude_e7 as f64 / 1e7 / Self::CELL_DEGREES).floor() as i32;
-        let longitude = (position.longitude_e7 as f64 / 1e7 / Self::CELL_DEGREES).floor() as i32;
+        let longitude = ((position.longitude_e7 as f64 / 1e7 / Self::CELL_DEGREES).floor() as i32)
+            .rem_euclid(360);
         (latitude, longitude)
     }
 }
@@ -358,6 +363,17 @@ impl NearSelector {
         candidates: &NearIndex,
         now: Instant,
     ) -> Option<String> {
+        let selected = self.propose_update_indexed(gga, candidates, now)?;
+        self.commit(&selected);
+        Some(selected)
+    }
+
+    pub fn propose_update_indexed(
+        &mut self,
+        gga: &NearGga,
+        candidates: &NearIndex,
+        now: Instant,
+    ) -> Option<String> {
         let valid_gga =
             matches!(gga.fix_quality, 1 | 2 | 4 | 5) && gga.hdop <= self.config.max_hdop;
         let Some(current_name) = self.current.clone() else {
@@ -366,10 +382,7 @@ impl NearSelector {
             }
             return candidates
                 .nearest(gga.position, self.config.max_distance_m)
-                .map(|source| {
-                    self.current = Some(source.mountpoint.clone());
-                    source.mountpoint.clone()
-                });
+                .map(|source| source.mountpoint.clone());
         };
         let Some(current) = candidates.get(&current_name).filter(|source| {
             source.mountpoint == current_name
@@ -383,10 +396,7 @@ impl NearSelector {
                     self.config.max_distance_m,
                     Some(&current_name),
                 )
-                .map(|source| {
-                    self.current = Some(source.mountpoint.clone());
-                    source.mountpoint.clone()
-                });
+                .map(|source| source.mountpoint.clone());
         };
         if !valid_gga {
             return None;
@@ -426,8 +436,6 @@ impl NearSelector {
                     self.observation = None;
                     return None;
                 }
-                self.current = Some(nearest.mountpoint.clone());
-                self.observation = None;
                 Some(nearest.mountpoint.clone())
             }
             _ => {
@@ -441,6 +449,11 @@ impl NearSelector {
                 None
             }
         }
+    }
+
+    pub fn commit(&mut self, mountpoint: &str) {
+        self.current = Some(mountpoint.to_owned());
+        self.observation = None;
     }
 }
 

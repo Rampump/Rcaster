@@ -242,6 +242,28 @@ fn validate_mountpoint_metadata(mountpoint: &Mountpoint) -> Result<(), AccountEr
         || mountpoint
             .coverage_radius_m
             .is_some_and(|radius| !radius.is_finite() || radius <= 0.0)
+        || mountpoint
+            .str_fields
+            .iter()
+            .flat_map(|fields| {
+                [
+                    fields.identifier.as_deref(),
+                    fields.format.as_deref(),
+                    fields.formats.as_deref(),
+                    fields.carrier.as_deref(),
+                    fields.navigation_system.as_deref(),
+                    fields.network.as_deref(),
+                    fields.country.as_deref(),
+                    fields.solution.as_deref(),
+                ]
+            })
+            .flatten()
+            .any(|value| {
+                value.len() > 128
+                    || value
+                        .bytes()
+                        .any(|byte| byte == b';' || byte < b' ' || byte == 0x7f)
+            })
     {
         return Err(AccountError::InvalidMountpoint);
     }

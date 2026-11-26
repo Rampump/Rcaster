@@ -142,6 +142,10 @@ impl BlacklistWatcher {
         self.healthy.load(Ordering::Acquire)
     }
 
+    pub(crate) fn health_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.healthy)
+    }
+
     pub async fn shutdown(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -325,6 +329,7 @@ pub async fn upsert_blacklist_rule(
 ) -> Result<u64, BlacklistError> {
     validate_rule(rule)?;
     let network = IpNetwork::parse(&rule.cidr).ok_or(BlacklistError::InvalidConfig)?;
+    let normalized = network.normalized_key();
     let prefix = blacklist_prefix(cluster_id);
     for kv in client
         .get(prefix, Some(GetOptions::new().with_prefix()))
@@ -338,7 +343,7 @@ pub async fn upsert_blacklist_rule(
             && existing.enabled
             && rule.enabled
             && IpNetwork::parse(&existing.cidr)
-                .is_some_and(|existing| existing.normalized_key() == network.normalized_key())
+                .is_some_and(|existing| existing.normalized_key() == normalized)
         {
             return Err(BlacklistError::InvalidConfig);
         }
@@ -363,12 +368,72 @@ pub async fn upsert_blacklist_rule(
     };
     let value =
         serde_json::to_vec(rule).map_err(|error| BlacklistError::Json(error.to_string()))?;
+    let current_reservation_key = reservation_key(cluster_id, &normalized);
+    let reservation = client
+        .get(current_reservation_key.clone(), None)
+        .await
+        .map_err(|error| BlacklistError::Etcd(error.to_string()))?
+        .kvs()
+        .first()
+        .cloned();
+    if let Some(existing) = &reservation
+        && existing.value() != rule.id.as_bytes()
+    {
+        return Err(BlacklistError::InvalidConfig);
+    }
+    let mut compares = vec![compare];
+    let mut operations = vec![TxnOp::put(key, value, Some(PutOptions::new()))];
+    if let Some(previous) = current
+        .as_ref()
+        .and_then(|current| serde_json::from_slice::<BlacklistRule>(current.value()).ok())
+        .filter(|previous| previous.enabled)
+        .and_then(|previous| IpNetwork::parse(&previous.cidr))
+        .map(|previous| previous.normalized_key())
+        .filter(|previous| previous != &normalized)
+    {
+        let previous_key = reservation_key(cluster_id, &previous);
+        let owned = client
+            .get(previous_key.clone(), None)
+            .await
+            .map_err(|error| BlacklistError::Etcd(error.to_string()))?
+            .kvs()
+            .first()
+            .is_some_and(|value| value.value() == rule.id.as_bytes());
+        if owned {
+            compares.push(Compare::value(
+                previous_key.clone(),
+                CompareOp::Equal,
+                rule.id.as_bytes().to_vec(),
+            ));
+            operations.push(TxnOp::delete(previous_key, Some(DeleteOptions::new())));
+        }
+    }
+    if rule.enabled {
+        if reservation.is_none() {
+            compares.push(Compare::create_revision(
+                current_reservation_key.clone(),
+                CompareOp::Equal,
+                0,
+            ));
+            operations.push(TxnOp::put(
+                current_reservation_key,
+                rule.id.as_bytes().to_vec(),
+                None,
+            ));
+        }
+    } else if reservation.is_some() {
+        compares.push(Compare::value(
+            current_reservation_key.clone(),
+            CompareOp::Equal,
+            rule.id.as_bytes().to_vec(),
+        ));
+        operations.push(TxnOp::delete(
+            current_reservation_key,
+            Some(DeleteOptions::new()),
+        ));
+    }
     let response = client
-        .txn(
-            Txn::new()
-                .when([compare])
-                .and_then([TxnOp::put(key, value, Some(PutOptions::new()))]),
-        )
+        .txn(Txn::new().when(compares).and_then(operations))
         .await
         .map_err(|error| BlacklistError::Etcd(error.to_string()))?;
     if !response.succeeded() {
@@ -387,16 +452,49 @@ pub async fn delete_blacklist_rule(
     expected_revision: u64,
 ) -> Result<(), BlacklistError> {
     let key = format!("{}{}", blacklist_prefix(cluster_id), id);
+    let value = client
+        .get(key.clone(), None)
+        .await
+        .map_err(|error| BlacklistError::Etcd(error.to_string()))?
+        .kvs()
+        .first()
+        .cloned();
+    let Some(value) = value else {
+        return Err(BlacklistError::Conflict);
+    };
+    let existing: BlacklistRule = serde_json::from_slice(value.value())
+        .map_err(|error| BlacklistError::Json(error.to_string()))?;
+    let mut compares = vec![Compare::mod_revision(
+        key.clone(),
+        CompareOp::Equal,
+        expected_revision as i64,
+    )];
+    let mut operations = vec![TxnOp::delete(key, Some(DeleteOptions::new()))];
+    if existing.enabled
+        && let Some(network) = IpNetwork::parse(&existing.cidr)
+    {
+        let key = reservation_key(cluster_id, &network.normalized_key());
+        let reservation = client
+            .get(key.clone(), None)
+            .await
+            .map_err(|error| BlacklistError::Etcd(error.to_string()))?
+            .kvs()
+            .first()
+            .cloned();
+        if reservation
+            .as_ref()
+            .is_some_and(|value| value.value() == id.as_bytes())
+        {
+            compares.push(Compare::value(
+                key.clone(),
+                CompareOp::Equal,
+                id.as_bytes().to_vec(),
+            ));
+            operations.push(TxnOp::delete(key, Some(DeleteOptions::new())));
+        }
+    }
     let response = client
-        .txn(
-            Txn::new()
-                .when([Compare::mod_revision(
-                    key.clone(),
-                    CompareOp::Equal,
-                    expected_revision as i64,
-                )])
-                .and_then([TxnOp::delete(key, Some(DeleteOptions::new()))]),
-        )
+        .txn(Txn::new().when(compares).and_then(operations))
         .await
         .map_err(|error| BlacklistError::Etcd(error.to_string()))?;
     if response.succeeded() {
@@ -404,6 +502,14 @@ pub async fn delete_blacklist_rule(
     } else {
         Err(BlacklistError::Conflict)
     }
+}
+
+fn reservation_key(cluster_id: &str, normalized_cidr: &str) -> String {
+    let encoded = normalized_cidr
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("/rcaster/{cluster_id}/config/blacklist-reservations/{encoded}")
 }
 
 pub(crate) fn validate_rule(rule: &BlacklistRule) -> Result<(), BlacklistError> {

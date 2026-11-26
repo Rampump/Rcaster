@@ -303,6 +303,89 @@ async fn edge_relay_manager_shares_remote_source_over_mtls() {
         .await;
 }
 
+#[tokio::test]
+async fn failed_relay_start_releases_its_starting_slot() {
+    let cluster = unique("relay-start-failure");
+    let mut admin = connect().await;
+    publish_config(&mut admin, &cluster, CasterConfig::new(1))
+        .await
+        .expect("publish config");
+    let coordinator = Arc::new(
+        AdmissionCoordinator::start(connect().await, &cluster, CoordinatorOptions::default())
+            .await
+            .expect("coordinator"),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve relay address");
+    let relay_address = listener.local_addr().expect("relay address");
+    drop(listener);
+    let owner = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        options(&cluster, "caster-owner", &relay_address.to_string()),
+    )
+    .await
+    .expect("owner runtime");
+    let edge = SharedClusterRuntime::start(
+        connect().await,
+        Arc::clone(&coordinator),
+        options(&cluster, "caster-edge", "127.0.0.1:1"),
+    )
+    .await
+    .expect("edge runtime");
+    let owner_hub = Arc::new(MountpointHub::new(16).expect("owner hub"));
+    let source = owner_hub.claim_source("C63").expect("source");
+    let record = StrRecord::from_profile("C63", &DataProfile::default());
+    source.set_str_record(record.clone()).expect("source STR");
+    let permit = owner
+        .admit_source("owner", "C63", "connection-1", 1)
+        .await
+        .expect("admit source");
+    owner
+        .activate_source(&permit, &record)
+        .await
+        .expect("activate source");
+    wait_for_route(&owner, "C63").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while edge.source_route("C63").await.is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("edge source discovery");
+
+    let manager = RelayManager::with_limits(
+        Arc::new(MountpointHub::new(16).expect("edge hub")),
+        edge.clone(),
+        GrpcClientTls {
+            ca_certificate_pem: String::new(),
+            certificate_pem: String::new(),
+            private_key_pem: String::new(),
+            server_name: "localhost".to_owned(),
+            service_token: "unused".to_owned(),
+        },
+        10,
+        2,
+        Duration::from_millis(100),
+    );
+    assert!(manager.ensure("C63").await.is_err());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager.metrics().await.starting != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("starting slot released");
+
+    owner.shutdown().await.expect("owner shutdown");
+    edge.shutdown().await.expect("edge shutdown");
+    Arc::try_unwrap(coordinator)
+        .expect("coordinator handle")
+        .shutdown()
+        .await;
+}
+
 async fn wait_for_route(
     runtime: &SharedClusterRuntime,
     mountpoint: &str,

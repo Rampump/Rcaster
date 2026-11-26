@@ -464,7 +464,7 @@ async fn listener_releases_cluster_source_when_connection_closes() {
 }
 
 #[tokio::test]
-async fn source_stops_publishing_after_its_cluster_lease_is_removed() {
+async fn source_and_clients_close_after_the_cluster_lease_is_removed() {
     let cluster = unique("ntrip-fence");
     let mut admin = connect().await;
     publish_config(&mut admin, &cluster, CasterConfig::new(1))
@@ -540,11 +540,24 @@ async fn source_stops_publishing_after_its_cluster_lease_is_removed() {
         .read_exact(&mut response)
         .await
         .expect("source response");
+    let mut client = TcpStream::connect(address).await.expect("client");
+    client
+        .write_all(b"GET /C66\r\n\r\n")
+        .await
+        .expect("client request");
+    client
+        .read_exact(&mut response)
+        .await
+        .expect("client response");
     shared.shutdown().await.expect("remove cluster lease");
     let mut byte = [0_u8; 1];
     let closed = tokio::time::timeout(Duration::from_secs(2), source.read(&mut byte))
         .await
         .expect("source fence timeout");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+        .await
+        .expect("client fence timeout");
     assert!(matches!(closed, Ok(0) | Err(_)));
 
     shutdown_tx.send(()).expect("shutdown");

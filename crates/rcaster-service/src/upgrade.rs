@@ -258,10 +258,15 @@ pub fn verify_artifact(
             metadata.len()
         )));
     }
-    let bytes = std::fs::read(path).map_err(|error| {
+    let file = std::fs::File::open(path).map_err(|error| {
         UpgradeError::InvalidManifest(format!("artifact cannot be read: {error}"))
     })?;
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut reader, &mut hasher).map_err(|error| {
+        UpgradeError::InvalidManifest(format!("artifact cannot be read: {error}"))
+    })?;
+    let actual = format!("{:x}", hasher.finalize());
     if !actual.eq_ignore_ascii_case(&manifest.artifact_sha256) {
         return Err(UpgradeError::InvalidManifest(
             "artifact SHA-256 does not match the signed manifest".to_owned(),
@@ -292,6 +297,7 @@ struct UpgradeInner {
 struct HeldLock {
     operation_id: String,
     lease_id: i64,
+    value: Vec<u8>,
     stop: Option<oneshot::Sender<()>>,
 }
 
@@ -672,7 +678,7 @@ impl UpgradeInner {
                     .and_then([
                         TxnOp::put(
                             lock_key,
-                            lock_value,
+                            lock_value.clone(),
                             Some(PutOptions::new().with_lease(lease_id)),
                         ),
                         TxnOp::put(self.operation_key(&operation_id), operation_value, None),
@@ -704,6 +710,7 @@ impl UpgradeInner {
         self.lock = Some(HeldLock {
             operation_id: operation_id.clone(),
             lease_id,
+            value: lock_value,
             stop: Some(stop_tx),
         });
         Ok(serde_json::to_value(operation)?)
@@ -814,7 +821,7 @@ impl UpgradeInner {
                     .and_then([
                         TxnOp::put(
                             lock_key,
-                            lock_value,
+                            lock_value.clone(),
                             Some(PutOptions::new().with_lease(lease_id)),
                         ),
                         TxnOp::put(operation_key, serde_json::to_vec(&operation)?, None),
@@ -846,6 +853,7 @@ impl UpgradeInner {
         self.lock = Some(HeldLock {
             operation_id: operation_id.to_owned(),
             lease_id,
+            value: lock_value,
             stop: Some(stop_tx),
         });
         Ok(serde_json::to_value(operation)?)
@@ -1055,7 +1063,7 @@ impl UpgradeInner {
                         ])
                         .and_then([TxnOp::put(
                             lock_key,
-                            lock_value,
+                            lock_value.clone(),
                             Some(PutOptions::new().with_lease(lease_id)),
                         )]),
                 )
@@ -1084,6 +1092,7 @@ impl UpgradeInner {
             self.lock = Some(HeldLock {
                 operation_id: operation.operation_id,
                 lease_id,
+                value: lock_value,
                 stop: Some(stop_tx),
             });
             return Ok(());
@@ -1183,13 +1192,19 @@ impl UpgradeInner {
         caster_id: &str,
         command: &Value,
     ) -> Result<(), UpgradeError> {
-        self.client
-            .put(
-                self.command_key(operation_id, caster_id),
-                serde_json::to_vec(command)?,
-                None,
+        let key = self.command_key(operation_id, caster_id);
+        let value = serde_json::to_vec(command)?;
+        let response = self
+            .client
+            .txn(
+                Txn::new()
+                    .when(self.lock_compares(operation_id)?)
+                    .and_then([TxnOp::put(key, value, None)]),
             )
             .await?;
+        if !response.succeeded() {
+            return Err(UpgradeError::Conflict);
+        }
         Ok(())
     }
 
@@ -1205,9 +1220,19 @@ impl UpgradeInner {
             "apply"
         };
         let command = self.command(operation, action)?;
-        self.client
-            .put(key, serde_json::to_vec(&command)?, None)
+        let mut compares = vec![Compare::create_revision(key.clone(), CompareOp::Equal, 0)];
+        compares.extend(self.lock_compares(&operation.operation_id)?);
+        let response = self
+            .client
+            .txn(Txn::new().when(compares).and_then([TxnOp::put(
+                key,
+                serde_json::to_vec(&command)?,
+                None,
+            )]))
             .await?;
+        if !response.succeeded() {
+            return Err(UpgradeError::Conflict);
+        }
         Ok(())
     }
 
@@ -1242,15 +1267,17 @@ impl UpgradeInner {
     async fn put_operation(&mut self, operation: &UpgradeOperation) -> Result<(), UpgradeError> {
         let key = self.operation_key(&operation.operation_id);
         let current = self.client.get(key.clone(), None).await?;
-        let compare = match current.kvs().first() {
+        let operation_compare = match current.kvs().first() {
             Some(value) => {
                 Compare::mod_revision(key.clone(), CompareOp::Equal, value.mod_revision())
             }
             None => Compare::create_revision(key.clone(), CompareOp::Equal, 0),
         };
+        let mut compares = self.lock_compares(&operation.operation_id)?;
+        compares.push(operation_compare);
         let response = self
             .client
-            .txn(Txn::new().when([compare]).and_then([TxnOp::put(
+            .txn(Txn::new().when(compares).and_then([TxnOp::put(
                 key,
                 serde_json::to_vec(operation)?,
                 None,
@@ -1260,6 +1287,20 @@ impl UpgradeInner {
             return Err(UpgradeError::Conflict);
         }
         Ok(())
+    }
+
+    fn lock_compares(&self, operation_id: &str) -> Result<Vec<Compare>, UpgradeError> {
+        let Some(lock) = &self.lock else {
+            return Ok(Vec::new());
+        };
+        if lock.operation_id != operation_id {
+            return Err(UpgradeError::Conflict);
+        }
+        let key = self.lock_key();
+        Ok(vec![
+            Compare::value(key.clone(), CompareOp::Equal, lock.value.clone()),
+            Compare::lease(key, CompareOp::Equal, lock.lease_id),
+        ])
     }
 
     async fn delete_commands(&mut self, operation_id: &str) -> Result<(), UpgradeError> {

@@ -30,7 +30,7 @@ use rcaster_service::{
         serve_admission_grpc, serve_admission_grpc_mtls,
     },
     etcd_reload::{EtcdTlsSource, ReloadableEtcdClient},
-    health::{HealthState, process_usage, serve_health_with_token},
+    health::{HealthState, clock_health, process_usage, serve_health_with_token},
     history_store::HistoryStore,
     hub::{HealthThresholds, HubLimits, MountpointHub},
     maintenance,
@@ -430,6 +430,19 @@ async fn serve(args: &[String]) -> AppResult<()> {
     };
     let health_state = Arc::new(HealthState::default());
     health_state.set_ready(true);
+    let auth_prune_task = {
+        let accounts = account_directory.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                accounts.prune_expired_local_auth();
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                }
+            }
+        })
+    };
     let listener_tls = match (
         config.tls_certificate.as_ref(),
         config.tls_private_key.as_ref(),
@@ -493,16 +506,31 @@ async fn serve(args: &[String]) -> AppResult<()> {
         let monitor_hub = Arc::clone(&hub);
         let monitor_relay = relay_manager.clone();
         let monitor_connections = Arc::clone(&connection_limiter);
+        let monitor_command_connections = Arc::clone(&connections);
         let monitor_tls = listener_tls.clone();
         let monitor_shutdown = shutdown_rx.clone();
         let monitor = tokio::spawn(async move {
             let mut shutdown = monitor_shutdown;
             let mut source_warning_states = BTreeMap::<String, u8>::new();
+            let mut last_clock_sample = None::<std::time::Instant>;
             loop {
-                monitor_health.set_ready(match &monitor_runtime {
+                if last_clock_sample
+                    .is_none_or(|sampled| sampled.elapsed() >= Duration::from_secs(30))
+                {
+                    monitor_health.set_clock_health(
+                        tokio::task::spawn_blocking(clock_health)
+                            .await
+                            .ok()
+                            .flatten(),
+                    );
+                    last_clock_sample = Some(std::time::Instant::now());
+                }
+                let runtime_ready = match &monitor_runtime {
                     Some(runtime) => runtime.is_healthy().await,
                     None => true,
-                });
+                };
+                monitor_health
+                    .set_ready(runtime_ready && monitor_command_connections.is_watch_healthy());
                 monitor_health.set_dependency_health(match &monitor_runtime {
                     Some(runtime) => runtime.dependency_health().await.unwrap_or([false; 5]),
                     None => [true; 5],
@@ -822,7 +850,8 @@ async fn serve(args: &[String]) -> AppResult<()> {
                     cluster.cluster_id.clone(),
                     cluster.caster_id.clone(),
                     Some(Arc::clone(&health_state)),
-                );
+                )
+                .with_connections(Arc::clone(&connections));
                 let mut shutdown = shutdown_rx.clone();
                 Some(tokio::spawn(async move {
                     loop {
@@ -1046,6 +1075,8 @@ async fn serve(args: &[String]) -> AppResult<()> {
         monitor.abort();
     }
     sampling_task.await?;
+    auth_prune_task.abort();
+    let _ = auth_prune_task.await;
     if let Some(task) = standalone_backup_task {
         task.await?;
     }

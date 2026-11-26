@@ -26,6 +26,7 @@ const LOGIN_MAX_FAILURES: u8 = 5;
 const LOGIN_LOCKOUT: Duration = Duration::from_secs(300);
 const TOKEN_LAST_USED_UPDATE_S: u64 = 3600;
 const TOKEN_LAST_USED_TTL_S: i64 = 31 * 86_400;
+const MAX_LOGIN_LIMITER_ENTRIES: usize = 4096;
 
 #[derive(Clone, Default)]
 pub struct LoginLimiter {
@@ -38,6 +39,7 @@ struct LoginState {
     attempts: u8,
     failures: u8,
     locked_until: Option<Instant>,
+    last_seen: Option<Instant>,
 }
 
 impl LoginLimiter {
@@ -82,7 +84,9 @@ impl LoginLimiter {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_login_states(&mut states, now);
         let state = states.entry(key.to_owned()).or_default();
+        state.last_seen = Some(now);
         if let Some(until) = state.locked_until {
             if until > now {
                 return Some(until.duration_since(now).as_secs().max(1));
@@ -119,7 +123,9 @@ impl LoginLimiter {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_login_states(&mut states, now);
         let state = states.entry(key.to_owned()).or_default();
+        state.last_seen = Some(now);
         state.failures = state.failures.saturating_add(1);
         if state.failures >= LOGIN_MAX_FAILURES {
             state.locked_until = Some(now + LOGIN_LOCKOUT);
@@ -135,6 +141,35 @@ impl LoginLimiter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(key);
     }
+}
+
+fn prune_login_states(states: &mut HashMap<String, LoginState>, now: Instant) {
+    if states.len() < MAX_LOGIN_LIMITER_ENTRIES {
+        return;
+    }
+    states.retain(|_, state| {
+        let expired_lock = state.locked_until.is_some_and(|until| until <= now);
+        let expired_window = state
+            .window_started
+            .is_none_or(|started| now.duration_since(started) >= LOGIN_LOCKOUT);
+        !(expired_lock && expired_window)
+    });
+    if states.len() >= MAX_LOGIN_LIMITER_ENTRIES
+        && let Some(oldest) = states
+            .iter()
+            .min_by_key(|(_, state)| state.last_seen.unwrap_or(now - LOGIN_LOCKOUT))
+            .map(|(key, _)| key.clone())
+    {
+        states.remove(&oldest);
+    }
+}
+
+pub fn valid_login_username(username: &str) -> bool {
+    !username.is_empty()
+        && username.len() <= 128
+        && username
+            .bytes()
+            .all(|byte| byte != b':' && byte >= b' ' && byte != 0x7f)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -226,6 +261,9 @@ pub async fn login(
     username: &str,
     password: &str,
 ) -> Result<IssuedSession, AdminAuthError> {
+    if !valid_login_username(username) {
+        return Err(AdminAuthError::Invalid);
+    }
     let user = directory
         .linear_user_by_username(username)
         .await?
@@ -726,7 +764,7 @@ fn unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LoginLimiter, digest_secret, verify_secret_hash};
+    use super::{LoginLimiter, MAX_LOGIN_LIMITER_ENTRIES, digest_secret, verify_secret_hash};
     use crate::account_auth::hash_password;
 
     #[test]
@@ -741,6 +779,19 @@ mod tests {
         assert!(limiter.retry_after("user:admin").is_some());
         limiter.success("user:admin");
         assert!(limiter.retry_after("user:admin").is_none());
+    }
+
+    #[test]
+    fn login_limiter_memory_is_capacity_bounded() {
+        let limiter = LoginLimiter::default();
+        for index in 0..MAX_LOGIN_LIMITER_ENTRIES + 500 {
+            limiter.failure(&format!("user:random-{index}"));
+        }
+        let states = limiter
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(states.len() <= MAX_LOGIN_LIMITER_ENTRIES);
     }
 
     #[tokio::test]
