@@ -79,6 +79,8 @@ Final current-tree verification on 2026-11-26:
 - `cargo test --workspace --all-features --locked`: pass.
 - `cargo clippy --workspace --all-features --all-targets --locked -- -D
   warnings`: pass.
+- Repository CI now mirrors the all-features Clippy, browser-asset syntax and
+  all-features app-bin release gates.
 - All-feature release binaries: pass.
   - `rcaster` 23,624,440 bytes,
     SHA-256

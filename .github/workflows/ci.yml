@@ -159,6 +159,19 @@ jobs:
           RCASTER_RTKLIB_WORKER_BIN: /tmp/rtklib-decoder-worker
         run: cargo test --workspace --all-features --locked
 
+      - name: Run Clippy with all features
+        env:
+          RTKLIB_SOURCE_DIR: /tmp/RTKLIB
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked
+          -- -D warnings
+
+      - name: Check browser assets and harness syntax
+        run: |
+          node --check crates/rcaster-service/src/admin_app.js
+          node --check crates/rcaster-service/src/public_app.js
+          python3 -m py_compile tools/web-e2e/run_browser_e2e.py
+
       - name: Verify RTKLIB source and client round trip
         env:
           RCASTER_STR2STR_BIN: /tmp/RTKLIB/app/str2str/gcc/str2str
@@ -193,4 +206,7 @@ jobs:
           --sources 10 --subscribers 1000 --duration-s 10 --rate-kib 1
 
       - name: Build release binaries
-        run: cargo build --workspace --release --locked
+        env:
+          RTKLIB_SOURCE_DIR: /tmp/RTKLIB
+        run: >-
+          cargo build -p rcaster-app --bins --release --all-features --locked
